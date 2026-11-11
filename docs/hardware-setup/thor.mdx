@@ -1,13 +1,14 @@
 ---
 title: "Advantech Thor (MIC-742)"
-description: "Wire the cameras, install the operating system and add the camera driver on the Jetson Thor Compute Kit."
+description: "Wire the cameras, install the operating system, JetPack and the camera driver on the Jetson Thor Compute Kit."
 ---
 
 The Jetson Thor Compute Kit is the **Advantech MIC-742-AT** (Jetson T5000, 128GB) with Wi-Fi and a GMSL2 frame grabber, the card the cameras plug into. Before you [install the Axol software](/installation), follow this guide to:
 
 1. Connect the Camera Kit.
 2. Install Advantech's operating system image.
-3. Install the camera driver.
+3. Install JetPack.
+4. Install the camera driver.
 
 <Warning>
   **Never flash the MIC-742 with NVIDIA's standard JetPack image.** That image is for NVIDIA's own Thor developer kit. On the MIC-742, it makes the camera driver hang at boot. Always use Advantech's MIC-742 image (see [Flash the OS](#flash-the-os)).
@@ -111,6 +112,8 @@ You need a separate **x86_64 PC running Ubuntu 24.04**, a **USB-A to Micro-USB**
     3. Press and hold **REC**.
     4. Plug in power and press **RST**, keeping **REC** held. Release **REC** 5–10 seconds after pressing **RST**.
 
+    If the MIC-742 is already on, or keeps restarting, leave its power connected. Hold **REC**, press **RST**, and release **REC** 5–10 seconds later.
+
     Confirm it from the host:
 
     ```bash
@@ -126,13 +129,29 @@ You need a separate **x86_64 PC running Ubuntu 24.04**, a **USB-A to Micro-USB**
     ```
   </Step>
   <Step title="Reboot">
-    When the script reports success, press **RST**. The MIC-742 starts up with the new image. Finish the Ubuntu first-boot setup on the HDMI monitor.
+    When the script reports success, press **RST**. The MIC-742 doesn't restart by itself after flashing. It starts up with the new image and logs in to the desktop as `mic-742`.
   </Step>
 </Steps>
 
+## Install JetPack
+
+Advantech's image doesn't include CUDA, cuDNN or TensorRT. The ZED SDK needs them, so install them from NVIDIA's JetPack packages first. The MIC-742 needs internet access for this, over Ethernet or Wi-Fi.
+
+Advantech's image keeps its kernel at the L4T release it ships with. Pin the rest of L4T to the same release, or `apt` refuses to install JetPack. On the MIC-742:
+
+```bash
+L4T=$(dpkg-query -W -f='${Version}' nvidia-l4t-core)
+printf 'Package: nvidia-l4t-*\nPin: version *%s\nPin-Priority: 1001\n' "$L4T" |
+  sudo tee /etc/apt/preferences.d/90-mic742-l4t.pref
+sudo apt update
+sudo apt install -y nvidia-jetpack
+```
+
+This downloads several gigabytes. Plan for about 10 minutes.
+
 ## Install the camera driver
 
-Once the new image is running, install the **Stereolabs driver built for the MIC-742**: `stereolabs-advantech-mic742` release **1.4.3 for L4T 39.2.0**. It is the only driver that works with Advantech's image. Drivers for the ZED Box, the ZED Link or NVIDIA's developer kit do not work on the MIC-742.
+Once JetPack is installed, install the **Stereolabs driver built for the MIC-742**: `stereolabs-advantech-mic742` release **1.4.3 for L4T 39.2.0**. It is the only driver that works with Advantech's image. Drivers for the ZED Box, the ZED Link or NVIDIA's developer kit do not work on the MIC-742.
 
 | File | Download | MD5 |
 |---|---|---|
@@ -154,10 +173,11 @@ Then install the ZED SDK release for JetPack 7.2 (L4T 39.2) from the [Stereolabs
 
 ## Verify
 
-Before you install the Axol software, check the L4T release and the driver:
+Before you install the Axol software, check the L4T release, JetPack and the driver:
 
 ```bash
 head -1 /etc/nv_tegra_release      # expect: # R39 (release), REVISION: 2.x
+dpkg -l nvidia-jetpack | tail -1    # expect: ii  nvidia-jetpack  7.2.x
 dpkg -l | grep stereolabs           # expect: stereolabs-advantech-mic742  1.4.3-L4T39.2.0
 ```
 
