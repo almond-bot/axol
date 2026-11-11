@@ -35,12 +35,12 @@ from .lift import goto as lift_goto
 from .lift import home as lift_home
 from .lift import update as lift_update
 from .motion import add_parser as motion_add_parser
+from .motor import burn_in as motor_burn_in
 from .motor import dump_config as motor_dump_config
 from .motor import flash as motor_flash
 from .motor import health as motor_health
 from .motor import info as motor_info
 from .motor import restore_config as motor_restore_config
-from .motor import burn_in as motor_burn_in
 from .motor import set_can_id, set_zero_pos
 from .motor import set_config as motor_set_config
 from .tune import a4 as tune_a4

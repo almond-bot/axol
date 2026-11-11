@@ -184,6 +184,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`motor.set-config`](https://docs.almond.bot/cli/motor-set-config)
 - [`motor.restore-config`](https://docs.almond.bot/cli/motor-restore-config)
 - [`motor.flash`](https://docs.almond.bot/cli/motor-flash)
+- [`motor.burn-in`](https://docs.almond.bot/cli/motor-burn-in): ID, zero and long-run test for loose motors on a test stand
 - [`teleop`](https://docs.almond.bot/cli/teleop)
 - [`collect-data`](https://docs.almond.bot/cli/collect-data)
 - [`collect-dagger`](https://docs.almond.bot/cli/collect-dagger)
