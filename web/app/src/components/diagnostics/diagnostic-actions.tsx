@@ -292,7 +292,7 @@ export interface ActionMode {
   description?: string
   presetArgs?: Record<string, FormValue>
   hideKeys?: string[]
-  /** This mode works on a whole arm, so the bus picker offers only the arms. */
+  /** This mode works on a whole arm, so the bus picker offers only the arms and one is required. */
   armOnly?: boolean
 }
 
@@ -360,10 +360,17 @@ export function ActionDialog({
   const mode = modes?.find((m) => m.key === modeKey) ?? null
 
   const allFields = useMemo(() => flattenFields(spec.schema), [spec])
-  const busMode = busOptions != null && !mode?.armOnly && allFields.some((f) => f.key === "arm")
+  const busMode = busOptions != null && allFields.some((f) => f.key === "arm")
+  // An arm-only mode (guided zeroing walks a whole arm) offers just the arms.
+  const armOnly = Boolean(mode?.armOnly)
+  const shownBusOptions = useMemo(
+    () => (busOptions ?? []).filter((o) => !armOnly || !o.value.startsWith(IFACE_PREFIX)),
+    [busOptions, armOnly]
+  )
   const [bus, setBus] = useState("")
   const presetArm = presetArgs?.arm != null ? String(presetArgs.arm) : ""
-  const busValue = bus || presetArm
+  // A test-stand interface picked in another mode doesn't carry over.
+  const busValue = shownBusOptions.some((o) => o.value === bus) ? bus : presetArm
 
   const effectivePresets = useMemo(() => {
     const merged: Record<string, FormValue> = {
@@ -437,7 +444,7 @@ export function ActionDialog({
       ...(firmwareField ? [firmwareField] : []),
     ]
     const miss = missingRequired(formFields, overrides)
-    if (busMode && !busValue) miss.unshift("Bus")
+    if (busMode && !busValue) miss.unshift(armOnly ? "Arm" : "Bus")
     setMissing(miss)
     if (miss.length > 0) return
     const args = computeArgs(formFields, overrides)
@@ -519,7 +526,7 @@ export function ActionDialog({
         {busMode && (
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center gap-2">
-              <Label htmlFor="cfg-bus">Bus</Label>
+              <Label htmlFor="cfg-bus">{armOnly ? "Arm" : "Bus"}</Label>
               <span className="text-xs text-[#eff483]">*</span>
             </div>
             <select
@@ -530,15 +537,17 @@ export function ActionDialog({
               className="h-9 w-full rounded-md border border-input bg-white/[0.02] px-3 text-sm text-foreground outline-none focus-visible:border-ring/70 disabled:opacity-50"
             >
               <option value="">Select…</option>
-              {(busOptions ?? []).map((o) => (
+              {shownBusOptions.map((o) => (
                 <option key={o.value} value={o.value} className="bg-[#1a1a1a]">
                   {o.label}
                 </option>
               ))}
             </select>
-            <p className="text-xs text-white/40">
-              Pick an arm, or another CAN interface for a motor on a test stand.
-            </p>
+            {!armOnly && (
+              <p className="text-xs text-white/40">
+                Pick an arm, or another CAN interface for a motor on a test stand.
+              </p>
+            )}
           </div>
         )}
 
