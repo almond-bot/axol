@@ -388,6 +388,46 @@ class StribeckDefaultTest(unittest.TestCase):
             self.assertEqual(stribeck.get("stribeck_gain"), want)
             self.assertEqual(stribeck["stribeck_dfs"], 0.6)
 
+    def test_a_fit_saved_without_a_gain_clears_the_one_saved_before(self) -> None:
+        from almond_axol.robot.calibration import update_joint_calibration
+
+        fit = {"stribeck_dfs": 0.6, "stribeck_load_gain": 0.03, "stribeck_vs": 0.1}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "calibration.json"
+
+            def save(stribeck: dict[str, float]) -> dict[str, Any]:
+                update_joint_calibration(
+                    "left",
+                    "shoulder_2",
+                    stribeck=stribeck,
+                    hub_serial=SERIAL,
+                    path=path,
+                )
+                return json.loads(path.read_text())["left"]["shoulder_2"]
+
+            self.assertEqual(save({**fit, "stribeck_gain": 0.8})["stribeck_gain"], 0.8)
+            entry = save({**fit, "stribeck_dfs": 0.5})
+            self.assertNotIn("stribeck_gain", entry)
+            self.assertEqual(entry["stribeck_dfs"], 0.5)
+            # A gain set on its own afterwards keeps the fit it belongs to.
+            entry = save({"stribeck_gain": 0.4})
+            self.assertEqual(
+                (entry["stribeck_gain"], entry["stribeck_dfs"]), (0.4, 0.5)
+            )
+
+    def test_the_stored_copy_drops_the_old_gain_with_the_old_fit(self) -> None:
+        from almond_axol.cli.tune.factory import merge_cloud_document
+
+        old = {"stribeck_gain": 0.8, "stribeck_dfs": 0.6, "com": [0.0, 0.01, 0.0]}
+        stored = {"left": {"shoulder_2": old, "elbow": dict(old)}}
+        new = {"left": {"shoulder_2": {"stribeck_dfs": 0.5}, "elbow": {"mass": 1.0}}}
+        merged = merge_cloud_document(stored, new, SERIAL)["left"]
+        self.assertNotIn("stribeck_gain", merged["shoulder_2"])
+        self.assertEqual(merged["shoulder_2"]["stribeck_dfs"], 0.5)
+        self.assertEqual(merged["shoulder_2"]["com"], [0.0, 0.01, 0.0])
+        # An entry with no new fit leaves the stored fit and its gain alone.
+        self.assertEqual(merged["elbow"]["stribeck_gain"], 0.8)
+
     def test_a_fit_saved_without_a_gain_takes_the_motors_default(self) -> None:
         entry = {k: v for k, v in _SLOW_ENTRY.items() if k != "stribeck_gain"}
         on_150 = _config({"left": _BOTH_150}, local={"left": {"shoulder_2": entry}})

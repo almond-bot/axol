@@ -214,6 +214,14 @@ def merge_cloud_document(
         if isinstance(new, dict):
             for joint, entry in new.items():
                 prev = side_doc.get(joint)
+                if (
+                    isinstance(prev, dict)
+                    and "stribeck_dfs" in entry
+                    and "stribeck_gain" not in entry
+                ):
+                    # A fit saved without a gain replaces the stored fit's
+                    # gain too (see update_joint_calibration).
+                    prev = {k: v for k, v in prev.items() if k != "stribeck_gain"}
                 side_doc[joint] = (
                     {**prev, **entry} if isinstance(prev, dict) else dict(entry)
                 )
