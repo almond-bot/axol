@@ -120,6 +120,8 @@ Per-arm and per-joint flags are shown for `left` / `elbow`. Swap in `right`, or 
   | `wrist_2` | 130 | 2.25 | 0 | 0 | 0.65 | 25 | 1.5 |
   | `wrist_3` | 130 | 2.0 | 0 | 0 | 0.75 | 25 | 0.9 |
 
+  **RMD-X8-P20-150 shoulders.** A `shoulder_1` or `shoulder_2` with an RMD-X8-P20-150 motor uses `kd_host` 10 and `kd_host_q` 3. Its other values match the table. Axol reads each motor's model when it enables the arms, and the next session uses the matching defaults. If the log says a session started with the settings for a different shoulder motor, stop the operation and start it again.
+
   **Slow-motion gains.** A joint whose calibration includes its own slow-profile friction fit runs the stiffer set below. [`tune.factory`](/cli/tune-factory) writes that fit by default, and so does [`tune.friction --profile slow --save`](/cli/tune-friction). These gains oscillate on a joint that still uses the fallback friction, so an uncalibrated joint keeps the table above.
 
   | Joint | `kp` | `kd` | `kd_host` | `kd_host_hz` / `kd_host_q` | `stribeck_gain` / `stribeck_pole` |
@@ -129,10 +131,12 @@ Per-arm and per-joint flags are shown for `left` / `elbow`. Swap in `right`, or 
   | `elbow` | 200 | 5.0 | 10 | 1.6 / 1.5 | 0.8 / 40 |
 
   Gains saved in the joint's own calibration entry still override these, for example from `tune.pid --save` or the friction fit's `stribeck_gain`.
+
+  A shoulder with an RMD-X8-P20-150 motor doesn't switch to this set. After calibration it keeps its default gains and uses the measured friction. The calibration saves its `stribeck_gain` as 0 unless you pass `--stribeck-gain`.
 </Accordion>
 
 <Accordion title="Per-motor friction defaults">
-  Fallback values of `fc`, `k`, `fv`, `fo` for each motor, measured on a reference robot with [`tune.friction`](/cli/tune-friction). A joint's slow-profile friction (`fl` and the Stribeck excess) comes only from its own calibration. There is no fallback for it, so calibrate each robot.
+  Fallback values of `fc`, `k`, `fv`, `fo` for each motor, measured on a reference robot with [`tune.friction`](/cli/tune-friction). For the motors in this table, slow-profile friction (`fl` and the Stribeck excess) comes only from calibration. There is no fallback for it, so calibrate each robot.
 
   | Joint | Left arm | Right arm |
   |---|---|---|
@@ -143,4 +147,11 @@ Per-arm and per-joint flags are shown for `left` / `elbow`. Swap in `right`, or 
   | `wrist_1` | `0.3765, 88.91, 0.0298, −0.0115` | `0.5245, 98.58, 0.3062, −0.0097` |
   | `wrist_2` | `0.1521, 780.31, 0, −0.0152` | `0.1092, 899.67, 0, 0.0021` |
   | `wrist_3` | `0.0714, 927.26, 0, 0.0042` | `0.1172, 204.46, 0, 0.0042` |
+
+  Shoulders with RMD-X8-P20-150 motors use these fallback values on both arms. They include `fl`. The Stribeck excess still comes only from calibration.
+
+  | Joint | `fc` | `k` | `fv` | `fo` | `fl` |
+  |---|---|---|---|---|---|
+  | `shoulder_1` | 0.75 | 100 | 0 | 0 | 0.034 |
+  | `shoulder_2` | 0.44 | 100 | 0 | 0 | 0.042 |
 </Accordion>

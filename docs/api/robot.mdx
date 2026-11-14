@@ -450,6 +450,8 @@ Both arms share the `ArmConfig` defaults for gains and masses. The right arm's c
 
 `shoulder_1` sets `kd_host_q=3` on both arms. This keeps its damper on the impedance mode and off a separate 12.5 to 13.6 Hz mode of the mast and forearm. Other joints leave `kd_host_q` at `None`, which uses 0.8.
 
+A `shoulder_1` or `shoulder_2` with an RMD-X8-P20-150 motor has different defaults: `kd_host=10`, `kd_host_q=3` and a separate fallback friction. `enable()` reads each motor's model, and the next `AxolConfig()` on this computer uses the matching defaults. If `enable()` logs that the session started with the settings for a different shoulder motor, create the config and the robot again.
+
 ## Gravity compensation
 
 `almond_axol.robot.gravity.GravityCompensator` builds a MuJoCo model from the bundled URDF. It computes each joint's gravity torque as `qfrc_bias` with zero velocity, so the Coriolis terms drop out. Each joint's load includes the weight of every link after it in the chain.
