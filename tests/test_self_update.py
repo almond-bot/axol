@@ -643,6 +643,34 @@ def test_main_channel_offers_an_update_when_the_branch_moves(monkeypatch) -> Non
     asyncio.run(exercise())
 
 
+def test_status_reports_the_channel_being_installed(monkeypatch) -> None:
+    async def exercise() -> None:
+        updater = _updater(monkeypatch)
+        # Debounced: the status calls below spawn no ls-remote.
+        updater._remote_checked_at = update.time.monotonic()
+        assert (await updater.status())["target"] is None
+
+        release = asyncio.Event()
+
+        async def hold(*args, **kwargs):
+            await release.wait()
+
+        monkeypatch.setattr(updater, "_run_update", hold)
+        assert updater.start("main") == (True, None)
+        status = await updater.status()
+        assert status["channel"] == "release"
+        assert status["state"] == "updating"
+        assert status["target"] == "main"
+
+        updater._fail("boom")
+        assert (await updater.status())["target"] is None
+        release.set()
+        assert updater._update_task is not None
+        await updater._update_task
+
+    asyncio.run(exercise())
+
+
 def test_switching_channels(monkeypatch) -> None:
     async def exercise() -> None:
         updater = _updater(monkeypatch)

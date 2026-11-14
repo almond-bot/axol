@@ -46,7 +46,6 @@ function render(
       <SoftwareChannel
         update={update}
         updating={updating}
-        phase={null}
         opRunning={opRunning}
         hostInstalling={false}
         onSwitch={onSwitch}
@@ -55,65 +54,61 @@ function render(
   )
 }
 
-const option = (label: string) =>
-  [...container.querySelectorAll<HTMLButtonElement>("[role=radio]")].find(
+const buttons = (label: string) =>
+  [...container.querySelectorAll<HTMLButtonElement>("button")].filter(
     (b) => b.textContent === label
-  ) as HTMLButtonElement
-const button = (label: string) =>
-  [...container.querySelectorAll<HTMLButtonElement>("button")].find(
-    (b) => b.textContent === label
-  ) as HTMLButtonElement | undefined
+  )
+/** The button in the open confirmation (the last match), if any. */
+const confirm = (label: string) => buttons(label).at(-1)
 
 describe("SoftwareChannel", () => {
-  it("marks the installed channel", () => {
+  it("offers the other channel", () => {
     render(status, () => {})
-    expect(option("Release").getAttribute("aria-checked")).toBe("true")
-    expect(option("Main").getAttribute("aria-checked")).toBe("false")
+    expect(buttons("Switch to main")).toHaveLength(1)
+    render({ ...status, channel: "main" }, () => {})
+    expect(buttons("Switch to release")).toHaveLength(1)
   })
 
-  it("asks before switching, then switches", () => {
+  it("shows what the switch installs, asks, then switches", () => {
     const onSwitch = vi.fn()
-    render(status, onSwitch)
-    act(() => option("Main").click())
-    expect(container.textContent).toContain("Switch to main")
+    render({ ...status, version: "0.2.44", remoteCommit: "2222222bbbb" }, onSwitch)
+    act(() => buttons("Switch to main")[0].click())
+    expect(container.textContent).toContain("v0.2.44 \u2192 main 2222222")
+    const link = container.querySelector("a") as HTMLAnchorElement
+    expect(link.textContent).toBe("View changes")
+    expect(link.href).toBe("https://github.com/almond-bot/axol/compare/v0.2.44...main")
     expect(onSwitch).not.toHaveBeenCalled()
-    act(() => button("Switch to main")!.click())
+    act(() => confirm("Switch to main")!.click())
     expect(onSwitch).toHaveBeenCalledWith("main")
-    expect(button("Switch to main")).toBeUndefined()
-  })
-
-  it("does nothing when the installed channel is clicked", () => {
-    render(status, () => {})
-    act(() => option("Release").click())
-    expect(button("Cancel")).toBeUndefined()
+    expect(buttons("Cancel")).toHaveLength(0)
   })
 
   it("names the release it switches back to", () => {
     const onSwitch = vi.fn()
-    render({ ...status, channel: "main", commit: "abcdef0123" }, onSwitch)
-    act(() => option("Release").click())
-    expect(container.textContent).toContain("Install the latest release (v0.2.41).")
-    act(() => button("Switch to release")!.click())
+    render({ ...status, channel: "main", commit: "1111111aaaa" }, onSwitch)
+    act(() => buttons("Switch to release")[0].click())
+    expect(container.textContent).toContain("main 1111111 \u2192 v0.2.41")
+    expect((container.querySelector("a") as HTMLAnchorElement).textContent).toBe("Release notes")
+    act(() => confirm("Switch to release")!.click())
     expect(onSwitch).toHaveBeenCalledWith("release")
   })
 
   it("can't switch to release before the latest release is known", () => {
     render({ ...status, channel: "main", remoteVersion: null }, () => {})
-    act(() => option("Release").click())
+    act(() => buttons("Switch to release")[0].click())
     expect(container.textContent).toContain("The latest release is not known yet.")
-    expect(button("Switch to release")!.disabled).toBe(true)
+    expect(confirm("Switch to release")!.disabled).toBe(true)
   })
 
   it("can't switch while an operation is running", () => {
     render(status, () => {}, { opRunning: true })
-    act(() => option("Main").click())
+    act(() => buttons("Switch to main")[0].click())
     expect(container.textContent).toContain("An operation is running. Stop it first.")
-    expect(button("Switch to main")!.disabled).toBe(true)
+    expect(confirm("Switch to main")!.disabled).toBe(true)
   })
 
-  it("locks the choice while an update applies", () => {
+  it("can't switch while an update applies", () => {
     render(status, () => {}, { updating: true })
-    expect(option("Main").disabled).toBe(true)
-    expect(container.textContent).toContain("Updating…")
+    expect(buttons("Switch to main")[0].disabled).toBe(true)
   })
 })

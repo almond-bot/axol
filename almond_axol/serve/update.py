@@ -395,6 +395,9 @@ class SelfUpdater:
         # "restarting" | "rebooting" (``None`` when not updating).
         self._phase: str | None = None
         self._update_task: asyncio.Task[None] | None = None
+        # The channel the in-flight update installs, so every panel (not just
+        # the one that clicked) can show a channel switch as it runs.
+        self._target: str | None = None
         # Set when an upgrade landed but the server was busy; restart at the
         # next idle opportunity (a subsequent status poll re-checks).
         self._restart_pending = False
@@ -517,6 +520,9 @@ class SelfUpdater:
             "updateAvailable": self._update_available(),
             "idle": self._is_idle(),
             "state": self._state,
+            # The channel being installed while updating; it differs from
+            # ``channel`` during a switch. ``None`` when not updating.
+            "target": self._target if self._state == "updating" else None,
             "phase": self._phase,
             "error": self._error,
             "warning": self._provision_warning,
@@ -553,6 +559,7 @@ class SelfUpdater:
             return False, "server is busy; stop the running operation first"
         self._state = "updating"
         self._error = None
+        self._target = target
         self._update_task = asyncio.create_task(self._run_update(target))
         return True, None
 

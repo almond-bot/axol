@@ -250,6 +250,11 @@ export interface UpdateStatus {
   /** Safe to restart now (no op running). */
   idle: boolean
   state: UpdateState
+  /**
+   * The channel being installed while state is "updating"; it differs from
+   * `channel` during a channel switch. Null otherwise. Absent on older hosts.
+   */
+  target?: UpdateChannel | null
   /** Step while state is "updating" (upgrading/provisioning/restarting/rebooting); else null. */
   phase: UpdatePhase | null
   /** Last update failure, surfaced to the operator; null otherwise. */

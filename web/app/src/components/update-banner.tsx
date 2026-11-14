@@ -1,52 +1,27 @@
 import { Download, ExternalLink, Loader2 } from "lucide-react"
-import type { UpdatePhase, UpdateStatus } from "@/lib/supervisor"
+import type { UpdateChannel, UpdatePhase, UpdateStatus } from "@/lib/supervisor"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
-import { PHASE_LABEL, shortCommit } from "@/lib/update-view"
+import { PHASE_LABEL, describeChange } from "@/lib/update-view"
 
-const REPO_URL = "https://github.com/almond-bot/axol"
-const RELEASES_URL = `${REPO_URL}/releases`
-
-/** Release version with the conventional "v" prefix, e.g. "v0.1.2". */
-function tag(version: string | null): string {
-  return version ? `v${version}` : "unknown"
-}
-
-/** What the banner says and links to, for the installed channel. */
-function describe(update: UpdateStatus): {
-  title: string
-  jump: string
-  link: string
-  linkLabel: string
-} {
-  if (update.channel === "main") {
-    const { commit, remoteCommit } = update
-    return {
-      title: "New changes are available on main",
-      jump: `main ${shortCommit(commit)} \u2192 ${shortCommit(remoteCommit)}`,
-      link:
-        commit && remoteCommit
-          ? `${REPO_URL}/compare/${commit}...${remoteCommit}`
-          : `${REPO_URL}/commits/main`,
-      linkLabel: "View changes",
-    }
-  }
-  return {
-    title: "A new release is available",
-    jump: `${tag(update.version)} \u2192 ${tag(update.remoteVersion)}`,
-    link: RELEASES_URL,
-    linkLabel: "Release notes",
-  }
+/** The banner's heading, for an update within the installed channel or a switch to `to`. */
+function title(update: UpdateStatus, to: UpdateChannel): string {
+  const from = update.channel ?? "release"
+  if (to !== from) return to === "main" ? "Switching to main" : "Switching to the latest release"
+  return from === "main" ? "New changes are available on main" : "A new release is available"
 }
 
 /**
- * Banner shown above the connections bar when newer code exists on the
- * installed channel: a release with a higher version, or new commits on main. The Update button is disabled while an
- * operation is running (a connected robot is fine), since applying it restarts
- * the server.
+ * Banner shown above the page while newer code is available or being
+ * installed: a release with a higher version, new commits on main, or a switch
+ * between the two channels. It shows what the host moves from and to, a link
+ * to the changes and the update's progress. The Update button is disabled
+ * while an operation is running (a connected robot is fine), since applying it
+ * restarts the server.
  */
 export function UpdateBanner({
   update,
+  switchTo = null,
   updating,
   phase,
   blocked,
@@ -54,6 +29,8 @@ export function UpdateBanner({
   onUpdate,
 }: {
   update: UpdateStatus
+  /** The channel being switched to, while a channel switch applies. */
+  switchTo?: UpdateChannel | null
   updating: boolean
   /** Current update step, for the button label while updating. */
   phase: UpdatePhase | null
@@ -65,11 +42,12 @@ export function UpdateBanner({
 }) {
   const hint = busyReason ?? "The Host Computer is busy"
   const updatingLabel = (phase && PHASE_LABEL[phase]) || "Updating…"
-  const { title, jump, link, linkLabel } = describe(update)
+  const to = switchTo ?? update.channel ?? "release"
+  const { jump, link, linkLabel } = describeChange(update, to)
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
       <div className="flex min-w-0 flex-col gap-0.5">
-        <span className="font-medium text-amber-200">{title}</span>
+        <span className="font-medium text-amber-200">{title(update, to)}</span>
         <span className="font-mono text-amber-200/60">{jump}</span>
         {blocked && !updating && <span className="text-amber-200/60">{hint} to update.</span>}
       </div>

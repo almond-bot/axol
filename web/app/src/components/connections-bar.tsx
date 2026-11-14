@@ -5,7 +5,7 @@ import { useCallback, useState, type ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
 import { BatteryIndicator, WheelGrid } from "@/components/jelly-status"
 import { SoftwareChannel } from "@/components/software-channel"
-import { shortCommit } from "@/lib/update-view"
+import { CHANNEL_LABEL, releaseTag, shortCommit } from "@/lib/update-view"
 import {
   jellyBattery,
   jellyDeviceView,
@@ -26,7 +26,6 @@ import {
   type MotorHealth,
   type RobotStatus,
   type UpdateChannel,
-  type UpdatePhase,
   type UpdateStatus,
 } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
@@ -209,7 +208,6 @@ export function ConnectionsBar({
   version,
   update,
   updating = false,
-  updatePhase = null,
   onSwitchChannel,
   onOpenSetup,
   onHostDisconnect,
@@ -242,7 +240,6 @@ export function ConnectionsBar({
   update?: UpdateStatus | null
   /** An update or channel switch is applying. */
   updating?: boolean
-  updatePhase?: UpdatePhase | null
   /** Reinstalls the host software from the other channel. */
   onSwitchChannel?: (channel: UpdateChannel) => void
   onOpenSetup: () => void
@@ -592,25 +589,29 @@ export function ConnectionsBar({
         {online && (host || version) ? (
           <div className="flex flex-col gap-2">
             {host && <Detail label="Address">{host}</Detail>}
-            {version && (
-              <Detail label="Software">
-                Axol v{version}
-                {update?.channel === "main" && (
-                  <span className="text-white/45"> (main, {shortCommit(update.commit)})</span>
+            {update?.channel === "main" ? (
+              <>
+                <Detail label="Software">Main, commit {shortCommit(update.commit)}</Detail>
+                {update.remoteVersion && (
+                  <Detail label="Latest release">{releaseTag(update.remoteVersion)}</Detail>
                 )}
-              </Detail>
+              </>
+            ) : (
+              version && <Detail label="Software">Axol {releaseTag(version)}</Detail>
             )}
             {update?.enabled && update.channel && onSwitchChannel && (
               <div className="flex min-w-0 items-center justify-between gap-4 text-sm">
                 <span className="shrink-0 text-white/45">Channel</span>
-                <SoftwareChannel
-                  update={update}
-                  updating={updating}
-                  phase={updatePhase}
-                  opRunning={opRunning}
-                  hostInstalling={hostInstalling}
-                  onSwitch={onSwitchChannel}
-                />
+                <span className="flex min-w-0 items-center gap-2">
+                  <SoftwareChannel
+                    update={update}
+                    updating={updating}
+                    opRunning={opRunning}
+                    hostInstalling={hostInstalling}
+                    onSwitch={onSwitchChannel}
+                  />
+                  <span className="text-white/80">{CHANNEL_LABEL[update.channel]}</span>
+                </span>
               </div>
             )}
           </div>
