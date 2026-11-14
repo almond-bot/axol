@@ -294,8 +294,9 @@ _MA_SERIES_SAMPLE_RES: dict[int, float] = {
 # 2026083101, factory-dated 2026-09) ships at 1 where every X8-P20-120 reads 2,
 # with the -120's current ratings, KT_OUT and MAX_TORQUE otherwise unchanged.
 # All four seen arrived that way, so 1 is taken as the drive's resistor.
-# Pending a gravity-comp check: if it is really 2, the arm sags at half torque
-# (the safe side of the mistake), and this entry goes.
+# Checked on the assembled arms (2026-11-13/14): the torque the motor reports
+# while holding is 0.95-1.00x the gravity model on six shoulder joints of
+# four arms, where a wrong resistor would read 0.5x or 2x.
 _MA_VARIANT_SAMPLE_RES: dict[tuple[int, int], float] = {
     (8, 150): 1.0,
 }

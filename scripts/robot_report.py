@@ -120,8 +120,13 @@ def system() -> dict:
 
 def identity() -> dict:
     from almond_axol.robot.identity import hub_serial
+    from almond_axol.robot.motor_models import load_motor_models
 
-    return {"hub_serial": hub_serial()}
+    serial = hub_serial()
+    # The models the last bring-up read from this hub's motors: they pick the
+    # shoulders' default gains (an RMD-X8-P20-150 runs its own set).
+    models = load_motor_models(expected_hub_serial=serial) if serial else {}
+    return {"hub_serial": serial, "motor_models": models}
 
 
 def settings() -> dict:

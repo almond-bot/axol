@@ -39,7 +39,7 @@ The tool poses the other joints so the arm stays clear of the robot:
 | `--kd FLOAT` | Derivative gain (default: the calibration gains below) |
 | `--profile {standard,slow}` | Sweep profile (default: `standard`) |
 | `--velocities V [V ...]` | Sweep speeds in deg/s (default: `7.2 18 36 54 72`, or `1 2 3 5 8 15 30` with `--profile slow`) |
-| `--stribeck-gain G` | With `--profile slow`: the share of the extra low-speed friction to cancel (default: 0.8 on `shoulder_1`, `shoulder_2` and `elbow`, 0 elsewhere) |
+| `--stribeck-gain G` | With `--profile slow`: the share of the extra low-speed friction to cancel (default: 0.8 on `shoulder_1`, `shoulder_2` and `elbow`, 0 on the other joints and on RMD-X8-P20-150 shoulders) |
 | `--raw-csv PATH` | Save every sweep sample, so you can refit later with `--fit-csv` |
 | `--fit-csv PATH [PATH ...]` | Fit the slow-profile model to saved `--raw-csv` files without moving anything. `--save` still applies. |
 | `--bins N` | Number of position bins the fit uses (default: 40) |

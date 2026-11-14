@@ -103,6 +103,7 @@ Check the report before anything moves:
 | `system.can_links` | `can_alm_axol_l/_r` missing or DOWN | `axol can.setup`; check the arm hub USB and power |
 | `system.processes_on_the_robot` | `axol serve`, teleop or a tuner running | stop it before any tuning tool (`sudo systemctl stop axol.service`, or stop it in the panel); restart after |
 | `calibration["calibration.json"].matches_this_hub` false | the file belongs to another robot and is ignored | recalibrate (Phase 2) |
+| `identity.motor_models` empty for an arm, or a shoulder there reads `RMD-X8-P20-150` while `effective_config` shows host damper 40 / 35 on it | this hub's motor models are not recorded yet, so the config runs the X8-P20-120 shoulder set | one bring-up records them (teleop, a ROM start or a `tune.*` tool); start again and check `effective_config` shows host damper 10 on shoulder_1 and shoulder_2 (`reference/history.md`, the -150 section) |
 | `settings.link_mass_com_overrides` non-empty | hand-tuned gravity in the panel | always run the factory with `--keep-gravity` |
 | `settings.has_gripper` false, or no gripper on the arm | gripperless robot | panel `axol.has_gripper` must be false (`tune.motion` follows it); see the section below |
 | `settings.wrist_cameras` null on an arm | no wrist IMU there | ask them to mount their own IMU (section below); else the encoder sway |

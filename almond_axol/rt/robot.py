@@ -93,6 +93,7 @@ from ..robot.base import (
 )
 from ..robot.config import AxolConfig, JointConfig, check_loop_hz
 from ..robot.gravity import PayloadSide
+from ..robot.motor_models import note_motor_models
 from ..settings import SHARED
 from .link import FeedbackSlot, RtLink, config_header
 
@@ -613,6 +614,9 @@ class Axol(RobotBase):
                     driver = arm.motors[j]._driver
                     await driver._detect_capabilities()
                     await driver._apply_low_voltage_threshold()
+            # The drivers have just read each motor's model: keep it for the
+            # next config, whose shoulder defaults depend on it.
+            note_motor_models("left" if side == 0 else "right", arm.motors)
 
         # Gripper bring-up runs from Python while the bus is still quiet —
         # the exact classic flow (enable/calibrate or attach/restore) the
