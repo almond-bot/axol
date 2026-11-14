@@ -50,7 +50,9 @@ The buttons above the motor cards run these commands:
 | **Edit parameter** | Reads or writes one configuration parameter ([`motor.set-config`](/cli/motor-set-config)). |
 | **Flash firmware** | Installs motor firmware from a `.bin` file on the Host Computer ([`motor.flash`](/cli/motor-flash)). Axol only. |
 
-In these tools, **Bus** picks the motor's arm. For a motor on a test stand, pick its CAN interface, such as `can0`, instead. Guided zeroing always works on an arm.
+In these tools, **Bus** picks the motor's arm. For a motor on a test stand, pick its CAN interface, such as `can0`, instead.
+
+**Set zero position** has two tabs. **Specific motor** zeroes one motor. **Guided** zeroes a whole arm, so it shows **Arm** in place of **Bus** and lists only the left and right arms. Pick one before you press **Run**. See [`motor.set-zero-pos`](/cli/motor-set-zero-pos#from-the-control-panel) for the steps.
 
 Mantis grippers calibrate themselves, so Mantis has no zeroing. To restore a saved configuration file, run [`motor.restore-config`](/cli/motor-restore-config) in a terminal.
 
@@ -148,7 +150,7 @@ In the ROM test, a deselected motor that doesn't answer is skipped. A deselected
 
 ### Steps that need you
 
-Some tests pause for you, for example to put an item in the gripper. The card then shows the instruction and a **Continue** button, such as "Position the item in the RIGHT gripper, then close it." Nothing moves until you press **Continue**.
+Some tests pause for you, for example to put an item in the gripper. The card then shows the instruction and a **Continue** button, such as "Position the item in the RIGHT gripper, then close it." Nothing moves until you press **Continue**. Press **Stop** to end the run instead.
 
 <a id="helpers"></a>
 

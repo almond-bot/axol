@@ -94,7 +94,7 @@ Each command places the shared configs at a different dotted path. Arm stiffness
 <Note>
   On a calibrated robot the defaults include that robot's measurements. They are applied in this order, and later ones win:
 
-  1. The built-in values. Shoulders with RMD-X8-P20-150 motors have their own built-in gains and friction. Axol reads the motor model each time the arms are enabled.
+  1. The built-in values. Shoulders with RMD-X8-P20-150 motors have their own built-in gains and friction. Axol reads the motor model each time the arms are enabled. If the log says the session started with the settings for a different shoulder motor, stop the operation and start it again.
   2. The factory calibration downloaded by [`calibration.pull`](/cli/tune-factory#calibration-pull), in `~/.almond/factory_calibration.json`.
   3. Gains, friction, masses and centres of mass saved on this computer by [`tune.pid --save`](/cli/tune-pid), [`tune.friction --save`](/cli/tune-friction) or [`tune.gravity --save`](/cli/tune-gravity), in `~/.almond/calibration.json`.
 

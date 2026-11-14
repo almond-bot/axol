@@ -11,7 +11,7 @@ Each joint sweeps back and forth at several speeds. From one sweep the tool fits
 - **Order:** each arm runs from `wrist_3` to `shoulder_1`. Each joint's fit is saved before the next joint sweeps, so the shoulder fits use the corrected wrist and elbow values.
 - **Poses:** the clearance and gravity-load poses are the same as in [`tune.friction`](/cli/tune-friction) and [`tune.gravity`](/cli/tune-gravity).
 
-The default `slow` profile calibrates friction for slow, smooth motion. On `shoulder_1`, `shoulder_2` and `elbow`, a slow-profile calibration also switches the joint to stiffer [slow-motion gains](/operations/teleop-config). A joint without one keeps the standard gains.
+The default `slow` profile calibrates friction for slow, smooth motion. On `shoulder_1`, `shoulder_2` and `elbow`, a slow-profile calibration also switches the joint to stiffer [slow-motion gains](/operations/teleop-config). A joint without one keeps the standard gains. A shoulder with an RMD-X8-P20-150 motor keeps its gains and takes only the friction fit.
 
 ## Where the results go
 

@@ -41,3 +41,11 @@ Press Ctrl-C to skip a joint.
 <Warning>
   **Axol won't enable arms whose zeros were never set.** Before it powers any motor, every arm bring-up checks that each joint's reading is plausible for its end-stop zero. This covers [`teleop`](/cli/teleop), [`collect-data`](/cli/collect-data), [`run-policy`](/cli/run-policy), [`gravity-comp`](/cli/gravity-comp), the [control panel](/guides/control-panel) and the [diagnostics dashboard](/guides/diagnostics-dashboard). If a joint fails, the error names it. Run `axol motor.set-zero-pos --guided`, then try again.
 </Warning>
+
+## From the control panel
+
+1. Open **Diagnostics** and press **Set zero position**.
+2. Choose **Guided** and pick the **Arm**.
+3. Press **Run**. Follow each instruction, then press **Continue**.
+
+Press **Stop** to end the run. Joints zeroed before that keep their new zero. If `wrist_2` or `wrist_3` is one of them, power-cycle Axol.

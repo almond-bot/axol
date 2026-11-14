@@ -18,7 +18,7 @@ Friction differs from motor to motor, and the built-in defaults are only a start
 
 The slow profile sweeps the speeds under 8°/s twice: once where the joint carries the least load, and once where it carries the most. With `--save` it stores the friction fit and the `stribeck_*` fields.
 
-On `shoulder_1`, `shoulder_2` and `elbow`, a saved slow-profile fit also switches the joint to stiffer [slow-motion gains](/operations/teleop-config). A joint without one keeps the standard gains. The `standard` profile doesn't switch them.
+On `shoulder_1`, `shoulder_2` and `elbow`, a saved slow-profile fit also switches the joint to stiffer [slow-motion gains](/operations/teleop-config). A joint without one keeps the standard gains. The `standard` profile doesn't switch them. A shoulder with an RMD-X8-P20-150 motor keeps its gains and takes only the friction fit.
 
 ## Sweep safety
 
