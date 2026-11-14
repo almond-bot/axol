@@ -307,6 +307,7 @@ function TableCell({
           onChange={(e) => onChange(field.key, e.target.value)}
           className={cellClass}
         >
+          {text === "" && <option value="" />}
           {(field.options ?? []).map((opt) => (
             <option key={opt} value={opt} className="bg-[#1a1a1a]">
               {opt}
@@ -523,7 +524,9 @@ export function FieldRow({
           onChange={(e) => onChange(field.key, e.target.value)}
           className="h-9 w-full rounded-md border border-input bg-white/[0.02] px-3 text-sm text-foreground outline-none focus-visible:border-ring/70 disabled:opacity-50"
         >
-          {field.required && <option value="">Select…</option>}
+          {/* An empty value needs its own entry, or the browser shows the
+              first option as picked and choosing it sends nothing. */}
+          {(field.required || text === "") && <option value="">Select…</option>}
           {(field.options ?? []).map((opt) => (
             <option key={opt} value={opt} className="bg-[#1a1a1a]">
               {opt}
