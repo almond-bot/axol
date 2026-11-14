@@ -136,14 +136,40 @@ _ARRIVE_TOL = 0.05
 _ARRIVE_TIMEOUT_S = 3.0
 
 
+#: A pass shorter than this (rad) is not run: the target stays where it was.
+_MIN_TRAVEL = 0.02
+#: A commanded start further than this (rad) from the measured position is
+#: not this joint's last target (far more than any load sags a joint): the
+#: ramp starts at the measured position instead.
+_START_SLACK = 0.5
+
+
+def _swept_to(start: float, end: float) -> float:
+    """Where a pass from ``start`` to ``end`` leaves the target (rad)."""
+    return end if abs(end - start) >= _MIN_TRAVEL else start
+
+
 async def _ramp_to(
     motor: JointFrameMotor,
     kp: float,
     kd: float,
     target: float,
     duration: float = 2.0,
+    start: float | None = None,
 ) -> None:
+    """Ramp the joint's target linearly to ``target`` over ``duration``.
+
+    ``start`` is where the last command left the target; pass it whenever it
+    is known. These moves carry no gravity feedforward, so a loaded joint
+    sits ``g/kp`` short of its target (about 5° at 21 Nm on kp 250).
+    Starting at the *measured* position instead drops that spring torque in
+    one cycle: the arm fell about 5° and bounced at every turnaround of a
+    loaded sweep window. ``None`` starts at the measured position, for a
+    joint still on its gravity-fed hold.
+    """
     start_pos = await motor.get_position()
+    if start is not None and abs(start - start_pos) <= _START_SLACK:
+        start_pos = start
     count = max(2, math.ceil(duration * _RATE_HZ) + 1)
     samples = [
         (start_pos + i / (count - 1) * (target - start_pos), target, 0.0)
@@ -467,7 +493,7 @@ async def _run_sweep_raw(
     estimate is already what we want.
     """
     travel = abs(end_pos - start_pos)
-    if travel < 0.02:
+    if travel < _MIN_TRAVEL:
         return []
     v = abs(velocity_rad_s)
     sign = 1.0 if velocity_rad_s > 0 else -1.0
@@ -711,24 +737,28 @@ async def _identify_joint(
         )
         print(f"  Dumping per-bin samples to {dump_csv}")
 
+    # Where the last command left the target (see _ramp_to). None until the
+    # first ramp, which leaves the gravity-fed hold at the measured position.
+    cmd: float | None = None
     try:
         for pass_index, v in enumerate(velocities):
             print(f"\n  v = {math.degrees(v):.1f} deg/s ...")
 
             # Ramp to sweep start with time proportional to distance
-            cur = await motor.get_position()
+            cur = await motor.get_position() if cmd is None else cmd
             ramp_dur = abs(sweep_lo - cur) / _RAMP_SPEED + 1.0
-            await _ramp_to(motor, kp, kd, sweep_lo, duration=ramp_dur)
+            await _ramp_to(motor, kp, kd, sweep_lo, duration=ramp_dur, start=cmd)
             await asyncio.sleep(0.3)
 
             fwd = await _run_sweep_raw(motor, kp, kd, sweep_lo, +v, sweep_hi)
-            cur = await motor.get_position()
+            turn = _swept_to(sweep_lo, sweep_hi)
             print(f"    fwd: {len(fwd)} samples")
 
             # Hold at turnaround to damp velocity before reversing
-            await _ramp_to(motor, kp, kd, cur, duration=2.0)
+            await _ramp_to(motor, kp, kd, turn, duration=2.0, start=turn)
 
-            bwd = await _run_sweep_raw(motor, kp, kd, cur, -v, sweep_lo)
+            bwd = await _run_sweep_raw(motor, kp, kd, turn, -v, sweep_lo)
+            cmd = _swept_to(turn, sweep_lo)
             print(f"    bwd: {len(bwd)} samples")
             if raw_writer is not None:
                 side_name = "left" if is_left else "right"
@@ -926,6 +956,9 @@ async def _identify_slow(
         )
         print(f"  Dumping every cruise sample to {raw_csv}")
     group = 0
+    # Where the last command left the target (see _ramp_to). None until the
+    # first ramp, which leaves the gravity-fed hold at the measured position.
+    cmd: float | None = None
     try:
         for v in speeds:
             for start, end in slow_windows(lo, hi, v, load):
@@ -934,15 +967,21 @@ async def _identify_slow(
                     f"[{math.degrees(start):.1f}, {math.degrees(end):.1f}]° "
                     f"(load {load(start):.1f}-{load(end):.1f} Nm) ..."
                 )
-                cur = await motor.get_position()
+                cur = await motor.get_position() if cmd is None else cmd
                 await _ramp_to(
-                    motor, kp, kd, start, duration=abs(start - cur) / _RAMP_SPEED + 1.0
+                    motor,
+                    kp,
+                    kd,
+                    start,
+                    duration=abs(start - cur) / _RAMP_SPEED + 1.0,
+                    start=cmd,
                 )
                 await asyncio.sleep(0.3)
                 fwd = await _run_sweep_raw(motor, kp, kd, start, +v, end)
-                cur = await motor.get_position()
-                await _ramp_to(motor, kp, kd, cur, duration=2.0)
-                bwd = await _run_sweep_raw(motor, kp, kd, cur, -v, start)
+                turn = _swept_to(start, end)
+                await _ramp_to(motor, kp, kd, turn, duration=2.0, start=turn)
+                bwd = await _run_sweep_raw(motor, kp, kd, turn, -v, start)
+                cmd = _swept_to(turn, start)
                 print(f"    fwd {len(fwd)} / bwd {len(bwd)} samples")
                 for direction, samples in (("+", fwd), ("-", bwd)):
                     for q, tau in samples:
