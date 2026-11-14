@@ -37,6 +37,7 @@ from ...motor.damiao import DamiaoMotor
 from ...motor.motor import Motor, make_driver
 from ...robot.axol import EITHER_STOP_JOINTS, closer_end_stop
 from ...robot.safety import SafetyBoard, SafetyError, resolve_safety_channel
+from .. import web_prompt
 from . import add_side_and_channel_arguments, resolve_channel
 
 # Marker prefix a --web-prompts step prints before blocking on stdin (same
@@ -95,7 +96,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
 def run(args: argparse.Namespace) -> None:
     """Set a motor's zero position (single ``--id`` or ``--guided`` mode)."""
-    asyncio.run(_run(args))
+    try:
+        asyncio.run(_run(args))
+    except KeyboardInterrupt:
+        print("\nstopped.")
+        sys.exit(130)
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -175,15 +180,17 @@ def _prompt(instruction: str, web_prompts: bool, button: str | None = None) -> b
     ``--web-prompts``: emit a ``[prompt]`` marker the dashboard turns into a
     button (Continue, or ``button`` when given), then block until it writes a
     line to our stdin. Otherwise an ordinary tty Enter prompt. Returns
-    ``False`` on Ctrl-C / EOF.
+    ``False`` on EOF, and on Ctrl-C at a tty prompt (skip this step). The
+    panel's Stop (SIGINT during a web prompt) raises ``KeyboardInterrupt``
+    instead, so the run ends rather than moving on to the next step.
     """
+    if web_prompts:
+        label = f" {BUTTON_MARKER} {button}]" if button else ""
+        if web_prompt.ask(f"{PROMPT_MARKER} {instruction}{label}") == "":
+            print("\n    skipped.")
+            return False
+        return True
     try:
-        if web_prompts:
-            label = f" {BUTTON_MARKER} {button}]" if button else ""
-            print(f"{PROMPT_MARKER} {instruction}{label}", flush=True)
-            if sys.stdin.readline() == "":
-                raise EOFError
-            return True
         if button:
             action = button[0].lower() + button[1:]
             input(f"  {instruction}\n  Press Enter to {action}, or Ctrl-C to skip: ")
@@ -360,6 +367,7 @@ async def _run_guided(args: argparse.Namespace) -> None:
 
         results: list[tuple[Joint, bool]] = []
         zeroed_damiao: list[Joint] = []
+        stopped = False
         for joint in joints:
             target, sign = closer_end_stop(joint, is_left)
             motor = motors[joint]
@@ -374,6 +382,9 @@ async def _run_guided(args: argparse.Namespace) -> None:
                     )
             except KeyboardInterrupt:
                 print("\naborted.")
+                # The panel's Stop ends the run. Ctrl-C at a terminal still
+                # goes on to the summary and the Damiao power cycle.
+                stopped = args.web_prompts
                 break
             results.append((joint, ok))
             if ok and isinstance(motor._driver, DamiaoMotor):
@@ -382,6 +393,12 @@ async def _run_guided(args: argparse.Namespace) -> None:
         print("\n— summary —")
         for joint, ok in results:
             print(f"  {joint.name:<12} {'zeroed' if ok else 'skipped'}")
+
+        if stopped:
+            if zeroed_damiao:
+                names = ", ".join(j.name for j in zeroed_damiao)
+                print(f"\n⚠  Damiao motors zeroed ({names}) — power-cycle required.")
+            raise KeyboardInterrupt
 
         if zeroed_damiao:
             await _apply_damiao_zeros(

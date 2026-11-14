@@ -55,6 +55,7 @@ from ...motor.motor import make_driver
 from ...motor.myactuator import MyActuatorMotor
 from ...motor.types import ControlMode, MotorStatus
 from ...utils.paths import almond_path
+from .. import web_prompt
 
 STEPS = ("assign", "zero", "cycle")
 MYACTUATOR = MyActuatorMotor.MOTOR_TYPE
@@ -114,9 +115,12 @@ def _console_prompt(text: str) -> bool:
 
 
 def _web_prompt(text: str) -> bool:
-    """Print a prompt marker and block until the panel's Continue answers."""
-    print(f"{PROMPT_MARKER} {text}", flush=True)
-    return sys.stdin.readline() != ""
+    """Print a prompt marker and block until the panel's Continue answers.
+
+    The panel's Stop raises ``KeyboardInterrupt`` here, which :func:`run`
+    reports as stopped.
+    """
+    return web_prompt.ask(f"{PROMPT_MARKER} {text}") != ""
 
 
 def _bus_prompt(prompt: PromptFn, label: str) -> PromptFn:
