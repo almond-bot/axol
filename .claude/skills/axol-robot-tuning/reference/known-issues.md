@@ -24,6 +24,12 @@ its hard stop.**
 Cause (fixed in `a3483f3`): a fixed 4 s linear ramp to 0 before homing.
 Update the checkout.
 
+**In a friction sweep the arm drops about 5° and bounces each time it
+turns around while held out.**
+Cause (fixed): every move of the swept joint started at its measured
+position, which under load sits `g/kp` behind the target, so the spring let
+go at once. Update the checkout.
+
 **Joints sag for a moment when a tuning tool starts.**
 Expected: the motors reset (~2.5 s, no torque, no brakes) before the holds
 engage. Start with the arms hanging at rest; an arm raised at start-up will
