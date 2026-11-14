@@ -47,6 +47,13 @@ def _config(
             ),
             mock.patch.object(config_module, "FACTORY_CALIBRATION_PATH", factory_path),
             mock.patch.object(config_module, "hub_serial", return_value=SERIAL),
+            # Not this machine's own motor record: the shoulders stay the
+            # X8-P20-120 these tests are about.
+            mock.patch.object(
+                config_module,
+                "load_motor_models",
+                return_value={"left": {}, "right": {}},
+            ),
             mock.patch.object(
                 config_module,
                 "load_factory_calibration",

@@ -479,6 +479,12 @@ def update_joint_calibration(
             if f in friction
         }
     if stribeck is not None:
+        if "stribeck_dfs" in stribeck and "stribeck_gain" not in stribeck:
+            # A fit saved without a gain (the tune tools, for a shoulder
+            # whose motor model is not known): the gain an earlier fit saved
+            # goes with that fit, or it would stay pinned over the default
+            # of the motor the joint turns out to have.
+            entry.pop("stribeck_gain", None)
         for field, value in stribeck.items():
             entry[field] = float(value)
     if com is not None:

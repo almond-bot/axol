@@ -62,7 +62,12 @@ from ...motor import CanBus, ControlMode, Joint, Motor, MotorError
 from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.gravity import GravityCompensator
-from ...robot.motor_models import X8_150, note_motor_models, recorded_shoulder_variant
+from ...robot.motor_models import (
+    X8_150,
+    note_motor_models,
+    recorded_model,
+    shoulder_variant,
+)
 from ...tuning import (
     JointFrameMotor,
     joint_frame_motors,
@@ -1106,31 +1111,66 @@ def fit_and_report(
     return fit
 
 
-def _stribeck_gain(args: argparse.Namespace, joint: Joint, side: str) -> float:
+def _motor_model(motor: object) -> str | None:
+    """The model a motor's driver read at bring-up, if it read one."""
+    raw = getattr(motor, "motor", motor)
+    model = getattr(getattr(raw, "_driver", None), "_model", None)
+    return model if isinstance(model, str) and model else None
+
+
+def _stribeck_gain(
+    args: argparse.Namespace, joint: Joint, side: str, model: str | None = None
+) -> float | None:
     """The share of the fitted low-speed excess to save for ``side``'s joint.
 
     An X8-P20-150 shoulder saves it off unless asked: the cancellation is
     untested on that motor at the spring it runs (see ``_X8_150_GAINS`` in
-    :mod:`almond_axol.robot.config`). The fit itself is saved either way.
+    :mod:`almond_axol.robot.config`). ``model`` is what the motor said in
+    this run; without it (``--fit-csv`` touches no motor) the last recorded
+    model stands in.
+
+    ``None`` means save no gain: a shoulder whose motor is not known. A gain
+    saved in the calibration wins over the defaults for good, so a guess
+    would pin the wrong one. Without it the joint takes the default for the
+    motor it turns out to have. The fit itself is saved either way.
     """
     if args.stribeck_gain is not None:
         return float(args.stribeck_gain)
-    if (
-        joint in (Joint.SHOULDER_1, Joint.SHOULDER_2)
-        and recorded_shoulder_variant(side, joint.value) == X8_150
-    ):
-        return 0.0
+    if joint in (Joint.SHOULDER_1, Joint.SHOULDER_2):
+        model = model or recorded_model(side, joint.value)
+        if model is None:
+            return None
+        if shoulder_variant(model) == X8_150:
+            return 0.0
     return DEFAULT_STRIBECK_GAIN.get(joint, 0.0)
 
 
-def save_slow_fit(fit: "FrictionFit", side: str, joint: Joint, gain: float) -> Path:
+def stribeck_fields(fit: "FrictionFit", gain: float | None) -> dict[str, float]:
+    """The ``stribeck_*`` fields to save: the fit, and the gain unless it is
+    left to the default (``None``, see :func:`_stribeck_gain`)."""
+    fields = fit.stribeck_params(0.0 if gain is None else gain)
+    if gain is None:
+        del fields["stribeck_gain"]
+    return fields
+
+
+def save_slow_fit(
+    fit: "FrictionFit", side: str, joint: Joint, gain: float | None
+) -> Path:
     path = update_joint_calibration(
         side,
         joint.value,
         friction=fit.friction_params(),
-        stribeck=fit.stribeck_params(gain),
+        stribeck=stribeck_fields(fit, gain),
     )
-    print(f"\n  Saved friction + Stribeck (gain {gain:g}) to {path}")
+    if gain is None:
+        print(
+            f"\n  Saved friction + Stribeck fit to {path}. No Stribeck gain "
+            f"saved: {joint.value}'s motor model is not known yet, so the "
+            "default for its motor applies."
+        )
+    else:
+        print(f"\n  Saved friction + Stribeck (gain {gain:g}) to {path}")
     return path
 
 
@@ -1365,7 +1405,12 @@ async def _run(args: argparse.Namespace) -> None:
                 fit = fit_and_report(rows, joint, is_left, other_targets)
                 if fit is not None and args.save:
                     save_slow_fit(
-                        fit, side_str, joint, _stribeck_gain(args, joint, side_str)
+                        fit,
+                        side_str,
+                        joint,
+                        _stribeck_gain(
+                            args, joint, side_str, _motor_model(raw_motors[joint])
+                        ),
                     )
                 elif fit is not None:
                     print("\n  (re-run with --save to persist)")

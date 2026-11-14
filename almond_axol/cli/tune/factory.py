@@ -95,11 +95,13 @@ from .friction import (
     _home_all,
     _identify_joint,
     _identify_slow,
+    _motor_model,
     _ramp_verified,
     _safe_torque_off,
     _stribeck_gain,
     fit_and_report,
     slow_profile_seconds,
+    stribeck_fields,
     sweep_load,
 )
 from .gravity import fit_com
@@ -212,6 +214,14 @@ def merge_cloud_document(
         if isinstance(new, dict):
             for joint, entry in new.items():
                 prev = side_doc.get(joint)
+                if (
+                    isinstance(prev, dict)
+                    and "stribeck_dfs" in entry
+                    and "stribeck_gain" not in entry
+                ):
+                    # A fit saved without a gain replaces the stored fit's
+                    # gain too (see update_joint_calibration).
+                    prev = {k: v for k, v in prev.items() if k != "stribeck_gain"}
                 side_doc[joint] = (
                     {**prev, **entry} if isinstance(prev, dict) else dict(entry)
                 )
@@ -723,7 +733,9 @@ async def _calibrate_joint_slow(
     stribeck = None
     if fit is not None:
         entry["friction"] = fit.friction_params()
-        stribeck = fit.stribeck_params(_stribeck_gain(args, joint, side_str))
+        stribeck = stribeck_fields(
+            fit, _stribeck_gain(args, joint, side_str, _motor_model(motors[joint]))
+        )
         entry.update(stribeck)
     if com_fit is not None:
         entry["com"] = [round(v, 5) for v in com_fit]
