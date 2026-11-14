@@ -30,6 +30,18 @@ Cause (fixed): every move of the swept joint started at its measured
 position, which under load sits `g/kp` behind the target, so the spring let
 go at once. Update the checkout.
 
+**The hand stair-steps while a shoulder moves at teleop speed; the robot has
+RMD-X8-P20-150 shoulders (`axol motor.info --l --id 1`).**
+Cause: the X8-P20-120 gain sets pass the -150 gearbox's ripple into the arm
+(see `history.md`). The config uses the -150 set once a bring-up has
+recorded the motor models in `~/.almond/motor_models.json`. Check: that
+file names the -150 on both shoulders of both arms for this hub;
+`effective_config` shows host damper 10 on shoulder_1 and shoulder_2; the
+calibration file and the panel settings carry no `kp` / `kd_host` /
+`stribeck_gain` for those joints from an older tuning. The first session on
+a new computer or after an arm swap runs the old set and logs a warning:
+start it again.
+
 **Joints sag for a moment when a tuning tool starts.**
 Expected: the motors reset (~2.5 s, no torque, no brakes) before the holds
 engage. Start with the arms hanging at rest; an arm raised at start-up will

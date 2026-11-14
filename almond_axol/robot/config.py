@@ -41,6 +41,12 @@ from .calibration import (
     load_factory_calibration,
 )
 from .identity import hub_serial
+from .motor_models import (
+    MOTOR_MODELS_PATH,
+    X8_150,
+    load_motor_models,
+    shoulder_variant,
+)
 
 _logger = logging.getLogger(__name__)
 _warned_calibration_identity = False
@@ -850,6 +856,69 @@ _RIGHT_FRICTION = _ArmFriction(
     wrist_3=FrictionParams(fc=0.1172, k=204.46, fv=0.0, fo=0.0042),
 )
 
+# The RMD-X8-P20-150 shoulders (firmware 2026083101). The X8-P20-120 sets
+# above and below put more ripple into the arm on these: the gearbox has a
+# position-locked ripple at about 36, 44 and 53 cycles per joint revolution,
+# which lands at 3-9 Hz at teleop speeds, and the arm sees it in proportion
+# to the joint's control stiffness there. The joint's own encoder does not
+# show it (it reads the same or better on the stiffer sets); the motor's
+# torque ripple and the held wrist and elbow do. Measured at ROM-test speed
+# (2026-11-13/14, interleaved, live-guarded), shoulder_2 on four arms of two
+# robots and shoulder_1 on two arms of one: the swept joint's torque ripple
+# (cNm, 2-13 Hz), then the reaction of a held joint (mdeg; wrist_2 under
+# shoulder_2, the elbow under shoulder_1):
+#
+#   shoulder_2  X8-P20-120 calibrated gains (500/5/70)   232-496   94-251
+#               X8-P20-120 defaults (250/3.5/35, Q 0.8)  117-275   40-123
+#               this set                                  39-99    11-33
+#   shoulder_1  X8-P20-120 calibrated gains (450/5/110)  204-249   77-120
+#               X8-P20-120 defaults (250/3.5/40, Q 3)    104-106   22-33
+#               host damper 20                             73-74    15-22
+#               this set                                   58-60    11-20
+#
+# with tracking lag and the 1-4 Hz ring after a stop unchanged against the
+# X8-P20-120 defaults. A lower spring (kp 180) was no better on shoulder_2,
+# and a damper pinned at the ripple's 5.4 Hz swung the arm at 2 Hz at rest.
+# Selected per joint by the motor's model (see :mod:`.motor_models`).
+_X8_150_GAINS: dict[str, dict[str, Any]] = {
+    joint: {
+        "kp": 250.0,
+        "kd": 3.5,
+        "kd_host": 10.0,
+        "kd_host_hz": None,
+        "kd_host_q": 3.0,
+    }
+    for joint in ("shoulder_1", "shoulder_2")
+}
+
+# What a slow-profile friction calibration changes on an X8-P20-150 shoulder:
+# nothing in the gains. The stiffer X8-P20-120 slow-motion set is the worst
+# row of the table above, and the Stribeck cancellation is untested on this
+# motor at kp 250 (on the X8-P20-120 it raised shoulder_2's slow ripple 30%
+# there), so ``tune.friction`` saves it off for these joints. Calibration
+# still replaces the fallback friction below with the joint's own fit.
+_X8_150_SLOW_FRICTION_GAINS: dict[str, dict[str, Any]] = {
+    "shoulder_1": {},
+    "shoulder_2": {},
+}
+
+# Fallback friction for an uncalibrated X8-P20-150 shoulder, the same on
+# both arms: the mean of the slow-profile fits of the arms measured so far
+# (``tune.friction --profile slow``, 2026-11-13/14), as sliding friction at
+# no load ``fc`` (Nm) and its growth with gravity load ``fl`` (Nm per Nm):
+#
+#   shoulder_1  0.81 / 0.038   0.69 / 0.031
+#   shoulder_2  0.51 / 0.041   0.58 / 0.045   0.08 / 0.052   0.59 / 0.032
+#
+# The last two shoulder_2 fits swept 1-30°/s, the others 2-8°/s. At the
+# runtime law's ``k``, and with no Stribeck values: as on the X8-P20-120,
+# those come only from a robot's own calibration. ``fo`` is 0, because the
+# fitted offsets (-0.75 to +0.17 Nm) share no sign or size between arms.
+_X8_150_FRICTION: dict[str, FrictionParams] = {
+    "shoulder_1": FrictionParams(fc=0.75, k=100.0, fv=0.0, fo=0.0, fl=0.034),
+    "shoulder_2": FrictionParams(fc=0.44, k=100.0, fv=0.0, fo=0.0, fl=0.042),
+}
+
 # The slow-motion gains (#317), applied per joint over the ArmConfig defaults
 # only where that joint carries its own slow-profile friction calibration
 # (``tune.factory`` or ``tune.friction --profile slow --save``; see
@@ -979,6 +1048,11 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     panel's Advanced settings) apply on top of the built defaults and
     therefore still win.
 
+    A shoulder this hub's arm was last seen with as an RMD-X8-P20-150 (see
+    :mod:`.motor_models`) starts from :data:`_X8_150_GAINS` and
+    :data:`_X8_150_FRICTION` in place of the X8-P20-120 defaults, and takes
+    :data:`_X8_150_SLOW_FRICTION_GAINS` once it is calibrated.
+
     Each :class:`FrictionParams` is copied (``replace()`` with no field
     overrides) so that mutating one config's friction — e.g.
     ``config.left.shoulder_1.friction.fc = 0.5`` — does not aliasing-leak
@@ -1002,7 +1076,11 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     # local values winning, so a locally retuned friction fit shadows the
     # factory's while the factory's com (say) still applies.
     side = "left" if is_left else "right"
-    if not CALIBRATION_PATH.is_file() and not FACTORY_CALIBRATION_PATH.is_file():
+    if not (
+        CALIBRATION_PATH.is_file()
+        or FACTORY_CALIBRATION_PATH.is_file()
+        or MOTOR_MODELS_PATH.is_file()
+    ):
         return arm
     try:
         current_hub_serial = hub_serial()
@@ -1018,6 +1096,21 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
         return arm
     if current_hub_serial is None:
         return arm
+    # The motors this hub's arm was last seen with pick each shoulder's
+    # default set, under everything the robot's calibration then overlays.
+    models = load_motor_models(expected_hub_serial=current_hub_serial)[side]
+    slow_gains = dict(_SLOW_FRICTION_GAINS)
+    variant: dict[str, JointConfig] = {}
+    for joint in _X8_150_GAINS:
+        if shoulder_variant(models.get(joint)) == X8_150:
+            variant[joint] = replace(
+                getattr(arm, joint),
+                friction=replace(_X8_150_FRICTION[joint]),
+                **_X8_150_GAINS[joint],
+            )
+            slow_gains[joint] = _X8_150_SLOW_FRICTION_GAINS[joint]
+    if variant:
+        arm = replace(arm, **variant)
     factory = load_factory_calibration(expected_hub_serial=current_hub_serial)[side]
     local = load_calibration(expected_hub_serial=current_hub_serial)[side]
     if not factory and not local:
@@ -1030,8 +1123,8 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
         jc = getattr(arm, joint.value)
         # The slow-motion gains go under the entry, so gains the entry
         # itself carries (tune.pid --save, its stribeck_gain) still win.
-        if slow_friction_calibrated(entry) and joint.value in _SLOW_FRICTION_GAINS:
-            jc = replace(jc, **_SLOW_FRICTION_GAINS[joint.value])
+        if slow_friction_calibrated(entry) and joint.value in slow_gains:
+            jc = replace(jc, **slow_gains[joint.value])
         overrides[joint.value] = _calibrated_joint(jc, entry)
     return replace(arm, **overrides)
 

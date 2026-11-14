@@ -84,7 +84,7 @@ The saved calibration holds `friction`, `mass` (kg) and `com` for each joint:
 | `--left-channel IFACE` / `--right-channel IFACE` | CAN interface overrides (default: the Axol hub's interface names) |
 | `--profile {slow,standard}` | `slow` (default) calibrates friction for slow motion. `standard` is a quicker 7–72°/s sweep without the slow-speed and load terms. |
 | `--velocities DEG_S …` | Sweep speeds in deg/s (default: `1 2 3 5 8 15 30` for slow, `7.2 18 36 54 72` for standard) |
-| `--stribeck-gain G` | Share of the extra low-speed friction to cancel, saved for every joint (default: 0.8 on `shoulder_1`, `shoulder_2` and `elbow`, 0 elsewhere) |
+| `--stribeck-gain G` | Share of the extra low-speed friction to cancel, saved for every joint (default: 0.8 on `shoulder_1`, `shoulder_2` and `elbow`, 0 on the other joints and on RMD-X8-P20-150 shoulders) |
 | `--raw-dir DIR` | Save each joint's raw sweep samples to `DIR/<side>-<joint>.csv`. Refit them later with `tune.friction --fit-csv`. |
 | `--hub-serial SERIAL` | Robot identity for the upload (default: the attached hub's USB serial) |
 | `--keep-gravity` | Keep the [hand-tuned gravity model](#keeping-a-hand-tuned-gravity-model) from the panel settings. Saves friction only. |

@@ -153,3 +153,47 @@ All of this was with the stock gripper and camera on the wrist.
   `tune.factory --keep-gravity`.
 - Lesson for later reports of "one arm oscillates in teleop": a phone video
   can't tell input jitter from control ringing — record the bus (Phase 1).
+
+## RMD-X8-P20-150 shoulders (Nov 13–14, four arms of two robots)
+
+- **Symptom:** stair-stepping of the hand while a shoulder moves at teleop
+  or ROM-test speed; fine at creep speeds. Worst on shoulder_2, and worse
+  after `tune.friction --save` had switched the joint to the calibrated set.
+- **Cause:** the -150 gearbox has a position-locked ripple at about 36, 44
+  and 53 cycles per joint revolution (3–9 Hz at 0.3–0.9 rad/s). It is a
+  position error between motor and arm, so the arm sees it in proportion to
+  the joint's control stiffness in that band. Stiffer springs and the wide
+  host damper pass more of it on.
+- **The joint's own encoder is the wrong metric here:** its 2–13 Hz ripple
+  stays the same or improves on the stiff sets (shoulder_1: 55 mdeg on the
+  calibrated gains, 92 on the defaults, 107 on the soft set) while the arm
+  shakes two to four times more. What follows the shake: the swept joint's
+  motor torque ripple, and the deflection of a held light joint (wrist_2
+  under shoulder_2, the elbow and wrist_3 under shoulder_1). No camera or
+  IMU was on these robots.
+- **What won:** kp 250, kd 3.5, host damper 10 pose-tracked at Q 3 on both
+  shoulders (numbers in `numbers.md` and beside `_X8_150_GAINS`). Torque
+  ripple −64…−84% on shoulder_2 and −43…−76% on shoulder_1 against the
+  X8-P20-120 sets, with lag and the post-stop ring unchanged against the
+  uncalibrated set.
+- **What did not:** kp 180 (no better than 250); a damper pinned on the
+  ripple at 5.4 Hz (−20% encoder ripple, a sustained 2 Hz swing at rest;
+  at twice the gain unstable at 1.7 Hz, e-stopped); a position-indexed
+  torque feedforward fitted to the ripple (no effect: it is not a torque
+  disturbance); wrist_2 kp 130 → 60; Stribeck on or off (no effect at this
+  speed).
+- **Not tested:** creep speeds and `slow_osc` on the soft set, and the
+  Stribeck cancellation at kp 250 on this motor, which is why it is saved
+  off for these joints.
+- **Torque scaling:** holding torque was 0.95–1.00× the gravity model on
+  six shoulder joints, so CURRENT_SAMPLE_RES 1 is right for the -150.
+- **Friction** (slow profile, six fits): sliding 0.08–0.81 Nm at no load
+  plus 0.031–0.052 Nm per Nm of gravity load, about 0.9–1.3 Nm at mid
+  load; `fo` −0.75…+0.17 Nm with no pattern between arms. The fallback is
+  the mean (`_X8_150_FRICTION`).
+- **Friction tool:** the sweeps carry no gravity feedforward, and each move
+  started at the measured position, so a loaded joint (5° behind its target
+  at 21 Nm) dropped 5° and bounced at every turnaround. Moves now start at
+  the last commanded position. Under the tool's plain PD a -150 shoulder
+  still rings about 1° at 2 Hz in the 15°/s pass (the ripple sits on the
+  spring's own mode there) and when a fast pass brakes.

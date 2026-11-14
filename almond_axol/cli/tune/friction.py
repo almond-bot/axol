@@ -62,6 +62,7 @@ from ...motor import CanBus, ControlMode, Joint, Motor, MotorError
 from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.gravity import GravityCompensator
+from ...robot.motor_models import X8_150, note_motor_models, recorded_shoulder_variant
 from ...tuning import (
     JointFrameMotor,
     joint_frame_motors,
@@ -1105,9 +1106,20 @@ def fit_and_report(
     return fit
 
 
-def _stribeck_gain(args: argparse.Namespace, joint: Joint) -> float:
+def _stribeck_gain(args: argparse.Namespace, joint: Joint, side: str) -> float:
+    """The share of the fitted low-speed excess to save for ``side``'s joint.
+
+    An X8-P20-150 shoulder saves it off unless asked: the cancellation is
+    untested on that motor at the spring it runs (see ``_X8_150_GAINS`` in
+    :mod:`almond_axol.robot.config`). The fit itself is saved either way.
+    """
     if args.stribeck_gain is not None:
         return float(args.stribeck_gain)
+    if (
+        joint in (Joint.SHOULDER_1, Joint.SHOULDER_2)
+        and recorded_shoulder_variant(side, joint.value) == X8_150
+    ):
+        return 0.0
     return DEFAULT_STRIBECK_GAIN.get(joint, 0.0)
 
 
@@ -1174,7 +1186,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         default=None,
         help="Share of the fitted low-speed excess the runtime cancels, saved "
         "with --profile slow (default 0.8 on shoulder_1, shoulder_2 and the elbow, 0 "
-        "elsewhere: on shoulder_2/3 it made slow motion rougher)",
+        "elsewhere and on RMD-X8-P20-150 shoulders)",
     )
     p.add_argument(
         "--fit-csv",
@@ -1282,7 +1294,7 @@ async def _run(args: argparse.Namespace) -> None:
         print(f"\nFitting {side_str} {joint.value} from {len(data['q'])} saved samples")
         fit = fit_and_report(data, joint, is_left, other_targets)
         if fit is not None and args.save:
-            save_slow_fit(fit, side_str, joint, _stribeck_gain(args, joint))
+            save_slow_fit(fit, side_str, joint, _stribeck_gain(args, joint, side_str))
         elif fit is not None:
             print("\n  (re-run with --save to persist)")
         return
@@ -1296,6 +1308,7 @@ async def _run(args: argparse.Namespace) -> None:
     async with CanBus(channel) as bus:
         raw_motors = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw_motors.values()])
+        note_motor_models(side_str, raw_motors)
         # Motor encoders are zeroed at end stops; the sweep ranges, gravity
         # poses, and park targets below are joint frame (0 = rest), so wrap
         # the motors in the frame conversion before any position I/O.
@@ -1351,7 +1364,9 @@ async def _run(args: argparse.Namespace) -> None:
                 )
                 fit = fit_and_report(rows, joint, is_left, other_targets)
                 if fit is not None and args.save:
-                    save_slow_fit(fit, side_str, joint, _stribeck_gain(args, joint))
+                    save_slow_fit(
+                        fit, side_str, joint, _stribeck_gain(args, joint, side_str)
+                    )
                 elif fit is not None:
                     print("\n  (re-run with --save to persist)")
                 return

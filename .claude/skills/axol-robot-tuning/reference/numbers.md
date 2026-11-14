@@ -86,6 +86,16 @@ the coded fallback friction, which is why it is gated.
 An arm that oscillates on the uncalibrated set's joints at kp 450–500 means
 the robot is not factory-calibrated: run `tune.factory` before tuning.
 
+**RMD-X8-P20-150 shoulders** (the table above is the X8-P20-120). Both
+shoulders run 250 / 3.5 / host damper 10 pose-tracked, Q 3, Stribeck 0,
+calibrated or not; calibration only replaces their fallback friction with
+the joint's own fit. The config picks this from the motor models recorded at
+the last bring-up (`~/.almond/motor_models.json`, keyed to the hub), so the
+first session on a new computer or after an arm swap still runs the other
+set and logs a warning. `motor.info` shows a motor's model. At ROM-test
+speed on four arms: shoulder_2 torque ripple 39-99 cNm (2-13 Hz) and
+wrist_2 reaction 11-33 mdeg; shoulder_1 58-60 cNm and elbow 11-20 mdeg.
+
 Calibration tools hold and sweep at fixed calibration gains instead
 (s1/s2 250/3.5, s3 180/5, elbow 130/5, wrists as above). `robot_report.py`
 → `effective_config` shows what a given robot actually runs.

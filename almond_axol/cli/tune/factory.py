@@ -76,6 +76,7 @@ from ...robot.calibration_cloud import (
     supabase_credentials,
 )
 from ...robot.config import AxolConfig
+from ...robot.motor_models import note_motor_models
 from ...tuning import (
     JointFrameMotor,
     joint_frame_motors,
@@ -722,7 +723,7 @@ async def _calibrate_joint_slow(
     stribeck = None
     if fit is not None:
         entry["friction"] = fit.friction_params()
-        stribeck = fit.stribeck_params(_stribeck_gain(args, joint))
+        stribeck = fit.stribeck_params(_stribeck_gain(args, joint, side_str))
         entry.update(stribeck)
     if com_fit is not None:
         entry["com"] = [round(v, 5) for v in com_fit]
@@ -778,6 +779,7 @@ async def _calibrate_arm(
     async with CanBus(channel) as bus:
         raw_motors = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw_motors.values()])
+        note_motor_models(side_str, raw_motors)
         motors = await joint_frame_motors(raw_motors, is_left)
         # Every joint on impedance and held where it is before anything moves.
         await _enter_impedance_hold(motors)
