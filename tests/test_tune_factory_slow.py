@@ -10,6 +10,7 @@ import io
 import math
 import unittest
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -36,8 +37,69 @@ TRUE = FrictionFit(
 )
 
 
+def _reporting(model: str | None) -> SimpleNamespace:
+    """A swept joint's motor whose driver read ``model`` at bring-up."""
+    return SimpleNamespace(motor=SimpleNamespace(_driver=SimpleNamespace(_model=model)))
+
+
 class SlowFactoryTest(unittest.TestCase):
     def test_entry_has_friction_load_stribeck_and_com(self) -> None:
+        entry, saved, jc, com0 = self._calibrate_shoulder_1("RMD-X8-P20-120")
+        self.assertIsNotNone(entry)
+        self.assertIn("com", entry)
+        self.assertAlmostEqual(entry["com"][1] - com0[1], 0.01, delta=0.004)
+        self.assertEqual(entry["stribeck_gain"], 0.8)  # shoulder_1's default
+        self.assertGreater(entry["friction"]["fl"], 0.0)
+        self.assertGreater(entry["stribeck_dfs"], 0.0)
+        # The saved curve reproduces the true one where slow motion lives.
+        fit = FrictionFit(
+            fc=entry["friction"]["fc"],
+            fl=entry["friction"]["fl"],
+            k=100.0,
+            fv=entry["friction"]["fv"],
+            fo=0.0,
+            dfs=entry["stribeck_dfs"],
+            ls=entry["stribeck_load_gain"],
+            vs=entry["stribeck_vs"],
+            rms=0,
+            r2=0,
+            n=0,
+            load_span=0,
+            speeds=(),
+        )
+        for v_deg in (2, 5, 15):
+            v = math.radians(v_deg)
+            for g in (3.0, 10.0):
+                self.assertAlmostEqual(
+                    float(fit.halfdiff(np.array([v]), g)[0]),
+                    float(TRUE.halfdiff(np.array([v]), g)[0]),
+                    delta=0.08,
+                )
+        self.assertEqual(saved["stribeck"]["stribeck_gain"], 0.8)
+        self.assertEqual(saved["hub_serial"], "hub1")
+        # A fitted CoM travels with the mass it was fitted against.
+        self.assertEqual(entry["mass"], jc.mass)
+        self.assertEqual(saved["mass"], jc.mass)
+
+    def test_a_150_shoulder_saves_the_stribeck_gain_off(self) -> None:
+        entry, saved, _jc, _com0 = self._calibrate_shoulder_1("RMD-X8-P20-150")
+        self.assertEqual(entry["stribeck_gain"], 0.0)
+        self.assertEqual(saved["stribeck"]["stribeck_gain"], 0.0)
+        self.assertGreater(entry["stribeck_dfs"], 0.0)  # the fit is still kept
+
+    def test_a_shoulder_of_unknown_model_saves_no_stribeck_gain(self) -> None:
+        # A gain saved in the calibration wins for good: don't guess one.
+        with mock.patch(
+            "almond_axol.cli.tune.friction.recorded_model", return_value=None
+        ):
+            entry, saved, _jc, _com0 = self._calibrate_shoulder_1(None)
+        self.assertNotIn("stribeck_gain", entry)
+        self.assertNotIn("stribeck_gain", saved["stribeck"])
+        self.assertGreater(entry["stribeck_dfs"], 0.0)
+
+    def _calibrate_shoulder_1(self, model: str | None):
+        """Run the slow factory calibration of right shoulder_1 on a faked
+        sweep, with a motor that reported ``model``."""
         from almond_axol.cli.tune import factory
 
         joint, is_left = Joint.SHOULDER_1, False
@@ -87,7 +149,7 @@ class SlowFactoryTest(unittest.TestCase):
         ):
             entry = asyncio.run(
                 factory._calibrate_joint_slow(
-                    {joint: None},
+                    {joint: _reporting(model)},
                     joint,
                     is_left,
                     [math.radians(v) for v in (1, 2, 3, 5, 8, 15, 30)],
@@ -101,41 +163,7 @@ class SlowFactoryTest(unittest.TestCase):
                     hi_d,
                 )
             )
-        self.assertIsNotNone(entry)
-        self.assertIn("com", entry)
-        self.assertAlmostEqual(entry["com"][1] - com0[1], 0.01, delta=0.004)
-        self.assertEqual(entry["stribeck_gain"], 0.8)  # shoulder_1's default
-        self.assertGreater(entry["friction"]["fl"], 0.0)
-        self.assertGreater(entry["stribeck_dfs"], 0.0)
-        # The saved curve reproduces the true one where slow motion lives.
-        fit = FrictionFit(
-            fc=entry["friction"]["fc"],
-            fl=entry["friction"]["fl"],
-            k=100.0,
-            fv=entry["friction"]["fv"],
-            fo=0.0,
-            dfs=entry["stribeck_dfs"],
-            ls=entry["stribeck_load_gain"],
-            vs=entry["stribeck_vs"],
-            rms=0,
-            r2=0,
-            n=0,
-            load_span=0,
-            speeds=(),
-        )
-        for v_deg in (2, 5, 15):
-            v = math.radians(v_deg)
-            for g in (3.0, 10.0):
-                self.assertAlmostEqual(
-                    float(fit.halfdiff(np.array([v]), g)[0]),
-                    float(TRUE.halfdiff(np.array([v]), g)[0]),
-                    delta=0.08,
-                )
-        self.assertEqual(saved["stribeck"]["stribeck_gain"], 0.8)
-        self.assertEqual(saved["hub_serial"], "hub1")
-        # A fitted CoM travels with the mass it was fitted against.
-        self.assertEqual(entry["mass"], jc.mass)
-        self.assertEqual(saved["mass"], jc.mass)
+        return entry, saved, jc, com0
 
     def test_custom_link_reaches_the_entry_when_the_sweep_fails(self) -> None:
         from almond_axol.cli.tune import factory
