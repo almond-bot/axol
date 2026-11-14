@@ -323,30 +323,79 @@ class StribeckDefaultTest(unittest.TestCase):
     """What ``tune.friction`` / ``tune.factory`` save as the Stribeck gain."""
 
     def _gain(
-        self, joint: Joint, variant: str | None, asked: float | None = None
-    ) -> float:
+        self,
+        joint: Joint,
+        *,
+        said: str | None = None,
+        recorded: str | None = None,
+        asked: float | None = None,
+    ) -> float | None:
         from almond_axol.cli.tune import friction
 
         args = argparse.Namespace(stribeck_gain=asked)
-        with mock.patch.object(
-            friction, "recorded_shoulder_variant", return_value=variant
-        ):
-            return friction._stribeck_gain(args, joint, "left")
+        with mock.patch.object(friction, "recorded_model", return_value=recorded):
+            return friction._stribeck_gain(args, joint, "left", said)
 
     def test_150_shoulders_save_it_off(self) -> None:
-        self.assertEqual(self._gain(Joint.SHOULDER_1, X8_150), 0.0)
-        self.assertEqual(self._gain(Joint.SHOULDER_2, X8_150), 0.0)
+        self.assertEqual(self._gain(Joint.SHOULDER_1, said=M150), 0.0)
+        self.assertEqual(self._gain(Joint.SHOULDER_2, said=M150), 0.0)
 
     def test_120_shoulders_keep_their_default(self) -> None:
-        self.assertEqual(self._gain(Joint.SHOULDER_1, None), 0.8)
-        self.assertEqual(self._gain(Joint.SHOULDER_2, None), 0.8)
+        self.assertEqual(self._gain(Joint.SHOULDER_1, said=M120), 0.8)
+        self.assertEqual(self._gain(Joint.SHOULDER_2, said=M120), 0.8)
+
+    def test_without_a_motor_the_recorded_model_stands_in(self) -> None:
+        # --fit-csv touches no motor.
+        self.assertEqual(self._gain(Joint.SHOULDER_2, recorded=M150), 0.0)
+        self.assertEqual(self._gain(Joint.SHOULDER_2, recorded=M120), 0.8)
+
+    def test_what_the_motor_said_now_beats_the_record(self) -> None:
+        self.assertEqual(self._gain(Joint.SHOULDER_2, said=M150, recorded=M120), 0.0)
+        self.assertEqual(self._gain(Joint.SHOULDER_2, said=M120, recorded=M150), 0.8)
+
+    def test_a_shoulder_of_unknown_model_saves_no_gain(self) -> None:
+        self.assertIsNone(self._gain(Joint.SHOULDER_1))
+        self.assertIsNone(self._gain(Joint.SHOULDER_2))
 
     def test_only_the_shoulders_follow_the_motor(self) -> None:
-        self.assertEqual(self._gain(Joint.ELBOW, X8_150), 0.8)
-        self.assertEqual(self._gain(Joint.WRIST_1, X8_150), 0.0)
+        self.assertEqual(self._gain(Joint.ELBOW), 0.8)
+        self.assertEqual(self._gain(Joint.ELBOW, said=M150), 0.8)
+        self.assertEqual(self._gain(Joint.WRIST_1), 0.0)
 
     def test_a_gain_asked_for_wins(self) -> None:
-        self.assertEqual(self._gain(Joint.SHOULDER_2, X8_150, asked=0.4), 0.4)
+        self.assertEqual(self._gain(Joint.SHOULDER_2, said=M150, asked=0.4), 0.4)
+        self.assertEqual(self._gain(Joint.SHOULDER_2, asked=0.4), 0.4)
+
+    def test_saving_without_a_gain_leaves_it_out_of_the_entry(self) -> None:
+        from almond_axol.cli.tune import friction
+
+        fit = mock.Mock()
+        fit.friction_params.return_value = {"fc": 0.5, "k": 100.0, "fv": 0.0, "fo": 0.0}
+        fit.stribeck_params.side_effect = lambda gain: {
+            "stribeck_gain": gain,
+            "stribeck_dfs": 0.6,
+            "stribeck_load_gain": 0.03,
+            "stribeck_vs": 0.1,
+        }
+        for gain, want in ((None, None), (0.0, 0.0), (0.8, 0.8)):
+            with (
+                mock.patch.object(friction, "update_joint_calibration") as save,
+                mock.patch("builtins.print"),
+            ):
+                save.return_value = Path("calibration.json")
+                friction.save_slow_fit(fit, "left", Joint.SHOULDER_2, gain)
+            stribeck = save.call_args.kwargs["stribeck"]
+            self.assertEqual(stribeck.get("stribeck_gain"), want)
+            self.assertEqual(stribeck["stribeck_dfs"], 0.6)
+
+    def test_a_fit_saved_without_a_gain_takes_the_motors_default(self) -> None:
+        entry = {k: v for k, v in _SLOW_ENTRY.items() if k != "stribeck_gain"}
+        on_150 = _config({"left": _BOTH_150}, local={"left": {"shoulder_2": entry}})
+        on_120 = _config({}, local={"left": {"shoulder_2": entry}})
+        self.assertEqual(on_150.left.shoulder_2.stribeck_gain, 0.0)
+        self.assertEqual(on_150.left.shoulder_2.kd_host, 10.0)
+        self.assertEqual(on_120.left.shoulder_2.stribeck_gain, 0.8)
+        self.assertEqual(on_120.left.shoulder_2.kp, 500.0)
 
 
 if __name__ == "__main__":

@@ -133,11 +133,11 @@ def record_motor_models(
     return True
 
 
-def recorded_shoulder_variant(side: str, joint: str) -> str | None:
-    """The gain variant the record gives ``side``'s ``joint`` on this hub.
+def recorded_model(side: str, joint: str) -> str | None:
+    """The model the record holds for ``side``'s ``joint`` on this hub.
 
-    ``None`` when there is no hub, no record or no answer: the X8-P20-120
-    defaults apply.
+    ``None`` when there is no hub, no record or no answer from that motor:
+    the model is not known.
     """
     try:
         serial = current_hub_serial()
@@ -146,7 +146,15 @@ def recorded_shoulder_variant(side: str, joint: str) -> str | None:
     if not serial:
         return None
     models = load_motor_models(expected_hub_serial=serial)
-    return shoulder_variant(models.get(side, {}).get(joint))
+    return models.get(side, {}).get(joint)
+
+
+def recorded_shoulder_variant(side: str, joint: str) -> str | None:
+    """The gain variant the record gives ``side``'s ``joint`` on this hub.
+
+    ``None`` when the model is not known: the X8-P20-120 defaults apply.
+    """
+    return shoulder_variant(recorded_model(side, joint))
 
 
 def note_motor_models(side: str, motors: Mapping[Any, Any]) -> None:

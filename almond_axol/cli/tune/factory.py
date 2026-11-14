@@ -95,11 +95,13 @@ from .friction import (
     _home_all,
     _identify_joint,
     _identify_slow,
+    _motor_model,
     _ramp_verified,
     _safe_torque_off,
     _stribeck_gain,
     fit_and_report,
     slow_profile_seconds,
+    stribeck_fields,
     sweep_load,
 )
 from .gravity import fit_com
@@ -723,7 +725,9 @@ async def _calibrate_joint_slow(
     stribeck = None
     if fit is not None:
         entry["friction"] = fit.friction_params()
-        stribeck = fit.stribeck_params(_stribeck_gain(args, joint, side_str))
+        stribeck = stribeck_fields(
+            fit, _stribeck_gain(args, joint, side_str, _motor_model(motors[joint]))
+        )
         entry.update(stribeck)
     if com_fit is not None:
         entry["com"] = [round(v, 5) for v in com_fit]
