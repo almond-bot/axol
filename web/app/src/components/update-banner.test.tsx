@@ -97,4 +97,46 @@ describe("UpdateBanner", () => {
     expect(link.textContent).toBe("View changes")
     expect(link.href).toBe("https://github.com/almond-bot/axol/compare/1111111aaaa...2222222bbbb")
   })
+
+  it("shows a switch to main while it applies", () => {
+    act(() =>
+      root.render(
+        <UpdateBanner
+          update={{
+            ...status,
+            version: "0.2.44",
+            updateAvailable: false,
+            channel: "release",
+            remoteCommit: "2222222bbbb",
+          }}
+          switchTo="main"
+          updating
+          phase="provisioning"
+          blocked={false}
+          onUpdate={() => {}}
+        />
+      )
+    )
+    expect(container.textContent).toContain("Switching to main")
+    expect(container.textContent).toContain("v0.2.44 \u2192 main 2222222")
+    expect(button().textContent).toBe("Installing packages…")
+  })
+
+  it("shows a switch back to the latest release while it applies", () => {
+    act(() =>
+      root.render(
+        <UpdateBanner
+          update={{ ...status, updateAvailable: false, channel: "main", commit: "1111111aaaa" }}
+          switchTo="release"
+          updating
+          phase={null}
+          blocked={false}
+          onUpdate={() => {}}
+        />
+      )
+    )
+    expect(container.textContent).toContain("Switching to the latest release")
+    expect(container.textContent).toContain("main 1111111 \u2192 v0.2.11")
+    expect((container.querySelector("a") as HTMLAnchorElement).textContent).toBe("Release notes")
+  })
 })

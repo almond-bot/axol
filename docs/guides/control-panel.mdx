@@ -96,14 +96,21 @@ If a required step fails, the error names it. Press **Update** to try again. Opt
 
 #### Channel
 
-The **Channel** switch on the Host Computer card picks where the software comes from:
+The **Channel** line on the Host Computer card shows where the software comes from:
 
 | Channel | What it installs | When the banner offers **Update** |
 |---|---|---|
 | **Release** | The latest release. This is the default. | A newer release is out. |
 | **Main** | The newest code on the `main` branch, including changes that are not in a release yet. It has had less testing. | New changes land on `main`. The banner links to them. |
 
-Click the other channel, then confirm. The host installs that software and restarts, which can take several minutes. Stop any running operation first. On **Main**, the **Software** line shows the installed commit. Running the install command again puts the host back on **Release**.
+To change channels:
+
+1. Stop any running operation.
+2. Press **Switch to main** or **Switch to release** on the **Channel** line.
+3. Check the version change in the confirmation, then press the switch button again.
+4. Wait for the panel to reconnect. The banner at the top shows each step, the same as for an update.
+
+On **Main**, the **Software** line shows the installed commit and **Latest release** shows the release that **Switch to release** installs. Running the install command again also puts the host back on **Release**.
 
 The banner also warns when the panel and the host run different versions. This happens with an old browser tab or an outdated local UI build. Update the host, or rebuild the local UI.
 

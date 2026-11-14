@@ -269,6 +269,9 @@ export default function ControlPanel() {
   // spinner). Sourced from the server's reported phase, except "restarting"
   // which we infer locally once the server stops responding (it exited).
   const [updatePhase, setUpdatePhase] = useState<UpdatePhase | null>(null)
+  // The channel this browser asked to switch to, until the host's status
+  // reports the switch itself (`update.target`).
+  const [pendingSwitch, setPendingSwitch] = useState<UpdateChannel | null>(null)
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [simRobotChoice, setSimRobotChoice] = useState<SimRobot | null>(loadSimRobot)
@@ -503,6 +506,7 @@ export default function ControlPanel() {
       setStartingUpdate(false)
       setUpdateAbandoned(false)
       setUpdatePhase(null)
+      setPendingSwitch(null)
       setRobot(null)
       setRobotBusy(false)
       setCanProfiles(null)
@@ -896,6 +900,7 @@ export default function ControlPanel() {
     setStartingUpdate(false)
     setUpdateAbandoned(false)
     setUpdatePhase(null)
+    setPendingSwitch(null)
     setRobotBusy(false)
     robotStatusKnownRef.current = false
     canInventoryKnownRef.current = false
@@ -2097,6 +2102,7 @@ export default function ControlPanel() {
     setUpdateAbandoned(false)
     setStartingUpdate(true)
     setUpdatePhase("upgrading")
+    setPendingSwitch(channel ?? null)
     try {
       await startUpdate(channel)
       if (generation !== connectionGenerationRef.current) return
@@ -2105,6 +2111,7 @@ export default function ControlPanel() {
       toast.error(`Could not start the update: ${e}`)
       setStartingUpdate(false)
       setUpdatePhase(null)
+      setPendingSwitch(null)
       return
     }
     // Pull the now-"updating" status so `updating` derives true and the watcher
@@ -2193,15 +2200,21 @@ export default function ControlPanel() {
       </Link>
     ) : null
 
+  // The channel a running switch installs, so the banner shows it like a
+  // release update. Null for an update within the installed channel.
+  const switchTarget = updating ? (update?.target ?? pendingSwitch) : null
+  const switchTo = switchTarget !== (update?.channel ?? "release") ? switchTarget : null
+
   // Alerts that apply wherever the operator is: an update, a version skew, a
   // robot held after a failed shutdown, and hardware still to identify. Not on
   // Request data or Request teleoperator, which work without the robot. The connection itself shows
   // in the header pill, and on the pages that need it.
   const notices = (
     <>
-      {update?.updateAvailable && (
+      {update && (update.updateAvailable || switchTo) && (
         <UpdateBanner
           update={update}
+          switchTo={switchTo}
           updating={updating}
           phase={updatePhase}
           blocked={hostBusy}
@@ -2578,7 +2591,6 @@ export default function ControlPanel() {
               version={update?.version ?? hostInfo?.version ?? null}
               update={update}
               updating={updating}
-              updatePhase={updatePhase}
               onSwitchChannel={(channel) => void handleUpdate(channel)}
               onOpenSetup={() => setSetupOpen(true)}
               onHostDisconnect={hostDisconnectClick}
