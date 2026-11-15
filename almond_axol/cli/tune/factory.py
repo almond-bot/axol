@@ -390,7 +390,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         type=float,
         default=None,
         help="Stribeck share saved for every joint (slow profile; default 0.8 "
-        "on shoulder_1, shoulder_2 and the elbow, 0 elsewhere)",
+        "on shoulder_1, shoulder_2 and the elbow, 0 elsewhere and on "
+        "RMD-X8-P20-150 shoulders)",
     )
     p.add_argument(
         "--raw-dir",

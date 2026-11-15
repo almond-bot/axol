@@ -20,6 +20,22 @@ The slow profile sweeps the speeds under 8°/s twice: once where the joint carri
 
 On `shoulder_1`, `shoulder_2` and `elbow`, a saved slow-profile fit also switches the joint to stiffer [slow-motion gains](/operations/teleop-config). A joint without one keeps the standard gains. The `standard` profile doesn't switch them. A shoulder with an RMD-X8-P20-150 motor keeps its gains and takes only the friction fit.
 
+### Saved Stribeck gain
+
+One of the saved `stribeck_*` fields is `stribeck_gain`, the share of the extra low-speed friction that Axol cancels:
+
+| Joint | Saved `stribeck_gain` |
+|---|---|
+| `shoulder_1` or `shoulder_2` with an RMD-X8-P20-120 motor | 0.8 |
+| `shoulder_1` or `shoulder_2` with an RMD-X8-P20-150 motor | 0 |
+| `shoulder_1` or `shoulder_2` with a motor model that is not known | No gain is saved. The joint uses the value for its motor. |
+| `elbow` | 0.8 |
+| Other joints | 0 |
+
+A sweep reads the model from the motor. `--fit-csv` moves nothing, so it uses the model Axol read the last time this computer enabled that arm. If this computer has not enabled the arm, the model is not known.
+
+A fit saved without a gain also removes a gain saved earlier for that joint. Pass `--stribeck-gain` to save a gain you choose.
+
 ## Sweep safety
 
 The tool poses the other joints so the arm stays clear of the robot:
@@ -39,7 +55,7 @@ The tool poses the other joints so the arm stays clear of the robot:
 | `--kd FLOAT` | Derivative gain (default: the calibration gains below) |
 | `--profile {standard,slow}` | Sweep profile (default: `standard`) |
 | `--velocities V [V ...]` | Sweep speeds in deg/s (default: `7.2 18 36 54 72`, or `1 2 3 5 8 15 30` with `--profile slow`) |
-| `--stribeck-gain G` | With `--profile slow`: the share of the extra low-speed friction to cancel (default: 0.8 on `shoulder_1`, `shoulder_2` and `elbow`, 0 on the other joints and on RMD-X8-P20-150 shoulders) |
+| `--stribeck-gain G` | With `--profile slow`: the share of the extra low-speed friction to cancel (default: see [Saved Stribeck gain](#saved-stribeck-gain)) |
 | `--raw-csv PATH` | Save every sweep sample, so you can refit later with `--fit-csv` |
 | `--fit-csv PATH [PATH ...]` | Fit the slow-profile model to saved `--raw-csv` files without moving anything. `--save` still applies. |
 | `--bins N` | Number of position bins the fit uses (default: 40) |
