@@ -84,6 +84,11 @@ class _Worker:
             rest = np.full(_N, -1.0, np.float32)
             self._replies.append((now, ("reset_traj", rest, [])))
 
+    def owe(self, reply: object) -> None:
+        """Queue a reply to a request that was sent outside the frame path."""
+        self.first_reply_due = time.monotonic() + self._hold_s
+        self._replies.append((self.first_reply_due, reply))
+
     def poll(self, timeout=None) -> bool:
         # The worker is single-threaded: a reply is never ready before the
         # one ahead of it.
@@ -153,6 +158,38 @@ class LateReplyTest(unittest.TestCase):
         self.assertIsNone(core.reset_error)
         # The reset's own reply was adopted, not the late frame solution.
         np.testing.assert_array_equal(core.q, np.full(_N, -1.0, np.float32))
+
+    def test_a_timeout_in_the_engage_step_holds_that_frame_back(self) -> None:
+        # The DAgger sync runs inside the engage step and swallows its own
+        # timeout, so the loop reaches the frame dispatch in the same pass.
+        core = _core()
+        conn = _Worker(hold_s=4 * _TIMEOUT)
+        stop = threading.Event()
+        applied: list[tuple[int, float]] = []
+        set_target = core.set_target
+        update_engage = core.update_engage
+        synced = []
+
+        def engage(frame):
+            if not synced:
+                synced.append(True)
+                conn.owe(("synced", np.zeros(_N, np.float32)))
+                core._note_ik_timeout(_TIMEOUT)
+            update_engage(frame)
+
+        def record(q):
+            applied.append((conn.frames, float(np.asarray(q)[0])))
+            if len(applied) >= 3:
+                stop.set()
+            return set_target(q)
+
+        core.update_engage = engage
+        core.set_target = record
+        with self.assertNoLogs("test_ik_reply_resync", "ERROR"):
+            core.run_ik_loop(conn, _frame, stop, lambda: True, lambda _t: None)
+        self.assertEqual(conn.sent_while_owed, 0)
+        for sent, solved in applied:
+            self.assertEqual(solved, float(sent))
 
     def test_a_dead_worker_owes_nothing(self) -> None:
         core = _core()
