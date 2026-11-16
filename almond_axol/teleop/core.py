@@ -2748,6 +2748,12 @@ class VRTeleopCore:
                 self._pace(t0, ik_interval)
                 continue
 
+            if self._ik_owed:
+                # The engage step asked the worker something and gave up
+                # waiting (the DAgger sync): this frame waits for that reply.
+                self._pace(t0, ik_interval)
+                continue
+
             if not process_alive():
                 # Rate-limited: this used to log per iteration (~120 Hz).
                 if t0 - last_dead_warn >= 5.0:
