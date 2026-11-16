@@ -63,6 +63,10 @@ from .recorder import make as _recorder_make
 from .tcp import AbsoluteTCPMapping
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
+# How long one loop pass waits for a reply the worker still owes (see
+# VRTeleopCore._settle_ik_replies), and how often that wait is reported.
+_IK_SETTLE_POLL = 0.25
+_IK_SETTLE_WARN_S = 30.0
 _RAW_TCP_MAX_AGE_S = 0.15  # same capture-age contract as managed tracker input
 # Gripper opening step (fraction of travel) worth telling the IK worker:
 # 1% is 0.6 mm of finger travel.
@@ -225,6 +229,18 @@ def _is_absolute_reply(result: object) -> bool:
         and isinstance(result[0], str)
         and result[0] == "q"
     )
+
+
+def _reply_tag(result: object) -> str | None:
+    """The string tag an IK-worker reply leads with, or ``None`` if untagged.
+
+    Tagged replies are tuples such as ``("reset_traj", ...)``; a frame
+    solution leads with an array. The tag is type-checked before any
+    comparison, since comparing an array to a string is elementwise in numpy.
+    """
+    if isinstance(result, tuple) and result and isinstance(result[0], str):
+        return result[0]
+    return None
 
 
 def recv_with_timeout(
@@ -625,6 +641,11 @@ class VRTeleopCore:
         # positions (see :meth:`resync_to_positions`) before resuming, so the
         # reset trajectory plans from where the arms actually are.
         self._ik_paused: bool = False
+        # Replies the IK worker still owes for requests whose wait timed out,
+        # and when the oldest was sent (see _settle_ik_replies).
+        self._ik_owed: int = 0
+        self._ik_owed_since: float = 0.0
+        self._ik_owed_warned: float = 0.0
 
         # Engage block (set while the owner can't act on tracking, e.g.
         # collect-data saving an episode after the arms are home). Grips are
@@ -2536,6 +2557,13 @@ class VRTeleopCore:
                     # with locks low before a fresh engage can re-anchor it.
                     last_frame = None
 
+            # Nothing below may wait for an answer while the worker still owes
+            # one: a latched reset stays latched until the pipe is in step.
+            if self._ik_owed and not self._settle_ik_replies(
+                conn, stop_event, process_alive
+            ):
+                continue
+
             # Reset (return-to-rest) takes priority over normal tracking. Leave
             # the latch set if we can't dispatch yet (no solution, or a
             # trajectory already playing) so a press is never dropped.
@@ -2595,14 +2623,14 @@ class VRTeleopCore:
                         # the owner took the arms out-of-band and re-syncs q
                         # before any next dispatch.
                         pass
-                    elif isinstance(result, tuple) and result[0] == "reset_error":
+                    elif _reply_tag(result) == "reset_error":
                         self._reset_error = str(result[1])
                         # A park reads the public field after each leg.
                         self.reset_error = self._reset_error
                         self._disengage_all("Teleop disabled (reset path rejected)")
                         self._at_rest = False
                         self._logger.error("Reset path rejected: %s", self._reset_error)
-                    elif isinstance(result, tuple) and result[0] == "reset_traj":
+                    elif _reply_tag(result) == "reset_traj":
                         _, q_default, trajectory = result
                         if q_goal is not None:
                             trajectory = self._check_park_plan(
@@ -2793,6 +2821,10 @@ class VRTeleopCore:
                         else:
                             self._publish_tcp_pose(tcp_msg, pose_host_ts)
                         self._maybe_broadcast_urdf_state()
+                    elif _reply_tag(result) is not None:
+                        raise ValueError(
+                            f"expected a frame solution, got {_reply_tag(result)!r}"
+                        )
                     else:
                         self.set_target(self._unpack_solution(result))
                     if not self._record_raw_tcp:
@@ -2800,6 +2832,8 @@ class VRTeleopCore:
                     recv_timeout_count = 0
                     on_ik_sample(time.perf_counter())
                 else:
+                    if not stop_event.is_set():
+                        self._note_ik_timeout(_IK_RECV_TIMEOUT)
                     recv_timeout_count += 1
                     if recv_timeout_count <= 3 or recv_timeout_count % 100 == 0:
                         self._logger.warning(
@@ -2809,6 +2843,64 @@ class VRTeleopCore:
                 self._logger.error("IK dispatch error: %s", e)
 
             self._pace(t0, ik_interval)
+
+    def _note_ik_timeout(self, waited: float) -> None:
+        """Record that the worker still owes the reply to a request.
+
+        Call when a wait for a reply gave up after ``waited`` seconds. The
+        worker answers every request in order, so that reply still arrives.
+        """
+        now = time.perf_counter()
+        if self._ik_owed == 0:
+            self._ik_owed_since = now - waited
+            self._ik_owed_warned = now
+        self._ik_owed += 1
+
+    def _settle_ik_replies(
+        self,
+        conn: multiprocessing.connection.Connection,
+        stop_event: threading.Event,
+        process_alive: Callable[[], bool],
+    ) -> bool:
+        """Discard the replies the worker still owes; whether none are left.
+
+        A plan can outlast ``_IK_RECV_TIMEOUT`` (an arm stow takes the worker
+        several seconds), and its reply arrives after the wait gave up. Read
+        as the answer to the next request it would pair every later reply
+        with the wrong request: a reset would adopt a frame solution and a
+        frame a reset trajectory planned from an old pose. So the loop sends
+        nothing that needs an answer until each late reply has arrived, and
+        drops it: it answers a frame the operator has long moved on from.
+
+        Waits at most ``_IK_SETTLE_POLL`` per call so a pause or a stop is
+        still noticed. A dead worker owes nothing; the dead-process path
+        reports it.
+        """
+        while self._ik_owed:
+            if not process_alive():
+                self._ik_owed = 0
+                break
+            try:
+                late = recv_with_timeout(conn, _IK_SETTLE_POLL, stop_event)
+            except (EOFError, OSError):
+                self._ik_owed = 0
+                break
+            now = time.perf_counter()
+            if late is None:
+                if now - self._ik_owed_warned >= _IK_SETTLE_WARN_S:
+                    self._ik_owed_warned = now
+                    self._logger.warning(
+                        "Still waiting for the IK worker (%.0f s). The arms "
+                        "hold their position until it answers.",
+                        now - self._ik_owed_since,
+                    )
+                return False
+            self._ik_owed -= 1
+            if self._ik_owed == 0:
+                self._logger.info(
+                    "IK worker answered after %.1f s", now - self._ik_owed_since
+                )
+        return True
 
     def _clear_lift_idle(
         self, conn: multiprocessing.connection.Connection, stop_event: threading.Event
@@ -2828,6 +2920,8 @@ class VRTeleopCore:
         except Exception as e:  # noqa: BLE001 - keep the loop alive
             self._logger.error("IK lift clearance dispatch error: %s", e)
             return False
+        if reply is None and not stop_event.is_set():
+            self._note_ik_timeout(_IK_RECV_TIMEOUT)
         if not (
             isinstance(reply, tuple)
             and len(reply) == 3
@@ -3294,6 +3388,7 @@ class VRTeleopCore:
                         else:
                             self.set_target(self._unpack_solution(result))
                     else:
+                        self._note_ik_timeout(_IK_RECV_TIMEOUT)
                         self._logger.warning(
                             "IK recv timeout during stale-stream disengage"
                         )

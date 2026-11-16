@@ -333,6 +333,9 @@ class DaggerTeleopCore(VRTeleopCore):
 
         self._conn.send(("sync", pos_l[:7].copy(), pos_r[:7].copy()))
         result = recv_with_timeout(self._conn, _SYNC_RECV_TIMEOUT)
+        if result is None:
+            # The worker still answers later; the IK loop discards that reply.
+            self._note_ik_timeout(_SYNC_RECV_TIMEOUT)
         if not (isinstance(result, tuple) and result[0] == "synced"):
             raise RuntimeError(f"unexpected sync reply from IK worker: {result!r}")
         # _hold_target, not a bare ``self.q =``: run_ik_loop's set_target()
