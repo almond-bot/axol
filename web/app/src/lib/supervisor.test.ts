@@ -420,6 +420,14 @@ describe("showWhen gates", () => {
     expect(settingShown(parcelOnly, { "axol.gripper": "parcel" }, schema)).toBe(true)
   })
 
+  it("matches any of several values", () => {
+    const anyParcel = { key: "axol.gripper", oneOf: ["parcel_v1", "parcel_v2"] }
+    expect(settingShown(anyParcel, {}, schema)).toBe(false)
+    expect(settingShown(anyParcel, { "axol.gripper": "parallel" }, schema)).toBe(false)
+    expect(settingShown(anyParcel, { "axol.gripper": "parcel_v1" }, schema)).toBe(true)
+    expect(settingShown(anyParcel, { "axol.gripper": "parcel_v2" }, schema)).toBe(true)
+  })
+
   it("reads a reset (null) value as the default", () => {
     const parcelDefault: SettingsCategory[] = [
       {

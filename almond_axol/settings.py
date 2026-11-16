@@ -278,13 +278,8 @@ def resolve_gripper(
     control panel or ``--axol.gripper`` changed it). It selects the mobile
     Axol's URDF (:func:`almond_axol.constants.urdf_path`).
     """
-    from .robot.config import GRIPPER_TYPES
+    from .constants import normalize_gripper
 
     if gripper is None:
         gripper = shared_axol_config(store).gripper
-    gripper = str(gripper).strip().lower()
-    if gripper not in GRIPPER_TYPES:
-        raise ValueError(
-            f"gripper must be one of {list(GRIPPER_TYPES)}, got {gripper!r}"
-        )
-    return gripper
+    return normalize_gripper(gripper)

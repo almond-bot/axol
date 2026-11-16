@@ -9,6 +9,8 @@ from typing import Literal
 
 import numpy as np
 
+from ..constants import GRIPPER_ALIASES
+
 # Re-engage behaviour of a grip (see ``VRTeleopConfig.reengage``). Registered
 # as a draccus choice in ``almond_axol.cli.config``.
 ReengageMode = Literal["clutch", "ramp"]
@@ -193,8 +195,9 @@ class VRTeleopConfig:
             (``--axol.gripper``), which the CLIs and :class:`VRTeleop` adopt
             through :func:`adopt_robot_gripper`, so set it there; a value
             here that disagrees with the robot's is overridden with a
-            warning. Box mode exists only with ``"parcel"``, the parcel
-            gripper: with ``"parallel"`` (the stock two-finger gripper, and
+            warning. Box mode exists only with the parcel gripper
+            (``"parcel_v1"`` or ``"parcel_v2"``; ``"parcel"`` is read as
+            ``"parcel_v1"``): with ``"parallel"`` (the stock two-finger gripper, and
             what ``None`` means with no robot to follow) every
             box-mode setting is hidden from the headset and the control
             panel, ``box_mode`` is forced off and :meth:`VRTeleopCore.set_box_mode`
@@ -616,7 +619,7 @@ class VRTeleopConfig:
     reengage_ramp_min_s: float = 0.75
     box_mode: bool = False
     box_lead_hand: Literal["right", "left"] = "right"
-    gripper: Literal["parallel", "parcel"] | None = None
+    gripper: Literal["parallel", "parcel_v1", "parcel_v2", "parcel"] | None = None
     box_flush_deg: float = 39.0
     box_grasp: Literal["straight", "flush"] = "straight"
     box_face_left: Literal["auto", "+x", "-x"] = "auto"
@@ -663,9 +666,13 @@ def adopt_robot_gripper(config: VRTeleopConfig, gripper: str) -> None:
 
     The robot's ``AxolConfig.gripper`` is the one source of truth (it also
     sets the jaws' close direction and the calibration's stroke check); a
-    teleop value that disagrees with it is replaced, with a warning.
+    teleop value that disagrees with it is replaced, with a warning. An
+    earlier name for the same gripper (``"parcel"``) is not a disagreement.
     """
-    if config.gripper is not None and config.gripper != gripper:
+    if (
+        config.gripper is not None
+        and GRIPPER_ALIASES.get(config.gripper, config.gripper) != gripper
+    ):
         _logger.warning(
             "teleop gripper=%r ignored: the robot is configured for the %s "
             "gripper (set axol.gripper to change it)",

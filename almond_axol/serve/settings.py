@@ -54,7 +54,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from ..constants import GRIPPER_MAX_TORQUE
+from ..constants import (
+    GRIPPER_ALIASES,
+    GRIPPER_MAX_TORQUE,
+    GRIPPER_TYPES,
+    PARCEL_GRIPPERS,
+    normalize_gripper,
+)
 from ..tracker.trigger import validate_trigger_full_scale
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.paths import almond_path
@@ -372,9 +378,9 @@ def _lerobot_dataset_root() -> str:
 
 
 def _parcel_only() -> dict[str, Any]:
-    """``ui`` hint for box mode's settings: shown only while the parcel
-    gripper is selected (the only gripper with box mode)."""
-    return {"showWhen": {"key": "axol.gripper", "equals": "parcel"}}
+    """``ui`` hint for box mode's settings: shown only while a parcel
+    gripper is selected (the only grippers with box mode)."""
+    return {"showWhen": {"key": "axol.gripper", "oneOf": list(PARCEL_GRIPPERS)}}
 
 
 SETTINGS: tuple[SettingCategory, ...] = (
@@ -457,12 +463,13 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="axol.gripper",
                 label="Gripper",
                 type="select",
-                options=("parallel", "parcel"),
+                options=GRIPPER_TYPES,
                 help=(
                     "The gripper fitted to both arms. parallel is the stock two-finger "
-                    "gripper. parcel is the hinged-plate parcel gripper, which adds "
-                    "box mode settings to Teleop & VR. At startup, Axol measures the "
-                    "gripper's travel and stops if it looks like the other type."
+                    "gripper. parcel_v1 and parcel_v2 are the two versions of the "
+                    "hinged-plate parcel gripper, which adds box mode settings to "
+                    "Teleop & VR. If the parcel jaws stay closed after startup, "
+                    "select the other version."
                 ),
             ),
             SettingDef(
@@ -1658,6 +1665,7 @@ class SettingsStore:
                         for canonical in canonical_keys(key):
                             values[canonical] = value
                 self._repair_mantis_source(values)
+                self._rename_gripper(values)
                 if not self._strict:
                     self._repair_axol_channels(values)
                 return {"values": values, "cameras": raw.get("cameras")}
@@ -1686,6 +1694,18 @@ class SettingsStore:
             self._path,
         )
         values.pop("mantis.source")
+
+    @staticmethod
+    def _rename_gripper(values: dict[str, Any]) -> None:
+        """Read a gripper saved under an earlier name as its current one.
+
+        A file saved while there was one parcel gripper names it ``parcel``;
+        that gripper is ``parcel_v1`` (:data:`GRIPPER_ALIASES`). Any other
+        value is left for the config parse to accept or refuse.
+        """
+        saved = values.get("axol.gripper")
+        if isinstance(saved, str) and saved in GRIPPER_ALIASES:
+            values["axol.gripper"] = GRIPPER_ALIASES[saved]
 
     def _repair_axol_channels(self, values: dict[str, Any]) -> None:
         """Drop a persisted Axol arm map that the store would refuse to save.
@@ -1798,6 +1818,11 @@ class SettingsStore:
                         raise ValueError(f"{key}: {exc}") from exc
                 if key.endswith("gripper.torque_limit") and value is not None:
                     incoming[key] = _validate_gripper_torque(key, value)
+                if key == "axol.gripper" and value is not None:
+                    try:
+                        incoming[key] = normalize_gripper(value)
+                    except ValueError as exc:
+                        raise ValueError(f"{key}: {exc}") from exc
                 if (
                     key == "mantis.source"
                     and value is not None

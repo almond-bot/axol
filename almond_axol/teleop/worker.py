@@ -20,6 +20,7 @@ from typing import Any
 
 import numpy as np
 
+from ..constants import is_parcel_gripper
 from ..kinematics.config import KinematicsConfig
 from ..vr.models import VRFrame
 from .absolute_pose import AbsoluteCalibration
@@ -1789,7 +1790,7 @@ class IKWorker:
         mounts themselves, the same in both grasps).
         """
         cfg = self._config
-        if getattr(cfg, "gripper", "parallel") == "parcel":
+        if is_parcel_gripper(getattr(cfg, "gripper", None)):
             return parcel_tool(
                 float(getattr(cfg, "box_flush_deg", 39.0)), self._box_grasp()
             )
@@ -1810,7 +1811,7 @@ class IKWorker:
         ``_BODY_CLEARANCE_M`` apart (~77 mm).
         """
         cfg = self._config
-        parcel = getattr(cfg, "gripper", "parallel") == "parcel"
+        parcel = is_parcel_gripper(getattr(cfg, "gripper", None))
         clearance = _PARCEL_BODY_CLEARANCE_M if parcel else _BODY_CLEARANCE_M
         return max(float(cfg.box_width_min), self._box_tool().min_width(clearance))
 

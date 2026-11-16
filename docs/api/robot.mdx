@@ -406,11 +406,21 @@ Every joint defaults to `inf`, which leaves it uncapped. Box mode caps the wrist
 
 `ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm) and `max_speed` (rad/s). The gripper torque is capped at 5 Nm (`almond_axol.constants.GRIPPER_MAX_TORQUE`). A `torque_limit` above it raises `ValueError` when the config loads, and every gripper command is clamped to it. The gripper joint is fixed in the model, so the gripper's mass is included in `wrist_3.mass`.
 
-`AxolConfig.gripper` (below) sets which gripper is fitted: `"parallel"`, the stock two-finger gripper, or `"parcel"`, the hinged-plate parcel gripper. It sets which way each jaw's motor turns to close (`gripper_close_direction(gripper, is_left)`). Both parallel jaws close toward positive motor angles. The parcel gripper's right motor is mounted the other way round, so it closes toward negative angles.
+`AxolConfig.gripper` (below) sets which gripper is fitted: `"parallel"`, the stock two-finger gripper, or `"parcel_v1"` or `"parcel_v2"`, the two versions of the hinged-plate parcel gripper. `"parcel"` is read as `"parcel_v1"`.
+
+The setting decides which way each jaw's motor turns to close (`gripper_close_direction(gripper, is_left)`):
+
+| Gripper | Left jaw closes toward | Right jaw closes toward |
+|---|---|---|
+| `parallel` | positive motor angles | positive motor angles |
+| `parcel_v1` | positive motor angles | negative motor angles |
+| `parcel_v2` | negative motor angles | positive motor angles |
 
 The gripper's stroke is measured, not fixed. On every cold `enable()`, each jaw closes until it stalls on the closed stop, then opens until it stalls on the open stop, so it ends **open**. The two stops define `0` (closed) and `1` (open) for that session and are saved for reconnects.
 
-The measured stroke is then checked against the configured gripper: about 290° for the parallel gripper and 185° for the parcel gripper. If the stroke is closer to the other type's, the bring-up fails with a `MotorError` that names the right setting. A wrong type would leave the parcel gripper's right jaw closed after calibration.
+The measured stroke is then checked against the configured gripper: about 290° for the parallel gripper and 185° for the parcel gripper. If the stroke is closer to the other gripper's, the bring-up fails with a `MotorError` that names the right setting.
+
+The two parcel versions have the same stroke, so this check passes with either. With the wrong version set, the jaws end closed after calibration. Set the other version.
 
 ### `AxolConfig` fields
 
@@ -419,7 +429,7 @@ The measured stroke is then checked against the configured gripper: about 290° 
 | Field | Default | Description |
 |---|---|---|
 | `has_gripper` | `True` | Set `False` on the gripperless model. The gripper motors are never created, enabled or calibrated, and the gripper element of every `(8,)` array is ignored on write and reads `0.0`. |
-| `gripper` | `"parallel"` | Which gripper is fitted to both arms: `"parallel"` or `"parcel"` (see [Grippers](#grippers)). Teleop's box mode works only with `"parcel"`. |
+| `gripper` | `"parallel"` | Which gripper is fitted to both arms: `"parallel"`, `"parcel_v1"` or `"parcel_v2"` (see [Grippers](#grippers)). Teleop's box mode works only with a parcel gripper. |
 | `max_step_rad` | `0.5` | Largest change (rad) allowed in any arm joint between two `motion_control` calls. Larger commands are dropped with a warning, and `float("inf")` turns the check off. |
 | `left_stiffness` | `1.0` | Compliance of the **left** arm: a scalar in `[0, 1]` for every joint, or a 7-tuple with one value per joint. `1.0` runs the tuned gains, and `0` the soft, hand-guidable gains. |
 | `right_stiffness` | `1.0` | Same, for the **right** arm. |
@@ -427,7 +437,7 @@ The measured stroke is then checked against the configured gripper: about 290° 
 Notes:
 
 - With `has_gripper=False`, the array shapes don't change, and LeRobot datasets record 7 channels per arm instead of 8.
-- Set the gripper type with `--axol.gripper parcel` on the CLI, or with the **Gripper** setting on the control panel's **Robot** tab.
+- Set the gripper type with `--axol.gripper parcel_v2` on the CLI, or with the **Gripper** setting on the control panel's **Robot** tab.
 - At 30 Hz, a `max_step_rad` of 0.5 is about 15 rad/s, roughly 2.5 times the teleop speed limit.
 
 ### Stiffness

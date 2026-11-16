@@ -106,8 +106,12 @@ class GripperResolutionTest(unittest.TestCase):
 
     def test_saved_gripper_is_used(self) -> None:
         self.assertEqual(resolve_gripper(store=self.store), "parallel")
+        self.store.update(values={"axol.gripper": "parcel_v2"})
+        self.assertEqual(resolve_gripper(store=self.store), "parcel_v2")
+        # The earlier name for parcel_v1.
         self.store.update(values={"axol.gripper": "parcel"})
-        self.assertEqual(resolve_gripper(store=self.store), "parcel")
+        self.assertEqual(resolve_gripper(store=self.store), "parcel_v1")
+        self.assertEqual(resolve_gripper("parcel", store=self.store), "parcel_v1")
 
     def test_explicit_gripper_wins_and_is_validated(self) -> None:
         self.store.update(values={"axol.gripper": "parcel"})

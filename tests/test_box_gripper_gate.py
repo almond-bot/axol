@@ -36,7 +36,8 @@ class CoreGateTest(unittest.TestCase):
         self.assertIsNone(VRTeleopConfig().gripper)
         self.assertFalse(_core().box_available)
         self.assertFalse(_core(gripper="parallel").box_available)
-        self.assertTrue(_core(gripper="parcel").box_available)
+        for gripper in ("parcel_v1", "parcel_v2", "parcel"):
+            self.assertTrue(_core(gripper=gripper).box_available, gripper)
 
     def test_box_mode_at_startup_is_forced_off(self) -> None:
         with self.assertLogs("test", "WARNING") as logs:
@@ -56,8 +57,22 @@ class CoreGateTest(unittest.TestCase):
 class AdoptRobotGripperTest(unittest.TestCase):
     def test_follows_the_robot(self) -> None:
         config = VRTeleopConfig()
-        adopt_robot_gripper(config, "parcel")
-        self.assertEqual(config.gripper, "parcel")
+        adopt_robot_gripper(config, "parcel_v2")
+        self.assertEqual(config.gripper, "parcel_v2")
+
+    def test_an_earlier_name_for_the_robots_gripper_is_not_a_disagreement(
+        self,
+    ) -> None:
+        config = VRTeleopConfig(gripper="parcel")
+        with self.assertNoLogs("almond_axol.teleop.config", "WARNING"):
+            adopt_robot_gripper(config, "parcel_v1")
+        self.assertEqual(config.gripper, "parcel_v1")
+
+    def test_the_other_parcel_version_is_a_disagreement(self) -> None:
+        config = VRTeleopConfig(gripper="parcel_v1")
+        with self.assertLogs("almond_axol.teleop.config", "WARNING"):
+            adopt_robot_gripper(config, "parcel_v2")
+        self.assertEqual(config.gripper, "parcel_v2")
 
     def test_a_disagreeing_teleop_value_is_overridden_with_a_warning(self) -> None:
         config = VRTeleopConfig(gripper="parcel")
@@ -70,7 +85,7 @@ class AdoptRobotGripperTest(unittest.TestCase):
         from almond_axol.teleop.teleop import VRTeleop
 
         class _Arm:
-            gripper_type = "parcel"
+            gripper_type = "parcel_v2"
 
         class _Robot:
             left = _Arm()
@@ -86,7 +101,7 @@ class AdoptRobotGripperTest(unittest.TestCase):
         self.assertTrue(teleop._core.box_available)
         # ...and the IK solver and headset overlay use the parcel gripper's
         # model of Axol on Jelly.
-        self.assertEqual(teleop._kinematics_config.gripper, "parcel")
+        self.assertEqual(teleop._kinematics_config.gripper, "parcel_v2")
         self.assertEqual(teleop._core._urdf_file, "axol_jelly_parcel.urdf")
 
 
@@ -117,6 +132,7 @@ class PanelGateTest(unittest.TestCase):
         robot = next(c for c in serve_settings.SETTINGS if c.key == "robot")
         gripper = next(s for s in robot.settings if s.key == "axol.gripper")
         self.assertEqual(gripper.options, GRIPPER_TYPES)
+        self.assertEqual(GRIPPER_TYPES, ("parallel", "parcel_v1", "parcel_v2"))
 
     def test_every_box_setting_needs_the_parcel_gripper(self) -> None:
         box = [
@@ -129,7 +145,7 @@ class PanelGateTest(unittest.TestCase):
         for s in box:
             self.assertEqual(
                 s.ui.get("showWhen"),
-                {"key": "axol.gripper", "equals": "parcel"},
+                {"key": "axol.gripper", "oneOf": ["parcel_v1", "parcel_v2"]},
                 s.key,
             )
 

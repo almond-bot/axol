@@ -162,6 +162,11 @@ describe("supervisor API client", () => {
     expect(api.urdfUrl("classic", "parcel").endsWith("/api/urdf/axol.urdf")).toBe(true)
     expect(api.urdfUrl("ox_cart").endsWith("/api/urdf/axol_ox_cart.urdf")).toBe(true)
     expect(api.urdfUrl("owl", "parcel").endsWith("/api/urdf/axol_owl.urdf")).toBe(true)
+    expect(api.parseGripper("parcel")).toBe("parcel")
+    expect(api.parseGripper("parcel_v1")).toBe("parcel")
+    expect(api.parseGripper("parcel_v2")).toBe("parcel")
+    expect(api.parseGripper("parallel")).toBe("parallel")
+    expect(api.parseGripper(undefined)).toBe("parallel")
     expect(api.parseAxolModel("standalone")).toBe("standalone")
     expect(api.parseAxolModel("hover")).toBe(null)
     // The picker's value: legacy until a mount is saved; Jelly is never picked.
