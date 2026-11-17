@@ -49,3 +49,15 @@ When arm joints are missing, the arm isn't on the robot, so the command drives i
 On a full-robot run, `--payload-kg` is the mass of the item each gripper holds. It is added to the gravity model as each gripper closes, so the arms carry the item without sagging.
 
 An item heavier than the setting makes the shoulders sag and buzz when the arm is held out. Set it to the item's real mass, or `0` for none. The dashboard shows it as **Payload kg per gripper**. Runs with `--joints` hold no item and ignore it.
+
+## Grip
+
+Each gripper clamps the item with a light, fixed force and holds it for the whole test. The force stays low so the gripper motors don't overheat over two hours. The test uses the gripper type set in **Robot → Gripper** in the control panel.
+
+The test watches each gripper while it holds the item. If a gripper's torque drops and stays low, that gripper has let go, most likely because its motor overheated. The test then:
+
+- stops sweeping and returns the arms home,
+- keeps the motors enabled, so the other gripper keeps holding its item,
+- exits with an error that names the gripper.
+
+Let the gripper cool, then run [`diag.rom-disable`](/cli/diag-rom-disable) to release the items. A gripper that closed on nothing holds almost no torque, so the test can't watch it and prints a note at the start.

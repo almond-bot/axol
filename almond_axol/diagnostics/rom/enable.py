@@ -14,6 +14,12 @@ the robot returns home but keeps holding the item with the motors left enabled
 — run ``almond_axol.diagnostics.rom.disable`` afterwards to open the grippers
 and retrieve the item.
 
+Each gripper holds the item with a light force (``GRIPPER_TORQUE_LIMIT``) so
+its motor does not overheat over two hours. The test watches each gripper's
+torque while it holds. If a gripper lets go, the test stops, returns home with
+the motors still enabled, and exits with an error. The gripper type comes from
+the robot's settings, the same as for ``rom.disable``.
+
 The arms are driven through the Rust realtime core (``Axol``), the same
 control path as teleop: the core owns the CAN buses, renders the streamed
 targets at 240 Hz, and runs the host damping against fresh feedback. A soak
@@ -75,8 +81,9 @@ import asyncio
 import math
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Awaitable, Iterable
 from dataclasses import replace
+from typing import TypeVar
 
 import numpy as np
 
@@ -101,6 +108,7 @@ from ...robot.axol import LIMITS as _AXOL_LIMITS
 from ...robot.config import ArmConfig, AxolConfig, FrictionParams
 from ...robot.gravity import MAX_PAYLOAD_KG
 from ...rt import Axol, Mantis
+from ...settings import resolve_gripper
 from ..telemetry_log import TelemetryCsvLogger
 
 CONTROL_RATE_HZ = 100.0  # Hz
@@ -153,7 +161,14 @@ SHOULDER_PRE_POSE_ANGLE = -25 * math.pi / 180  # rad
 # holds at this torque — so GRIPPER_TORQUE_LIMIT *is* the grasp force. The
 # default config cap (0.5 Nm) is raised to this value for the test (see
 # run_axol).
-GRIPPER_TORQUE_LIMIT = 2.0  # Nm — POSITION_FORCE grasp force (output cap)
+#
+# A jaw clamped on an item never reaches its closed target, so the motor sits
+# at this cap for the whole two-hour soak. The DM-J4310 is rated 3.5 Nm
+# continuous, and the cap reads back about 1.9x higher than commanded: at 2.0
+# Nm both grippers reported ~3.8 Nm and cut out (over-temperature) after 11
+# and 14 minutes (2026-11-17). 1.2 Nm reads back ~2.3 Nm, about a third of
+# the heat.
+GRIPPER_TORQUE_LIMIT = 1.2  # Nm — POSITION_FORCE grasp force (output cap)
 GRIPPER_SPEED = 1.0  # normalized [0, 1] per second — open/close speed
 
 # Mass of the item each gripper holds on a full-robot run, added to the gravity
@@ -168,9 +183,144 @@ NUM_JOINTS = len(list(Joint))
 
 FULL_JOINT_SET: frozenset[Joint] = frozenset(Joint)
 
+T = TypeVar("T")
+
 
 class CoreLimp(RuntimeError):
     """The realtime core dropped the arms to gravity comp mid-run."""
+
+
+# Gripper let-go watch (full-robot grasp runs). The realtime core does not
+# report a gripper motor's fault flags while armed, so a gripper that cuts out
+# (over-temperature, overload) is seen only as its torque collapsing while
+# the command is still "closed". Without this watch the soak kept sweeping
+# for 15 minutes with a limp gripper and the item loose.
+GRIP_WATCH_MIN_HOLD = 0.5  # Nm — a hold under this is not watched
+GRIP_WATCH_DROP_FRACTION = 0.25  # of the hold torque — below this counts as let go
+GRIP_WATCH_SECONDS = 2.0  # s — how long the torque must stay low
+GRIP_WATCH_PERIOD = 0.1  # s — poll period of the watch
+GRIP_HOLD_SAMPLE_SECONDS = 1.0  # s — how long the hold torque is sampled
+
+
+class GripLost(RuntimeError):
+    """A clamped gripper stopped holding during the soak."""
+
+    def __init__(self, side: str, hold_nm: float, now_nm: float) -> None:
+        self.side = side
+        self.hold_nm = hold_nm
+        self.now_nm = now_nm
+        super().__init__(
+            f"{side.capitalize()} gripper let go: its torque fell from "
+            f"{hold_nm:.1f} Nm to {now_nm:.1f} Nm. The gripper motor most "
+            "likely overheated."
+        )
+
+
+class GripWatch:
+    """Spot a clamped gripper whose torque collapses mid-soak.
+
+    ``hold_nm`` maps each side to the torque magnitude (Nm) its gripper held
+    right after closing. A side holding under ``GRIP_WATCH_MIN_HOLD`` is
+    not watched: a jaw that closed on nothing and rests at its target has
+    no torque to lose. A watched side is lost once its torque magnitude
+    stays under ``GRIP_WATCH_DROP_FRACTION`` of the hold for
+    ``GRIP_WATCH_SECONDS``.
+    """
+
+    def __init__(self, hold_nm: dict[str, float]) -> None:
+        self.hold_nm = {
+            side: hold for side, hold in hold_nm.items() if hold >= GRIP_WATCH_MIN_HOLD
+        }
+        self._low_since: dict[str, float] = {}
+
+    @property
+    def watching(self) -> bool:
+        return bool(self.hold_nm)
+
+    def update(self, side: str, torque_nm: float, now: float) -> None:
+        """Feed one torque reading (Nm) at ``now`` (s); raise if the grip is lost.
+
+        Raises:
+            GripLost: The side's torque has stayed low for ``GRIP_WATCH_SECONDS``.
+        """
+        hold = self.hold_nm.get(side)
+        if hold is None or not math.isfinite(torque_nm):
+            return
+        if abs(torque_nm) >= GRIP_WATCH_DROP_FRACTION * hold:
+            self._low_since.pop(side, None)
+            return
+        since = self._low_since.setdefault(side, now)
+        if now - since >= GRIP_WATCH_SECONDS:
+            raise GripLost(side, hold, abs(torque_nm))
+
+
+async def _gripper_torques(robot: Axol | Mantis) -> dict[str, float]:
+    """Each present arm's gripper torque (Nm), from the telemetry caches."""
+    gripper_i = JOINT_INDEX[Joint.GRIPPER]
+    left, right = await robot.get_torques()
+    out: dict[str, float] = {}
+    if left is not None:
+        out["left"] = float(left[gripper_i])
+    if right is not None:
+        out["right"] = float(right[gripper_i])
+    return out
+
+
+async def measure_grip_hold(
+    robot: Axol | Mantis,
+    left_q: np.ndarray,  # rad
+    right_q: np.ndarray,  # rad
+    sides: Iterable[str],
+    seconds: float = GRIP_HOLD_SAMPLE_SECONDS,
+) -> dict[str, float]:
+    """Hold the pose for ``seconds`` and return each side's median grip torque (Nm)."""
+    wanted = set(sides)
+    samples: dict[str, list[float]] = {side: [] for side in wanted}
+    dt = 1.0 / CONTROL_RATE_HZ
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        await _stream(robot, left_q, right_q)
+        for side, torque in (await _gripper_torques(robot)).items():
+            if side in wanted and math.isfinite(torque):
+                samples[side].append(abs(torque))
+        await asyncio.sleep(dt)
+    return {
+        side: float(np.median(values)) for side, values in samples.items() if values
+    }
+
+
+async def watch_grips(robot: Axol | Mantis, watch: GripWatch) -> None:
+    """Poll the gripper torques until a grip is lost (raises :class:`GripLost`)."""
+    while True:
+        now = time.monotonic()
+        for side, torque in (await _gripper_torques(robot)).items():
+            watch.update(side, torque, now)
+        await asyncio.sleep(GRIP_WATCH_PERIOD)
+
+
+async def run_watched(soak: Awaitable[T], watch: Awaitable[None] | None) -> T:
+    """Run ``soak`` while ``watch`` runs beside it; a watch error stops the soak.
+
+    The soak is cancelled and awaited before the watch's error is raised, so
+    the caller can move the arms without the soak still streaming targets.
+    With no ``watch`` this is ``await soak``.
+    """
+    if watch is None:
+        return await soak
+    soak_task = asyncio.ensure_future(soak)
+    watch_task = asyncio.ensure_future(watch)
+    try:
+        await asyncio.wait({soak_task, watch_task}, return_when=asyncio.FIRST_COMPLETED)
+        if soak_task.done():
+            return soak_task.result()
+        soak_task.cancel()
+        await asyncio.gather(soak_task, return_exceptions=True)
+        watch_task.result()
+        raise RuntimeError("grip watch stopped without an error")
+    finally:
+        for task in (soak_task, watch_task):
+            task.cancel()
+        await asyncio.gather(soak_task, watch_task, return_exceptions=True)
 
 
 def check_payload_kg(mass: float) -> float:
@@ -805,7 +955,13 @@ async def run_axol(
     payload_desc = f"  |  item: {payload_kg:g} kg per gripper" if grasp else ""
     print(f"Running {arms_desc}  |  joints: {joints_desc}{payload_desc}\n")
 
-    config = AxolConfig(left_stiffness=1.0, right_stiffness=1.0)
+    # The gripper type comes from the robot's settings, like every other
+    # command (rom.disable included): it sets the close direction and stroke
+    # the enable-time calibration expects, and a calibration saved under the
+    # wrong type is refused by the next command that reads it.
+    config = AxolConfig(
+        left_stiffness=1.0, right_stiffness=1.0, gripper=resolve_gripper()
+    )
     if grasp:
         # Raised grasp force is only needed to hold the item; a bare gripper
         # ROM sweep keeps the default (gentle) torque cap.
@@ -886,6 +1042,7 @@ async def run_axol(
     # the grasp is kept and ``rom.disable`` can release it later. Any subset run
     # holds nothing, so the motors are always disabled in the finally block.
     keep_enabled = False
+    grip_lost: GripLost | None = None
 
     try:
         gripper_i = JOINT_INDEX[Joint.GRIPPER]
@@ -941,36 +1098,61 @@ async def run_axol(
         closed_right_q = right_q.copy()
 
         print("Starting ROM test in 5 s ...")
-        await hold_pose(robot, left_q, right_q, 5.0)
-
-        deadline = time.monotonic() + SOAK_DURATION
-        cycle = 0
-
-        while time.monotonic() < deadline:
-            cycle += 1
-            remaining = deadline - time.monotonic()
-            print(f"\n--- Cycle {cycle}  ({remaining / 60:.1f} min remaining) ---")
-
-            left_q, right_q = home_with_grippers_closed()
-
-            left_q, right_q = await run_rom_cycle(
-                robot,
-                left_q,
-                right_q,
-                speed=AXOL_SPEED,
-                pre_pose_speed=AXOL_PRE_POSE_SPEED,
-                pause=AXOL_WAYPOINT_PAUSE,
-                shoulder3_mirror=False,
-                present=present,
-                run_left=run_left,
-                run_right=run_right,
-                sweep_gripper=sweep_gripper,
+        grip_watch: GripWatch | None = None
+        if grasp and target == "axol":
+            await hold_pose(robot, left_q, right_q, 5.0 - GRIP_HOLD_SAMPLE_SECONDS)
+            sides = [s for s, run in (("left", run_left), ("right", run_right)) if run]
+            grip_watch = GripWatch(
+                await measure_grip_hold(robot, left_q, right_q, sides)
             )
+            for side in sides:
+                hold = grip_watch.hold_nm.get(side)
+                if hold is None:
+                    print(
+                        f"{side.capitalize()} gripper holds almost no torque, so "
+                        "the test can't tell if it lets go."
+                    )
+        else:
+            await hold_pose(robot, left_q, right_q, 5.0)
 
-            print(f"\nCycle {cycle} complete.")
-            if time.monotonic() < deadline:
-                print(f"Waiting {CYCLE_PAUSE}s ...")
-                await hold_pose(robot, left_q, right_q, CYCLE_PAUSE)
+        async def soak_cycles() -> tuple[np.ndarray, np.ndarray, int]:
+            left_q, right_q = home_with_grippers_closed()
+            deadline = time.monotonic() + SOAK_DURATION
+            cycle = 0
+
+            while time.monotonic() < deadline:
+                cycle += 1
+                remaining = deadline - time.monotonic()
+                print(f"\n--- Cycle {cycle}  ({remaining / 60:.1f} min remaining) ---")
+
+                left_q, right_q = home_with_grippers_closed()
+
+                left_q, right_q = await run_rom_cycle(
+                    robot,
+                    left_q,
+                    right_q,
+                    speed=AXOL_SPEED,
+                    pre_pose_speed=AXOL_PRE_POSE_SPEED,
+                    pause=AXOL_WAYPOINT_PAUSE,
+                    shoulder3_mirror=False,
+                    present=present,
+                    run_left=run_left,
+                    run_right=run_right,
+                    sweep_gripper=sweep_gripper,
+                )
+
+                print(f"\nCycle {cycle} complete.")
+                if time.monotonic() < deadline:
+                    print(f"Waiting {CYCLE_PAUSE}s ...")
+                    await hold_pose(robot, left_q, right_q, CYCLE_PAUSE)
+            return left_q, right_q, cycle
+
+        left_q, right_q, cycle = await run_watched(
+            soak_cycles(),
+            watch_grips(robot, grip_watch)
+            if grip_watch is not None and grip_watch.watching
+            else None,
+        )
 
         print(f"\n2-hour soak complete — {cycle} cycle(s) finished.")
 
@@ -1008,6 +1190,13 @@ async def run_axol(
             "and will not track. Hand-guide them to rest; the run is over."
         )
 
+    except GripLost as exc:
+        grip_lost = exc
+        print(f"\n{exc} Stopping the test.")
+        if robot.limp is None:
+            await return_home(robot)
+            keep_enabled = grasp
+
     finally:
         if logger is not None:
             await logger.stop()
@@ -1026,6 +1215,12 @@ async def run_axol(
         else:
             await robot.disable()
             print("Motors disabled.")
+
+    if grip_lost is not None:
+        raise SystemExit(
+            f"Test stopped: the {grip_lost.side} gripper let go. Let the gripper "
+            "cool, then run diag.rom-disable to release the items."
+        )
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
