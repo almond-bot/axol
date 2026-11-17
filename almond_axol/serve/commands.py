@@ -493,6 +493,9 @@ COMMANDS: dict[str, CommandDef] = {
         # Arm gains and channels are the robot's shared settings, the same
         # ones gravity compensation and waypoints use.
         settings_like="gravity-comp",
+        # The Robot tab's "Axol arms" switch (settings ``robot.arms``), as for
+        # teleop: off jogs just Jelly, with no Axol connection needed.
+        arms_flag="arms",
         per_run_fields=("sim",),
     ),
     "collect-data": CommandDef(

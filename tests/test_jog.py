@@ -1459,3 +1459,109 @@ def test_a_sim_run_simulates_the_picked_gripper() -> None:
     with patch("almond_axol.jog.session.JogSession"):
         jog.build_session(cfg)
     assert cfg.kinematics.gripper == "parcel"
+
+
+# -- which hardware a jog run drives ----------------------------------------
+
+
+def _build_hardware(
+    tmp_path: Path, present: tuple[str, ...], jelly_attached: bool, **kw: Any
+) -> HardwareBackend:
+    """The backend ``build_session`` picks with these CAN interfaces attached."""
+    from almond_axol.cli import jog
+    from almond_axol.robot import jelly as jelly_module
+
+    for name in present:
+        (tmp_path / name).mkdir()
+    detected = JellyConfig() if jelly_attached else None
+    with (
+        patch.object(jelly_module, "_SYS_NET", tmp_path),
+        patch.object(jelly_module, "detect_jelly", return_value=detected),
+        patch.object(jelly_module, "Jelly", side_effect=lambda cfg: ("jelly", cfg)),
+        patch("almond_axol.robot.Axol", side_effect=lambda **_: "axol"),
+        patch("almond_axol.jog.session.JogSession") as session_cls,
+    ):
+        jog.build_session(jog.JogCmdConfig(**kw))
+    return session_cls.call_args.args[0]
+
+
+def test_jog_drives_the_arms_and_jelly_when_both_are_attached(tmp_path: Path) -> None:
+    from almond_axol.constants import CAN_LEFT, CAN_RIGHT
+
+    backend = _build_hardware(tmp_path, (CAN_LEFT, CAN_RIGHT), jelly_attached=True)
+    assert backend.connects_arms
+    assert backend._jelly is not None
+
+
+def test_jog_drives_just_jelly_without_the_arm_hub(tmp_path: Path, caplog) -> None:
+    with caplog.at_level("WARNING", logger="almond_axol.cli.jog"):
+        backend = _build_hardware(tmp_path, (), jelly_attached=True)
+    assert not backend.connects_arms
+    assert backend._jelly is not None
+    assert "jogging Jelly only" in caplog.text
+
+
+def test_axol_arms_off_jogs_just_jelly_with_the_hub_attached(tmp_path: Path) -> None:
+    from almond_axol.constants import CAN_LEFT, CAN_RIGHT
+
+    backend = _build_hardware(
+        tmp_path, (CAN_LEFT, CAN_RIGHT), jelly_attached=True, arms=False
+    )
+    assert not backend.connects_arms
+    assert backend._jelly is not None
+
+
+def test_without_jelly_the_arms_stay_requested(tmp_path: Path) -> None:
+    # No hub and no Jelly: the Axol connection reports the missing hub.
+    backend = _build_hardware(tmp_path, (), jelly_attached=False)
+    assert backend.connects_arms
+    assert backend._jelly is None
+
+
+def test_arms_off_without_jelly_is_refused(tmp_path: Path) -> None:
+    from almond_axol.constants import CAN_LEFT, CAN_RIGHT
+
+    with pytest.raises(ValueError, match="Nothing to jog. Axol arms is off"):
+        _build_hardware(
+            tmp_path, (CAN_LEFT, CAN_RIGHT), jelly_attached=False, arms=False
+        )
+
+
+def test_sim_needs_the_arms() -> None:
+    from almond_axol.cli import jog
+
+    with pytest.raises(ValueError, match="Sim needs the arms"):
+        jog.build_session(jog.JogCmdConfig(sim=True, arms=False))
+
+
+def test_jelly_only_startup_connects_to_jelly() -> None:
+    from almond_axol import progress
+
+    tracker = progress.begin()
+    try:
+        session = JogSession(
+            HardwareBackend(None, _FakeJelly()), _FakePlanner, rate=200.0
+        )
+        thread, stop = _start(session)
+        try:
+            assert _wait(lambda: tracker.is_ready, 5.0)
+            assert tracker.to_dict()["steps"] == ["jelly", "ik"]
+            assert session.state()["hasArms"] is False
+        finally:
+            stop.set()
+            thread.join(5)
+    finally:
+        progress.end(tracker)
+
+
+def test_jog_follows_the_axol_arms_setting(tmp_path: Path) -> None:
+    from almond_axol.serve.commands import COMMANDS
+    from almond_axol.serve.settings import SettingsStore
+
+    assert COMMANDS["jog"].arms_flag == "arms"
+    store = SettingsStore(tmp_path / "settings.json")
+    store.update(values={"robot.arms": False})
+    assert store.merged_args("jog", {})["arms"] is False
+    # Jog shares gravity compensation's settings, which has no arms switch.
+    assert "arms" not in store.merged_args("gravity-comp", {})
+    assert "arms" not in store.merged_args("waypoints", {})

@@ -361,20 +361,23 @@ def _wire_jelly_imu(cfg: TeleopCmdConfig, jelly: Any) -> Any | None:
         return None
 
 
-def _arm_channels_present(cfg: TeleopCmdConfig) -> bool:
-    """Whether any configured arm CAN interface exists on this host.
+def arm_channels_present(*channels: str | None) -> bool:
+    """Whether any of these arm CAN interfaces exists on this host.
 
     The Axol hub's channels are pinned to ``can_alm_axol_l`` / ``_r`` by
     ``axol can.setup`` (or the control panel's CAN discovery), so an interface
-    existing under ``/sys/class/net`` is the hub being plugged in. A ``null``
-    channel is an arm deliberately disabled and never counts.
+    existing under ``/sys/class/net`` is the hub being plugged in. A ``None``
+    channel is an arm deliberately disabled and never counts. Shared with
+    ``axol jog``, which picks its hardware the same way.
     """
     from ..robot.jelly import _iface_exists
 
-    return any(
-        channel is not None and _iface_exists(channel)
-        for channel in (cfg.left_channel, cfg.right_channel)
-    )
+    return any(channel is not None and _iface_exists(channel) for channel in channels)
+
+
+def _arm_channels_present(cfg: TeleopCmdConfig) -> bool:
+    """Whether any of this session's configured arm CAN interfaces exists."""
+    return arm_channels_present(cfg.left_channel, cfg.right_channel)
 
 
 def select_hardware(cfg: TeleopCmdConfig) -> tuple[bool, "JellyConfig | None"]:

@@ -44,6 +44,7 @@ class SimBackend:
     """
 
     mode = "sim"
+    connects_arms = True
     has_arms = True
 
     def __init__(self, robot_model: str, jelly: JellyConfig | None = None) -> None:
@@ -121,6 +122,10 @@ class HardwareBackend:
         self._jelly_open = False
         self._rest = _rest_pose()
         self._pose = [0.0, 0.0, 0.0]
+
+    @property
+    def connects_arms(self) -> bool:
+        return self._axol is not None
 
     @property
     def has_arms(self) -> bool:

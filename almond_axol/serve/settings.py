@@ -501,11 +501,13 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Axol arms",
                 type="boolean",
                 help=(
-                    "Drive Axol's arms during teleoperation. Turn off to drive only Jelly, "
-                    "with or without the arms connected. Data collection and policies "
-                    "always use the arms."
+                    "Drive Axol's arms in teleoperation and Jog. Turn off to drive only "
+                    "Jelly, with or without the arms connected. Data collection and "
+                    "policies always use the arms."
                 ),
-                targets={"teleop": ("arms",)},
+                # Jog inherits gravity-comp's table (settings_like) and adds
+                # this one target of its own (see targets_for).
+                targets={"teleop": ("arms",), "jog": ("arms",)},
             ),
             SettingDef(
                 key="teleop.reset_torque_threshold",
@@ -1311,15 +1313,22 @@ _SETTINGS_BY_KEY: dict[str, SettingDef] = {
 }
 
 
-def targets_for(key: str, op: str) -> tuple[str, ...]:
+def targets_for(key: str, op: str, own_op: str | None = None) -> tuple[str, ...]:
     """The op config key(s) a stored canonical ``key`` drives on ``op``.
 
     A curated setting with explicit ``targets`` wins; every other key is
     grafted through its section's per-op prefix. Unknown sections (or a bare
     section name) drive nothing.
+
+    ``own_op`` is the operation actually starting when ``op`` is the table it
+    inherits (``settings_like``). A curated setting that names ``own_op`` in
+    its ``targets`` uses that entry, so an aliased op can take a setting its
+    parent doesn't have (jog's ``arms``, under gravity-comp's table).
     """
     setting = _SETTINGS_BY_KEY.get(key)
     if setting is not None and setting.targets is not None:
+        if own_op is not None and own_op in setting.targets:
+            return setting.targets[own_op]
         return setting.targets.get(op, ())
     section_key, _, subpath = key.partition(".")
     section = _SECTIONS_BY_KEY.get(section_key)
@@ -2013,7 +2022,7 @@ class SettingsStore:
         for key, value in values.items():
             if value is None:
                 continue
-            for target in targets_for(key, target_op):
+            for target in targets_for(key, target_op, own_op=op_id):
                 merged[target] = value
 
         # The Mantis and Axol channel maps are deliberately independent. The
