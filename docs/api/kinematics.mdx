@@ -61,7 +61,7 @@ The bundled URDFs are in `almond_axol/kinematics/urdf/`, one per version. All bu
 | `axol_ox_cart.urdf` | Axol on Ox Cart | the cart's lift (`lift`), fingers |
 | `axol_owl.urdf` | Axol on Owl Mount: a column on a foot plate | fingers |
 | `axol_jelly.urdf` | Axol on Jelly, picked automatically when Jelly is enabled | `base_x`, `base_y`, `base_yaw` (the base in the plane, for simulators), the two-stage lift (`lift`, `lift_2`), wheels, fingers |
-| `axol_jelly_parcel.urdf` | Axol on Jelly with the parcel gripper, when `axol.gripper` is `parcel` | as above, with a hinged plate per gripper |
+| `axol_jelly_parcel.urdf` | Axol on Jelly with the parcel gripper, when `axol.gripper` is `parcel_v1` or `parcel_v2` | as above, with a hinged plate per gripper |
 
 **One model for everything.** Each generated file describes the full robot. IK, the sim viewer, the headset overlay, the control panel's viewer and physics simulators all load it. With every body joint at zero, the torso root (`root`) is the world origin, so poses match `axol.urdf`. IK loads the file through `almond_axol.kinematics.model.ik_urdf`, which:
 
@@ -81,7 +81,7 @@ Each version tells IK which parts of the body to keep the arms away from:
 - **Jelly:** the deck, also left out of the hard upper-arm guard. The lift carries the arms down while the deck stays on the ground. Teleop passes the height the lift reports to IK, which moves the deck and the lower column up toward the arms by that amount. Until the lift first reports a homed height, IK treats it as fully raised, and if the readings stop, IK keeps the last height. `KinematicsSolver.lift_contact()` reports how far each arm is inside the deck's soft-cost shell and the direction out. Teleop uses it to move arms that aren't tracking out of the deck's way (`lift_clear_step()`), to raise the return-to-rest goal over the deck (`lift_clear_pose()`), and to keep an engaged arm's target at the height the deck holds it.
 - **Parallel gripper (every version but `axol.urdf`):** teleop also passes each gripper's commanded opening to IK, which slides the fingers to match. Until the first command, IK treats both grippers as fully open. In `axol.urdf` the fingers are part of the gripper's shape.
 
-**Parcel gripper.** With `axol.gripper` set to `parcel`, Axol on Jelly uses `axol_jelly_parcel.urdf` everywhere a URDF is chosen: the IK solver (`KinematicsConfig.gripper`, which teleop sets from `AxolConfig.gripper`), the sim viewer, the headset overlay and the control panel's pose viewer. Each gripper is a fixed jaw (`*_gripper`) and a plate hinged on it (`*_plate`). The hinge, `*_plate_joint`, turns through half a turn, with 0 alongside the jaw. The parcel gripper has no wrist cameras, so this model has only the head camera frames.
+**Parcel gripper.** With `axol.gripper` set to `parcel_v1` or `parcel_v2`, Axol on Jelly uses `axol_jelly_parcel.urdf` everywhere a URDF is chosen: the IK solver (`KinematicsConfig.gripper`, which teleop sets from `AxolConfig.gripper`), the sim viewer, the headset overlay and the control panel's pose viewer. Each gripper is a fixed jaw (`*_gripper`) and a plate hinged on it (`*_plate`). The hinge, `*_plate_joint`, turns through half a turn, with 0 alongside the jaw. The parcel gripper has no wrist cameras, so this model has only the head camera frames.
 
 The parcel gripper model exists for Jelly only. The other versions keep the parallel gripper whichever gripper is fitted.
 
@@ -182,7 +182,7 @@ for q in plan_linear_segment(solver, q_a, q_b, speed=0.25, ang_speed=1.2, rate=2
 | `elbow_fade_band` | `0.15` m | Height band above the shoulder over which the elbow hint fades to zero, since the inferred elbow is unreliable at shoulder height and above. |
 | `robot_model` | `None` | Axol version to solve for: `classic`, `standalone`, `ox_cart`, `owl` or `mobile` (Axol on Jelly). `None` picks `mobile` when Jelly is enabled, else `mount`. |
 | `mount` | `None` | Mount without Jelly: `classic`, `standalone`, `ox_cart` or `owl`. `None` reads `kinematics.mount` from the shared settings. |
-| `gripper` | `None` | Fitted gripper, `parallel` or `parcel`. `None` reads `axol.gripper` from the shared settings. |
+| `gripper` | `None` | Fitted gripper: `parallel`, `parcel_v1` or `parcel_v2`. `None` reads `axol.gripper` from the shared settings. |
 | `backend` | `"jax"` | IK backend: `"jax"` (Pyroki, the default) or `"mink"`. The control panel sets it with **IK solver** under **Kinematics**. |
 
 When the headset elbow hint is on (`elbow_weight` above `0`), it is projected onto the elbow positions the robot can reach and fades out above shoulder height (see `elbow_fade_band`). In plain teleop with the hint off, the posture attractor sets the arm's swivel. Box mode can pass its own "elbows out" hint with a per-call weight, through `ik(elbow_weight=...)` and with no fade. It is set by `VRTeleopConfig.box_elbow_out` and `box_elbow_weight`, and is off by default.

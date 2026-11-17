@@ -331,6 +331,32 @@ class DiagnosticSettingsTest(unittest.TestCase):
                     )
                     self.assertNotIn("mantis_source", merged)
 
+    def test_gripper_saved_under_its_earlier_name_reads_as_parcel_v1(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(json.dumps({"version": 2, "axol": {"gripper": "parcel"}}))
+            for strict in (False, True):
+                with self.subTest(strict=strict):
+                    store = SettingsStore(path, strict=strict)
+                    self.assertEqual(
+                        store.snapshot()["values"]["axol.gripper"], "parcel_v1"
+                    )
+                    merged = store.merged_args("teleop", {})
+                    self.assertEqual(merged["axol.gripper"], "parcel_v1")
+
+            store = SettingsStore(path)
+            store.update(values={"axol.gripper": "parcel"})
+            self.assertEqual(store.snapshot()["values"]["axol.gripper"], "parcel_v1")
+            store.update(values={"axol.gripper": "parcel_v2"})
+            self.assertEqual(
+                json.loads(path.read_text())["axol"]["gripper"], "parcel_v2"
+            )
+            with self.assertRaisesRegex(ValueError, "axol.gripper"):
+                store.update(values={"axol.gripper": "claw"})
+            self.assertEqual(store.snapshot()["values"]["axol.gripper"], "parcel_v2")
+            store.update(values={"axol.gripper": None})
+            self.assertNotIn("axol.gripper", store.snapshot()["values"])
+
     def test_update_rejects_unknown_sections_and_curated_only_leaves(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory) / "settings.json")

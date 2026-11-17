@@ -1664,11 +1664,12 @@ export interface SettingsFieldUI {
 }
 
 /** Show a setting only while the setting `key` (its staged value, else its
- * default) equals `equals` — box mode's settings only with the parcel
- * gripper, say. */
+ * default) equals `equals` or is one of `oneOf` — box mode's settings only
+ * with a parcel gripper, say. */
 export interface ShowWhen {
   key: string
-  equals: SettingValue
+  equals?: SettingValue
+  oneOf?: SettingValue[]
 }
 
 export interface SettingsField {
@@ -1767,11 +1768,16 @@ export function parseAxolMount(value: unknown): AxolMount {
   return AXOL_MOUNTS.find((m) => m === value) ?? "classic"
 }
 
-/** The gripper fitted to both arms (the `axol.gripper` setting). */
+/** The gripper model drawn on both arms. The parcel gripper's two versions
+ * (`parcel_v1` and `parcel_v2` in the `axol.gripper` setting) look the same. */
 export type GripperType = "parallel" | "parcel"
 
+/** The gripper model for an `axol.gripper` value. `parcel` is what hosts
+ * that know one parcel gripper call it. */
 export function parseGripper(value: unknown): GripperType {
-  return value === "parcel" ? "parcel" : "parallel"
+  return value === "parcel" || value === "parcel_v1" || value === "parcel_v2"
+    ? "parcel"
+    : "parallel"
 }
 
 /**
@@ -1898,7 +1904,7 @@ export function filterSchema(nodes: SchemaNode[], exclude: Set<string>): SchemaN
 }
 
 /** Whether a setting gated by `showWhen` is visible: the controlling
- * setting's staged value (else its schema default) equals the wanted one. */
+ * setting's staged value (else its schema default) is a wanted one. */
 export function settingShown(
   showWhen: ShowWhen | undefined,
   values: Record<string, SettingValue>,
@@ -1911,6 +1917,7 @@ export function settingShown(
     staged != null
       ? staged
       : schema.flatMap((c) => c.settings).find((s) => s.key === showWhen.key)?.default
+  if (showWhen.oneOf) return showWhen.oneOf.some((wanted) => wanted === value)
   return value === showWhen.equals
 }
 

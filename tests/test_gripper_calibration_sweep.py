@@ -183,13 +183,59 @@ class GripperTypeTest(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(arm._gripper_close, jaw.hi, delta=0.01)
             self.assertEqual(jaw.position, jaw.lo)
 
+    async def test_parcel_versions_close_opposite_ways(self) -> None:
+        # The same jaw on each side under each version: the stop the sweep
+        # calls closed swaps, and it finishes on the other one (open).
+        expected = {
+            ("parcel_v1", "left"): "hi",
+            ("parcel_v1", "right"): "lo",
+            ("parcel_v2", "left"): "lo",
+            ("parcel_v2", "right"): "hi",
+        }
+        for (gripper, side), closed in expected.items():
+            with self.subTest(gripper=gripper, side=side):
+                jaw = _Jaw(lo=0.53, hi=3.74, start=2.0)
+                arm = getattr(AxolHardware(AxolConfig(gripper=gripper)), side)
+                arm.motors[Joint.GRIPPER] = jaw
+                await arm._calibrate_gripper()
+                close, open_ = (jaw.hi, jaw.lo) if closed == "hi" else (jaw.lo, jaw.hi)
+                self.assertAlmostEqual(arm._gripper_close, close, delta=0.01)
+                self.assertAlmostEqual(arm._gripper_open, open_, delta=0.01)
+                self.assertAlmostEqual(jaw.position, open_, delta=0.01)
+
+    async def test_parallel_stroke_under_either_parcel_setting_fails(self) -> None:
+        for gripper in ("parcel_v1", "parcel_v2"):
+            with self.subTest(gripper=gripper):
+                jaw = _Jaw(lo=-6.0, hi=-6.0 + math.radians(290), start=-4.0)
+                arm = AxolHardware(AxolConfig(gripper=gripper)).left
+                arm.motors[Joint.GRIPPER] = jaw
+                with self.assertRaisesRegex(
+                    MotorError,
+                    "matches the parallel gripper.*configured for the parcel "
+                    "gripper.*set the gripper type to parallel ",
+                ):
+                    await arm._calibrate_gripper()
+
+    async def test_restore_rejects_the_other_parcel_versions_calibration(
+        self,
+    ) -> None:
+        # Stops measured closing toward positive (parcel_v1's left jaw).
+        arm = AxolHardware(AxolConfig(gripper="parcel_v2")).left
+        arm.motors[Joint.GRIPPER] = _Jaw(lo=0.53, hi=3.74, start=2.0)
+        with patch.object(
+            axol_module, "_load_gripper_calibration", return_value=(0.53, 3.74)
+        ):
+            with self.assertRaisesRegex(MotorError, "closing the opposite way"):
+                await arm._restore_gripper_calibration()
+
     async def test_parcel_stroke_under_the_parallel_setting_fails(self) -> None:
         jaw = _Jaw(lo=0.53, hi=3.74, start=2.0)
         arm = AxolHardware(AxolConfig(gripper="parallel")).right
         arm.motors[Joint.GRIPPER] = jaw
         with self.assertRaisesRegex(
             MotorError,
-            "matches the parcel gripper.*Empty the gripper.*--axol.gripper parcel",
+            "matches the parcel gripper.*Empty the gripper.*"
+            "set the gripper type to parcel_v1 or parcel_v2",
         ):
             await arm._calibrate_gripper()
         self.assertEqual(jaw.target, jaw.position)

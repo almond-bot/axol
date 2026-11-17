@@ -5,7 +5,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}left_stiffness</F> | `1.0` | How stiff the left arm is, from `0` (soft, hand-guidable) to `1` (the tuned gains). One number sets every joint, and a 7-element list sets each joint in the order `shoulder_1, shoulder_2, shoulder_3, elbow, wrist_1, wrist_2, wrist_3`. |
 | <F>--{prefix}right_stiffness</F> | `1.0` | Same, for the right arm. |
 | <F>--{prefix}has_gripper</F> | `true` | Set `false` on the gripperless model. The gripper motors are never enabled and datasets record 7 channels per arm instead of 8. |
-| <F>--{prefix}gripper</F> | `parallel` | Which gripper is fitted: `parallel` (the stock two-finger gripper) or `parcel` (the hinged-plate parcel gripper). Box mode works only with `parcel`. |
+| <F>--{prefix}gripper</F> | `parallel` | Which gripper is fitted: `parallel` (the stock two-finger gripper), or `parcel_v1` or `parcel_v2` (the two versions of the hinged-plate parcel gripper). Box mode works only with a parcel gripper. |
 | <F>--{prefix}max_step_rad</F> | `0.5` | Largest joint move (rad) allowed between two consecutive commands. Bigger moves are dropped with a warning. `inf` disables. |
 | <F>--{prefix}controller</F> | `impedance` | Control law for the arms. `impedance` is compliant and runs at 240 Hz, and `position` hands each joint to its motor's own position loop at 400 Hz (see the notes below). |
 | <F>--{prefix}impedance_hz</F> | `240.0` | Command rate (Hz) of the MyActuator impedance joints: `240.0` or the experimental `480.0`. The gains were tuned at 240 Hz. |

@@ -45,7 +45,7 @@ from typing import Any
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, AxolModel, Joint, urdf_path
+from ..constants import ARM_JOINTS, AxolModel, Joint, is_parcel_gripper, urdf_path
 from ..robot.control import ContactWatchdog
 from ..robot.gravity import GravityCompensator
 from ..settings import resolve_gripper, resolve_robot_model
@@ -933,9 +933,9 @@ class VRTeleopCore:
 
     @property
     def box_available(self) -> bool:
-        """Whether this session has box mode: only with the parcel gripper
+        """Whether this session has box mode: only with a parcel gripper
         (``VRTeleopConfig.gripper``)."""
-        return self.config.gripper == "parcel"
+        return is_parcel_gripper(self.config.gripper)
 
     def set_box_mode(self, enabled: bool) -> None:
         """Switch box mode on/off (headset HUD / control panel / SDK). Safe
@@ -1826,7 +1826,7 @@ class VRTeleopCore:
             return True
         if not (
             edge
-            and getattr(self.config, "gripper", "parallel") == "parcel"
+            and is_parcel_gripper(getattr(self.config, "gripper", None))
             and self.q is not None
         ):
             return False

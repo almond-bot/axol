@@ -49,12 +49,26 @@ class StrokeTest(unittest.TestCase):
         self.assertAlmostEqual(arm._gripper_to_raw(1.0), -math.radians(180.0), places=9)
 
     def test_close_direction_follows_the_gripper_type(self) -> None:
+        self.assertEqual(gripper_close_direction("parcel_v1", is_left=True), 1)
+        self.assertEqual(gripper_close_direction("parcel_v1", is_left=False), -1)
+        # parcel_v2's motors are mounted the other way round.
+        self.assertEqual(gripper_close_direction("parcel_v2", is_left=True), -1)
+        self.assertEqual(gripper_close_direction("parcel_v2", is_left=False), 1)
+        # The earlier name for parcel_v1.
         self.assertEqual(gripper_close_direction("parcel", is_left=True), 1)
         self.assertEqual(gripper_close_direction("parcel", is_left=False), -1)
+        with self.assertRaisesRegex(ValueError, "gripper must be one of"):
+            gripper_close_direction("claw", is_left=True)
         self.assertEqual(gripper_close_direction("parallel", is_left=True), 1)
         self.assertEqual(gripper_close_direction("parallel", is_left=False), 1)
         hw = AxolHardware(AxolConfig())
         self.assertEqual((hw.left._close_direction, hw.right._close_direction), (1, 1))
+        hw = AxolHardware(AxolConfig(gripper="parcel_v2"))
+        self.assertEqual((hw.left._close_direction, hw.right._close_direction), (-1, 1))
+
+    def test_the_earlier_parcel_name_is_stored_as_parcel_v1(self) -> None:
+        self.assertEqual(AxolConfig(gripper="parcel").gripper, "parcel_v1")
+        self.assertEqual(AxolConfig(gripper="parcel_v2").gripper, "parcel_v2")
 
     def test_right_sweep_finishes_on_the_positive_stop(self) -> None:
         # The right arm's stops as measured on the robot: it rested closed

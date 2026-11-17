@@ -148,10 +148,49 @@ _URDF_FILES: dict[AxolModel, str] = {
     AxolModel.OWL: "axol_owl.urdf",
     AxolModel.MOBILE: "axol_jelly.urdf",
 }
-# The mobile Axol with the parcel gripper (AxolConfig.gripper = "parcel"):
-# the same body and arms, the parcel gripper's jaw and hinged plate in place
-# of the parallel gripper and its wrist camera.
+# The mobile Axol with a parcel gripper (AxolConfig.gripper in
+# PARCEL_GRIPPERS): the same body and arms, the parcel gripper's jaw and
+# hinged plate in place of the parallel gripper and its wrist camera.
 _PARCEL_URDF = "axol_jelly_parcel.urdf"
+
+# The grippers ``AxolConfig.gripper`` can name. The two parcel grippers are
+# one design (same model, stroke, mass and box mode) whose jaw motors are
+# mounted opposite ways round, so they differ only in which way each jaw
+# closes (``almond_axol.robot.config.gripper_close_direction``).
+PARCEL_GRIPPERS: tuple[str, ...] = ("parcel_v1", "parcel_v2")
+GRIPPER_TYPES: tuple[str, ...] = ("parallel", *PARCEL_GRIPPERS)
+# Names a gripper went by before, still accepted wherever one is read (a
+# saved setting, ``--axol.gripper``, a browser's stored sim pick): ``parcel``
+# is what ``parcel_v1`` was called while it was the only parcel gripper.
+GRIPPER_ALIASES: dict[str, str] = {"parcel": "parcel_v1"}
+
+
+def normalize_gripper(gripper: object) -> str:
+    """``gripper`` as one of :data:`GRIPPER_TYPES`.
+
+    Lower-cases and strips it, and maps an earlier name
+    (:data:`GRIPPER_ALIASES`) onto the current one.
+
+    Raises:
+        ValueError: If it names no gripper.
+    """
+    name = str(gripper).strip().lower()
+    name = GRIPPER_ALIASES.get(name, name)
+    if name not in GRIPPER_TYPES:
+        raise ValueError(
+            f"gripper must be one of {list(GRIPPER_TYPES)}, got {gripper!r}"
+        )
+    return name
+
+
+def is_parcel_gripper(gripper: object) -> bool:
+    """Whether ``gripper`` names a parcel gripper (either version, or the
+    earlier ``parcel``). ``None`` and unknown names are not."""
+    if gripper is None:
+        return False
+    name = str(gripper).strip().lower()
+    return GRIPPER_ALIASES.get(name, name) in PARCEL_GRIPPERS
+
 
 # Static body links the arms must not collide into, per version: the shoulder
 # bar, the head-camera mount, the lift column's top plate and each of its
@@ -186,8 +225,8 @@ def urdf_path(
     """The bundled URDF for ``model`` (meshes resolve relative to :data:`URDF_DIR`).
 
     ``gripper`` (``AxolConfig.gripper``) selects the mobile Axol's
-    parcel-gripper model; the other versions have one URDF each, with the
-    parallel gripper.
+    parcel-gripper model, the same for both parcel grippers; the other
+    versions have one URDF each, with the parallel gripper.
 
     Every version but ``CLASSIC`` is one full model — IK, the viewers and
     physics simulators all load it: every moving part (the Jelly base and
@@ -197,7 +236,7 @@ def urdf_path(
     which freezes the joints it does not solve and collides the
     fitted ``<ik_collision>`` boxes and capsules instead.
     """
-    if gripper == "parcel" and AxolModel(model) is AxolModel.MOBILE:
+    if is_parcel_gripper(gripper) and AxolModel(model) is AxolModel.MOBILE:
         return URDF_DIR / _PARCEL_URDF
     return URDF_DIR / _URDF_FILES[AxolModel(model)]
 

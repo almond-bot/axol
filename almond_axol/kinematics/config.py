@@ -187,8 +187,8 @@ class KinematicsConfig:
             ``"standalone"``, ``"ox_cart"`` or ``"owl"``. ``None`` reads the
             saved ``kinematics.mount`` (legacy if unset). Ignored while
             Jelly is enabled: the robot is then the mobile Axol.
-        gripper: The fitted gripper, ``"parallel"`` or ``"parcel"``
-            (``AxolConfig.gripper``, which teleop passes on). The mobile Axol
+        gripper: The fitted gripper: ``"parallel"``, ``"parcel_v1"`` or
+            ``"parcel_v2"`` (``AxolConfig.gripper``, which teleop passes on). The mobile Axol
             has a URDF per gripper, so it selects the gripper geometry the
             arms are kept clear of the body with; the classic Axol ignores
             it. ``None`` (the default) reads ``axol.gripper`` from the shared

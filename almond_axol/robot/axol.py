@@ -24,7 +24,12 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 import can
 import numpy as np
 
-from ..constants import ARM_JOINTS, RT_TARGET_FIELDS
+from ..constants import (
+    ARM_JOINTS,
+    GRIPPER_TYPES,
+    RT_TARGET_FIELDS,
+    is_parcel_gripper,
+)
 from ..motor import (
     CanBus,
     ControlMode,
@@ -81,14 +86,27 @@ LIMITS: dict[Joint, tuple[float, float]] = {
 # (:mod:`almond_axol.robot.mantis`) carries the same gripper and measures its
 # stroke the same way.
 GRIPPER_TRAVEL = math.radians(290)
-# Nominal stroke of each ``AxolConfig.gripper`` type (rad). The two are far
-# enough apart that a measured stroke tells them apart: calibration refuses a
-# stroke that matches the other type's, which is what a wrong setting
-# measures (on the right arm it would also have swapped open and closed).
+# Nominal stroke of each gripper design (rad): the parallel gripper, and the
+# parcel gripper, whose two versions (``PARCEL_GRIPPERS``) share one. The two
+# are far enough apart that a measured stroke tells them apart: calibration
+# refuses a stroke that matches the other design's, which is what a wrong
+# setting measures. A stroke cannot tell the parcel versions apart.
 _GRIPPER_NOMINAL_STROKE = {
     "parallel": GRIPPER_TRAVEL,
     "parcel": math.radians(185),
 }
+
+
+def _gripper_design(gripper: str) -> str:
+    """The ``_GRIPPER_NOMINAL_STROKE`` key for an ``AxolConfig.gripper``."""
+    return "parcel" if is_parcel_gripper(gripper) else "parallel"
+
+
+def _gripper_nominal_stroke(gripper: str) -> float:
+    """Nominal stroke (rad) of an ``AxolConfig.gripper``."""
+    return _GRIPPER_NOMINAL_STROKE[_gripper_design(gripper)]
+
+
 # How close (rad) a measured stroke must be to a type's nominal one to count
 # as that type's. Units vary by a few degrees; a stroke matching neither type
 # (a sweep cut short by an object in the jaws or a sticky stop) is accepted
@@ -1004,7 +1022,7 @@ class AxolArm:
         self._gripper_open: float = 0.0
         self._gripper_close: float = 0.0
         self._set_gripper_range(
-            open_pos=-self._close_direction * _GRIPPER_NOMINAL_STROKE[config.gripper],
+            open_pos=-self._close_direction * _gripper_nominal_stroke(config.gripper),
             close_pos=0.0,
         )
 
@@ -1410,7 +1428,7 @@ class AxolArm:
             direction,
             threshold,
             side="left" if self._is_left else "right",
-            nominal_stroke=_GRIPPER_NOMINAL_STROKE[self._config.gripper],
+            nominal_stroke=_gripper_nominal_stroke(self._config.gripper),
         )
 
     async def _unload_gripper_target(self) -> None:
@@ -1438,7 +1456,7 @@ class AxolArm:
             self.motors[Joint.GRIPPER],
             self._close_direction,
             side="left" if self._is_left else "right",
-            nominal_stroke=_GRIPPER_NOMINAL_STROKE[self._config.gripper],
+            nominal_stroke=_gripper_nominal_stroke(self._config.gripper),
         )
         try:
             self._check_gripper_stroke(abs(open_pos - close_pos))
@@ -1449,17 +1467,18 @@ class AxolArm:
         _save_gripper_calibration(self._is_left, open_pos, close_pos)
 
     def _check_gripper_stroke(self, travel: float) -> None:
-        """Refuse a measured stroke that belongs to the other gripper type.
+        """Refuse a measured stroke that belongs to the other gripper design.
 
-        Only a stroke within ``_GRIPPER_STROKE_TOLERANCE`` of another type's
-        nominal stroke (``_GRIPPER_NOMINAL_STROKE``) and not of the
+        Only a stroke within ``_GRIPPER_STROKE_TOLERANCE`` of the other
+        design's nominal stroke (``_GRIPPER_NOMINAL_STROKE``) and not of the
         configured ``AxolConfig.gripper``'s is refused; one that matches
-        neither is logged and accepted.
+        neither is logged and accepted. The two parcel versions have the
+        same stroke, so either passes as the other.
 
         Raises:
-            MotorError: If ``travel`` (rad) matches another type's stroke.
+            MotorError: If ``travel`` (rad) matches the other design's stroke.
         """
-        configured = self._config.gripper
+        configured = _gripper_design(self._config.gripper)
         side = "left" if self._is_left else "right"
 
         def matches(kind: str) -> bool:
@@ -1488,6 +1507,7 @@ class AxolArm:
                 math.degrees(_GRIPPER_NOMINAL_STROKE[configured]),
             )
             return
+        choices = " or ".join(g for g in GRIPPER_TYPES if _gripper_design(g) == other)
         raise MotorError(
             f"{side} gripper measured a {math.degrees(travel):.0f}° stroke, which "
             f"matches the {other} gripper "
@@ -1495,7 +1515,7 @@ class AxolArm:
             f"robot is configured for the {configured} gripper "
             f"(~{math.degrees(_GRIPPER_NOMINAL_STROKE[configured]):.0f}°). Empty "
             f"the gripper and enable again; if the {other} gripper really is "
-            f"fitted, set the gripper type to {other} (--axol.gripper {other}, "
+            f"fitted, set the gripper type to {choices} (--axol.gripper, "
             f"control panel Robot → Gripper)"
         )
 

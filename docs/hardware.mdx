@@ -34,9 +34,11 @@ The back of the robot has these connectors:
 Axol works with two grippers:
 
 - **Parallel**: the standard two-finger gripper.
-- **Parcel**: a gripper with hinged plates, used by [box mode](/guides/vr-interface#box-mode).
+- **Parcel**: a gripper with hinged plates, used by [box mode](/guides/vr-interface#box-mode). It comes in two versions, v1 and v2, whose jaw motors turn opposite ways.
 
-Tell the software which gripper is fitted. Use the **Gripper** setting under **Axol settings → Robot** in the control panel, or pass `--axol.gripper parallel` or `--axol.gripper parcel` on the command line (see [`AxolConfig.gripper`](/api/robot)). When the arms first enable after power-up, Axol measures each gripper's travel against its end stops.
+Tell the software which gripper is fitted. Use the **Gripper** setting under **Axol settings → Robot** in the control panel, or pass `--axol.gripper` on the command line (see [`AxolConfig.gripper`](/api/robot)). The values are `parallel`, `parcel_v1` and `parcel_v2`. `parcel` is read as `parcel_v1`.
+
+When the arms first enable after power-up, Axol measures each gripper's travel against its end stops. The jaws finish open. If the parcel jaws finish closed, select the other parcel version.
 
 ### Reference diagrams
 

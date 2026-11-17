@@ -55,8 +55,9 @@ class WarmIkTest(unittest.TestCase):
         cls = self._warm(jelly_attached=True)
         config, kinematics = cls.call_args.args
         self.assertEqual(kinematics.robot_model, "mobile")
-        self.assertEqual(kinematics.gripper, "parcel")
-        self.assertEqual(config.gripper, "parcel")
+        # Saved under the earlier name, read as parcel_v1.
+        self.assertEqual(kinematics.gripper, "parcel_v1")
+        self.assertEqual(config.gripper, "parcel_v1")
 
 
 if __name__ == "__main__":
