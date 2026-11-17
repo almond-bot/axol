@@ -57,7 +57,12 @@ from typing import TYPE_CHECKING, Any
 
 from ..zed.calibration import calibration_hint
 from .constants import HEADSET_STREAM_FPS
-from .hw_video import _bitrate_for, dataset_intra_vbr_bitrate, hw_h264_available
+from .hw_video import (
+    _bitrate_for,
+    dataset_intra_vbr_bitrate,
+    hw_h264_available,
+    nvenc_maxperf_prop,
+)
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -789,7 +794,7 @@ def _dataset_enc_shmsink(
         f"bitrate={target} peak-bitrate={peak} preset-level=1 "
         f"insert-sps-pps=true insert-aud=true "
         f"iframeinterval={_DATASET_GOP_FRAMES} "
-        f"idrinterval={_DATASET_GOP_FRAMES} maxperf-enable=true "
+        f"idrinterval={_DATASET_GOP_FRAMES} {nvenc_maxperf_prop()} "
         "! video/x-h264,stream-format=byte-stream,alignment=au "
         f"! queue name={name}_outq leaky=downstream "
         f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
@@ -803,7 +808,7 @@ def _dataset_enc_shmsink(
 def _enc_branch(bitrate: int, fps: int, name: str = "venc") -> str:
     return (
         f"nvv4l2h264enc name={name} control-rate=1 bitrate={bitrate} preset-level=1 "
-        f"insert-sps-pps=true insert-aud=true idrinterval={fps} maxperf-enable=true "
+        f"insert-sps-pps=true insert-aud=true idrinterval={fps} {nvenc_maxperf_prop()} "
         "! video/x-h264,stream-format=byte-stream"
     )
 
