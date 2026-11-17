@@ -29,7 +29,7 @@ not shown here.
 
 Run:
     uv run python scripts/view_ik_collision.py                  # Axol on Jelly
-    uv run python scripts/view_ik_collision.py --gripper parcel
+    uv run python scripts/view_ik_collision.py --gripper parcel_v1
     uv run python scripts/view_ik_collision.py --model owl --port 8004
 Then open http://localhost:8003.
 """
@@ -49,6 +49,8 @@ import yourdfpy
 from viser.extras import ViserUrdf
 
 from almond_axol.constants import (
+    GRIPPER_ALIASES,
+    GRIPPER_TYPES,
     AxolModel,
     torso_links,
     upper_arm_guard_links,
@@ -118,7 +120,7 @@ def main() -> None:
     parser.add_argument(
         "--gripper",
         default="parallel",
-        choices=["parallel", "parcel"],
+        choices=[*GRIPPER_TYPES, *GRIPPER_ALIASES],
         help="Fitted gripper (mobile only).",
     )
     parser.add_argument("--port", type=int, default=8003)

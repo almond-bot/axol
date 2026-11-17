@@ -70,7 +70,7 @@ The bundled URDFs are in `almond_axol/kinematics/urdf/`, one per version. All bu
 
 Each body part is a box or capsule fitted to it, and each arm part and finger is a capsule fitted to it. Every shape encloses its part. An `<ik_collision>` cylinder is read as a capsule: its radius, and the length of the straight section along the origin's z axis. The parcel gripper's plate is one capsule over its whole swing.
 
-To see the shapes over the robot model, run `uv run python scripts/view_ik_collision.py` and open `http://localhost:8003`. Add `--gripper parcel` or `--model owl` for another model.
+To see the shapes over the robot model, run `uv run python scripts/view_ik_collision.py` and open `http://localhost:8003`. Add `--gripper parcel_v1` or `--model owl` for another model.
 
 **Picking the version.** With Jelly enabled, the model is Axol on Jelly. Otherwise it is the mount picked under **Mount** on the control panel's Robot tab, saved as `kinematics.mount`: `classic` (Legacy, the default), `standalone`, `ox_cart` or `owl`. `kinematics.robot_model` forces a version.
 
