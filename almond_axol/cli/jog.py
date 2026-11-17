@@ -8,6 +8,10 @@ drive the Jelly base from the drive pad.
 With ``--sim`` nothing touches the hardware, and the lift and base are
 simulated with the real controllers' speeds and ramps.
 
+Like teleop, a robot with Jelly attached and no arm hub jogs just Jelly, and
+``--arms false`` (the Robot tab's "Axol arms" switch) leaves the arms
+untouched even when the hub is plugged in.
+
 The session is started and stopped by the control panel (``axol serve``),
 which owns the page's connection to it. Run it from the panel.
 """
@@ -43,6 +47,8 @@ class JogCmdConfig:
     right_channel: str | None = CAN_RIGHT
     sim: bool = False
     """Jog a simulated robot instead of the hardware."""
+    arms: bool = True
+    """Drive Axol's arms. Off jogs only Jelly and never opens the arm hub."""
     arm_speed: float = 0.6
     """Average speed (rad/s) of the furthest-moving joint along a planned move."""
     min_duration: float = 1.0
@@ -101,26 +107,51 @@ def build_session(cfg: JogCmdConfig) -> Any:
         )
 
     if cfg.sim:
+        if not cfg.arms:
+            raise ValueError(
+                "Sim needs the arms. Turn on Axol arms in Settings (or pass "
+                "--arms true), or turn off sim."
+            )
         model = resolve_robot_model(kinematics.robot_model, mount=kinematics.mount)
         backend: Any = SimBackend(model, jelly_cfg)
     else:
         from ..robot import Axol
         from ..robot.jelly import Jelly, detect_jelly
+        from .teleop import arm_channels_present
 
-        axol = None
-        if cfg.left_channel is not None or cfg.right_channel is not None:
-            axol = Axol(
+        detected = detect_jelly(jelly_cfg)
+        channels = (cfg.left_channel, cfg.right_channel)
+        arms = cfg.arms and any(c is not None for c in channels)
+        # As in teleop: Jelly attached without the arm hub jogs just Jelly.
+        # With no Jelly either, the arms stay requested so the Axol
+        # connection's "CAN interface not found" names the missing hub.
+        if arms and detected is not None and not arm_channels_present(*channels):
+            _logger.warning(
+                "jog: no Axol arm CAN interface found (%s), jogging Jelly only",
+                ", ".join(c for c in channels if c),
+            )
+            arms = False
+        if not arms and detected is None:
+            if not cfg.arms:
+                problem = "Axol arms is off"
+                fix = "Turn on Axol arms in Settings (or pass --arms true)"
+            else:
+                problem = "Both arm CAN channels are off"
+                fix = "Set an arm CAN channel in Settings"
+            raise ValueError(
+                f"Nothing to jog. {problem} and Jelly is not attached. {fix}, "
+                "or connect Jelly, then start Jog again."
+            )
+        axol = (
+            Axol(
                 config=cfg.axol,
                 left_channel=cfg.left_channel,
                 right_channel=cfg.right_channel,
             )
-        detected = detect_jelly(jelly_cfg)
+            if arms
+            else None
+        )
         jelly = Jelly(detected) if detected is not None else None
-        if axol is None and jelly is None:
-            raise ValueError(
-                "Both arms are turned off and no Jelly is attached, so there is "
-                "nothing to jog."
-            )
         backend = HardwareBackend(axol, jelly)
 
     from ..jog.session import JogSession

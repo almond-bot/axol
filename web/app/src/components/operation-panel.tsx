@@ -345,7 +345,7 @@ export function OperationPanel({
     device: mantisMode ? "Mantis" : "Axol",
     sim: isSim,
   })
-  // Teleop with the Robot tab's "Axol arms" switch off drives only Jelly: the
+  // Teleop or Jog with the Robot tab's "Axol arms" switch off drives only Jelly: the
   // arms and their CAN bus are never touched. A live run is described by its
   // merged args alone (a default-on flag is omitted from them, so the saved
   // switch must not be consulted — flipping it mid-run cannot relabel the

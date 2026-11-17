@@ -9,11 +9,14 @@ Start and stop Jog from the control panel. The panel connects the Jog screen to 
 
 With `--sim`, nothing touches the hardware. The lift and Jelly are simulated with the same speeds and ramps as the real ones.
 
+With `--arms false`, Jog drives only Jelly and never connects to the arms. The same happens when Jelly is attached but the arm hub is not.
+
 This command is configured through draccus (see [Command configuration](/cli/configuration)). Arm gains and stiffness are on the nested `axol` config, the same settings gravity compensation uses. The lift and Jelly use the shared `jelly` settings, the same as teleop.
 
 | Flag | Description |
 |---|---|
 | `--sim BOOL` | Jog a simulated Axol instead of the robot. Default `false` |
+| `--arms BOOL` | Drive the Axol arms. `false` jogs only Jelly. Default `true`. Control panel: **Axol arms** on the Robot tab. |
 | `--arm_speed FLOAT` | Average speed (rad/s) of the joint that moves furthest in a planned move. Default 0.6 |
 | `--min_duration FLOAT` | Shortest planned move, in seconds. Default 1.0 |
 | `--gripper_speed FLOAT` | Gripper jog speed (m/s) at full speed. Default 0.06 |

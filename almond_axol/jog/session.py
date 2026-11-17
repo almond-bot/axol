@@ -82,6 +82,8 @@ class JogBackend(Protocol):
     """What the session drives: the simulator or the real robot."""
 
     mode: str
+    connects_arms: bool
+    """Whether :meth:`start` opens the arms (False for a Jelly-only robot)."""
     has_arms: bool
     has_lift: bool
     has_base: bool
@@ -612,14 +614,16 @@ class JogSession:
         """Run until :meth:`stop`, ``stop_event`` or cancellation.
 
         Reports its startup to the control panel (:mod:`almond_axol.progress`):
-        connecting the arms and Jelly, then the IK solver, ready once both are
-        up.
+        connecting the arms and Jelly (just Jelly when there are no arms), then
+        the IK solver, ready once both are up.
         """
         from .. import progress
 
         backend = self._backend
-        progress.plan(["arms", "ik"])
-        progress.step("arms")
+        # A Jelly-only run connects to Jelly instead of the arms.
+        connect = "arms" if backend.connects_arms else "jelly"
+        progress.plan([connect, "ik"])
+        progress.step(connect)
         threading.Thread(
             target=self._build_planner, name="axol-jog-ik", daemon=True
         ).start()

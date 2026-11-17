@@ -2541,6 +2541,27 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         self.assertEqual(robot.releases, 0)
         worker.start.assert_called_once_with()
 
+    def test_arms_off_jog_is_robot_free_and_keeps_the_axol_link(self) -> None:
+        # Jog follows the same switch: off jogs just Jelly.
+        robot = _Robot(profile="axol")
+        runner = OperationRunner(robot_link=robot)
+        config = SimpleNamespace(
+            sim=False,
+            arms=False,
+            axol=SimpleNamespace(has_gripper=True),
+        )
+        worker = Mock()
+        with (
+            patch.object(runner, "_build_config", return_value=config),
+            patch.object(runner, "_attach_cameras_to_teleop"),
+            patch("almond_axol.serve.runner.threading.Thread", return_value=worker),
+        ):
+            session = runner.start("jog", {"arms": False})
+
+        self.assertEqual(session.status, "running", session.error)
+        self.assertEqual(robot.releases, 0)
+        worker.start.assert_called_once_with()
+
     def test_arms_default_on_requires_the_axol_link(self) -> None:
         # With ``arms`` omitted the config default (on) applies: a gripperless
         # survey then trips the gripper check, proving the run was classified
