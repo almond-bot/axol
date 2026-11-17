@@ -56,8 +56,8 @@ class GripWatchTest(unittest.TestCase):
         watch.update("right", 0.1, 3.9)  # low again, but only 1.9 s
 
     def test_sign_does_not_matter(self) -> None:
-        # The parcel right jaw closes toward negative angles: its hold
-        # torque is negative.
+        # A parcel_v1 right jaw (and a parcel_v2 left jaw) closes toward
+        # negative angles: its hold torque is negative.
         watch = rom.GripWatch({"right": 2.0})
         for t in range(30):
             watch.update("right", -1.9, t * 0.1)
@@ -143,14 +143,14 @@ class GripperTypeFromSettingsTest(unittest.IsolatedAsyncioTestCase):
             return set(joints)
 
         with (
-            patch.object(rom, "resolve_gripper", return_value="parcel"),
+            patch.object(rom, "resolve_gripper", return_value="parcel_v2"),
             patch.object(rom, "probe_bus_joints", all_joints),
             patch.object(rom, "Axol", fake_axol),
             patch("builtins.print"),
             self.assertRaises(_Stop),
         ):
             await rom.run_axol(capture=False)
-        self.assertEqual(seen["config"].gripper, "parcel")
+        self.assertEqual(seen["config"].gripper, "parcel_v2")
         self.assertEqual(
             seen["config"].left.gripper.torque_limit, rom.GRIPPER_TORQUE_LIMIT
         )
