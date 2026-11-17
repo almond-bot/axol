@@ -166,6 +166,7 @@ def _inspect_nvenc() -> str | None:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            errors="replace",  # odd bytes must not cost the hardware path
             timeout=10,
         )
     except Exception:  # noqa: BLE001 - inspection failure → no hardware path
