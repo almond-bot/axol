@@ -140,5 +140,8 @@ jobs:
         run: npm test
       - name: Production build and type check
         run: npm run build
+      # Shipped dependencies only. Dev and build tools (vite, vitest, eslint)
+      # never reach a robot or the browser bundle, and an advisory with no
+      # patched release there would otherwise block every PR.
       - name: Dependency audit
-        run: npm audit --audit-level=high
+        run: npm audit --omit=dev --audit-level=high
