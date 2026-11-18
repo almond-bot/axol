@@ -24,7 +24,7 @@ almond_axol/
     └── camera/   ZedCamera — LeRobot Camera for a locally attached ZED
 ```
 
-The browser front-ends are outside the Python package, in `web/`. The [VR teleop interface](/guides/vr-interface) and the [web control panel](/guides/control-panel) are both built to `web/app/dist` and served by [`axol serve`](/cli/serve).
+The browser front-ends live in `web/`. The [VR teleop interface](/guides/vr-interface) and the [web control panel](/guides/control-panel) are both built to `web/app/dist` and served by [`axol serve`](/cli/serve). Release wheels include the built UI, so an installed `axol serve` hosts it too.
 
 End-to-end data flow for teleoperation:
 

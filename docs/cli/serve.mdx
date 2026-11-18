@@ -42,9 +42,11 @@ TLS is **on by default**, so HTTPS pages such as the hosted VR app at `axol.almo
 
 To connect from a browser on another machine, open the printed **LAN** URL once and accept the certificate warning. Pass `--no-tls` to disable TLS entirely (plain HTTP).
 
-## Building the web UI
+## The web UI
 
-The server looks for the built web UI at `web/app/dist`, which exists only in a repo checkout. Without it, `axol serve` still runs and the **API is available**. Use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to the server directly. To serve the UI locally instead, build it once:
+With the [one-command install](/installation), the control panel and VR interface come with each release. Open `https://<host-ip>:8001` to use them, or use the hosted UI at [axol.almond.bot](https://axol.almond.bot).
+
+In a repo checkout, `axol serve` serves `web/app/dist` when you have built it. Without a build, `axol serve` still runs and serves the API only. Use the hosted UI at [axol.almond.bot](https://axol.almond.bot), or build the UI once:
 
 ```bash
 cd web

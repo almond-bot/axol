@@ -38,7 +38,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      # Ship the built web UI inside the wheel, so the installed `axol serve`
+      # (axol.service) hosts the control panel and VR app itself. It is
+      # staged into almond_axol/serve/ui, a gitignored hatch artifact (see
+      # pyproject.toml). Building from the release checkout bakes the tag's
+      # commit and version into the bundle.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+      - name: Stage web UI into the package
+        run: |
+          rm -rf almond_axol/serve/ui
+          cp -R web/app/dist almond_axol/serve/ui
       - run: uv build
+      - name: Check the wheel ships the web UI
+        run: |
+          python3 - <<'EOF'
+          import glob, sys, zipfile
+          (wheel,) = glob.glob("dist/*.whl")
+          names = zipfile.ZipFile(wheel).namelist()
+          if "almond_axol/serve/ui/index.html" not in names:
+              sys.exit(f"{wheel} is missing almond_axol/serve/ui/index.html")
+          EOF
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true

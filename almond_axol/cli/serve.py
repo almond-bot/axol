@@ -3,7 +3,8 @@ axol serve
 
 Run the Axol web control panel: a small local server that wraps the CLI so the
 robot can be driven from a browser instead of a terminal. It serves the built
-web UI (when present) and a JSON/WebSocket API that launches robot operations,
+web UI (shipped in release wheels, or built in a checkout's web/app/dist) and
+a JSON/WebSocket API that launches robot operations,
 streams their output, and stops them. The four core operations (teleop,
 gravity-comp, collect-data, run-policy) run in-process so they share one robot
 connection; the setup/calibration commands run as ``axol`` subprocesses.
@@ -64,12 +65,29 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.set_defaults(func=run)
 
 
-def _find_static_dir() -> Path | None:
-    """Locate the built web bundle (web/app/dist), if it exists."""
+def _static_dir_candidates() -> tuple[Path, ...]:
+    """Where a built web bundle may live, in preference order.
+
+    A repo checkout's own build (web/app/dist) wins, so a developer always sees
+    the UI they just built. Otherwise use the bundle the release workflow
+    stages into the package (almond_axol/serve/ui), which is how a PyPI
+    install serves the control panel and VR app.
+    """
+    package_root = Path(__file__).resolve().parents[1]
     # almond_axol/cli/serve.py -> repo root is two parents up from the package.
-    repo_root = Path(__file__).resolve().parents[2]
-    dist = repo_root / "web" / "app" / "dist"
-    return dist if (dist / "index.html").is_file() else None
+    repo_root = package_root.parent
+    return (
+        repo_root / "web" / "app" / "dist",
+        package_root / "serve" / "ui",
+    )
+
+
+def _find_static_dir() -> Path | None:
+    """Locate the built web bundle, if one exists."""
+    for candidate in _static_dir_candidates():
+        if (candidate / "index.html").is_file():
+            return candidate
+    return None
 
 
 def _local_ip() -> str:
@@ -127,9 +145,9 @@ def run(args: argparse.Namespace) -> None:
         )
     if static_dir is None:
         print(
-            "  (no local web bundle — drive this machine from "
-            "https://axol.almond.bot, or build one with `npm install && "
-            "npm run build` in web/)"
+            "  (no web UI found, serving the API only. Open "
+            "https://axol.almond.bot to drive this computer, or run "
+            "`npm install && npm run build` in web/ to serve the UI here)"
         )
 
     if args.open:
