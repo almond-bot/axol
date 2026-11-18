@@ -230,6 +230,23 @@ If VR tracking feels jittery or arrives in bursts, set these on your router or a
 
 These settings stop the access point from holding packets between beacons, which causes latency spikes in VR.
 
+### Weak Wi-Fi
+
+The headset video adjusts to the link on its own:
+
+- When the link can't carry the full stream, Axol lowers the video bitrate. The picture gets softer, then sharpens again as the link recovers. It never goes above its normal quality.
+- When video starts to back up on the link, Axol skips ahead to the live view instead of falling behind. The picture may pause for up to a second.
+
+Every open camera view gets its own copy of the video, in the headset and in the control panel. A control panel showing the cameras over the same Wi-Fi leaves less of the link for the headset.
+
+Every 5 seconds the log shows one line for each camera view, for example:
+
+```
+webrtc[3] link: sending 6.2 Mbps (encoders 6.4 of 16.6 Mbps), loss 1.2%, round trip 40 ms, queued 12 KB, receiver estimate 7.0 Mbps, frames skipped 3
+```
+
+A line that starts with `headset video: lowered to` says when the bitrate dropped and why.
+
 ## Latency tuning
 
 Teleoperation smooths the pose stream before it reaches the arms, so tracking glitches and network jitter don't shake them. With the defaults, the arm lags your hand by about 100 to 120 ms on a clean link. Each setting below is a CLI flag or a [config file](/cli/configuration) field.
