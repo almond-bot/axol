@@ -85,6 +85,14 @@ tracker = ["websockets>=12,<16"]
 [project.scripts]
 axol = "almond_axol.cli:main"
 
+# The release workflow stages the built web UI (web/app/dist) here so the
+# installed `axol serve` hosts the control panel and VR app. The directory is
+# gitignored, so list it as an artifact for hatch to pick up anyway. Builds
+# without it (dev checkouts, git installs) still work: `axol serve` then looks
+# for web/app/dist, or serves only the API.
+[tool.hatch.build]
+artifacts = ["/almond_axol/serve/ui/"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["almond_axol"]
 

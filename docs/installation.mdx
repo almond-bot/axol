@@ -45,7 +45,7 @@ The command:
 - Installs the camera streaming software, `adb` for the [Quest-over-USB](/guides/quest-over-usb) link, and Lighthouse tracking for [Mantis](/mantis/tracking) (see [`axol provision`](/cli/provision)). Steps that need the ZED SDK are skipped when it is not installed.
 - On a **ZED Box** (Duo or Mini), upgrades an outdated GMSL camera driver (see [`zed.driver`](/cli/zed-driver)). If it upgrades the driver, the computer **restarts** at the end of the install and your SSH session closes. Reconnect after a minute or two.
 - On a Jetson, tunes the system for real-time robot control (see [`jetson.setup`](/cli/jetson-setup)). The tuning is applied again at every boot.
-- Starts the control panel as a service named `axol`, which starts at boot and restarts if it stops (see [`axol serve`](/cli/serve)).
+- Starts the control panel as a service named `axol`, which starts at boot and restarts if it stops (see [`axol serve`](/cli/serve)). You can open it at `https://<host-ip>:8001`.
 
 If an optional step fails, such as Lighthouse tracking, the install finishes with a warning that names it. Axol works without it. Fix the problem and run the install command again to add it. If a required step fails, the install stops with an error. The control panel then shows the failed step, and you can press **Update** to install a fixed release.
 
@@ -81,6 +81,8 @@ systemctl restart axol       # restart manually
 1. On any computer on the same network, open [axol.almond.bot](https://axol.almond.bot).
 2. Enter the IP address of the Host Computer.
 3. The first time, your browser warns about the robot's security certificate. Accept it. You only do this once, for both the control panel and the VR headset link.
+
+You can also open `https://<host-ip>:8001` on the Host Computer's network. It serves the same control panel from the Host Computer, so it works without internet access.
 
 On the first connection, the control panel sets up the connection to Axol's arms for you (see [`can.setup`](/cli/can-setup)). See the [Web Control Panel guide](/guides/control-panel) for the rest of the steps.
 

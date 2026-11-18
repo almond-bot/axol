@@ -24,3 +24,6 @@ pytest.xml
 .env
 .env.local
 .env.*.local
+
+# Web UI bundle staged into the package at release time (see publish.yml)
+/almond_axol/serve/ui/
