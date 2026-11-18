@@ -264,6 +264,57 @@ class CheckPolicyTest(unittest.TestCase):
             report = check_policy(served.url, ticks=120, delay_steps=3)
         self.assertGreater(report.max_step_at_switch.max(), 0.02)
 
+    def test_jump_after_a_recovery_hold_is_measured(self) -> None:
+        calls = []
+
+        def alternate(obs: Observation) -> np.ndarray:
+            # Each plan sits at +2 or -2: every hand-over is a 4 rad jump.
+            calls.append(None)
+            level = 2.0 if len(calls) % 2 else -2.0
+            return np.full((30, 16), level, np.float32)
+
+        with _Served(alternate) as served:
+            report = check_policy(
+                served.url, ticks=120, delay_steps=7, max_first_action_offset_rad=0
+            )
+        # Late replies leave hold rows between plans, so every hand-over
+        # follows a NaN row; it must still be measured.
+        self.assertTrue(report.recoveries)
+        self.assertTrue(np.isnan(report.targets).any())
+        self.assertAlmostEqual(float(report.max_step_at_switch.max()), 4.0, places=5)
+        np.testing.assert_allclose(report.max_step_within_plan, 0.0)
+
+    def test_first_plan_far_from_the_start_pose_fails_the_start_check(self) -> None:
+        def far(obs: Observation) -> np.ndarray:
+            return np.full((30, 16), 1.5, np.float32)
+
+        with _Served(far) as served:
+            report = check_policy(served.url, ticks=40, delay_steps=2)
+        self.assertAlmostEqual(float(report.max_step_at_switch.max()), 1.5, places=5)
+        np.testing.assert_allclose(report.start_offset, 1.5, atol=1e-6)
+        joint, offset = report.start_rejected
+        self.assertEqual(joint, "left_shoulder_1.pos")
+        self.assertAlmostEqual(offset, 1.5, places=5)
+        self.assertIn("Start check failed", report.summary())
+
+    def test_start_check_exempts_grippers_and_can_be_disabled(self) -> None:
+        def grip(obs: Observation) -> np.ndarray:
+            # Arms start where they are; only the grippers jump.
+            rows = np.repeat(obs.state[None, :], 30, axis=0)
+            rows[:, 7] = rows[:, 15] = 1.0
+            return rows
+
+        with _Served(grip) as served:
+            report = check_policy(served.url, ticks=40, delay_steps=2)
+        self.assertIsNone(report.start_rejected)
+        self.assertAlmostEqual(float(report.start_offset[7]), 1.0, places=5)
+
+        with _Served(lambda obs: np.full((30, 16), 1.5, np.float32)) as served:
+            report = check_policy(
+                served.url, ticks=40, delay_steps=2, max_first_action_offset_rad=0
+            )
+        self.assertIsNone(report.start_rejected)
+
     def test_late_replies_are_reported_as_recoveries(self) -> None:
         with _Served(_Ramp()) as served:
             report = check_policy(served.url, ticks=60, delay_steps=10)

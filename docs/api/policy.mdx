@@ -267,7 +267,7 @@ print(report.summary())
 assert not report.recoveries
 ```
 
-`delay_steps` is the simulated reply latency in ticks, independent of this machine's speed. `default_spec()` builds the contract `run-policy` sends with default settings. Its arguments are `cartesian`, `cameras`, `image_shape`, `fps`, `actions_per_chunk`, `request_interval` and `max_adoption_offset_steps`.
+`delay_steps` is the simulated reply latency in ticks, independent of this machine's speed. `max_first_action_offset_rad` is `run-policy`'s start check limit (default 0.15, `0` turns it off). `default_spec()` builds the contract `run-policy` sends with default settings. Its arguments are `cartesian`, `cameras`, `image_shape`, `fps`, `actions_per_chunk`, `request_interval` and `max_adoption_offset_steps`.
 
 `CheckReport` has these members:
 
@@ -280,7 +280,9 @@ assert not report.recoveries
 | `recoveries` | Why each recovery happened (late reply, exhausted plan). |
 | `latency_s` | Real round trip per request. |
 | `max_step_within_plan` | Per-dim largest step between consecutive ticks of one plan. |
-| `max_step_at_switch` | The same, where one plan hands over to the next. It should be no larger than `max_step_within_plan`. |
+| `max_step_at_switch` | The same, where one plan hands over to the next. It is measured from the last command the arm executed, so it includes the first plan's step from the initial state and a plan that takes over after a recovery hold. It should be no larger than `max_step_within_plan`. |
+| `start_offset` | Per-dim distance of the first executed target from the initial state. NaN for a dim the state does not share. |
+| `start_rejected` | `(joint, offset)` when the first action puts an arm joint further than `max_first_action_offset_rad` from the initial state, or `None`. On the robot, `run-policy` would send nothing and discard the episode. |
 | `summary()` | A readable report. |
 
 ## Robot side and wire format

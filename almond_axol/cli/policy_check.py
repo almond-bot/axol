@@ -39,6 +39,9 @@ class PolicyCheckConfig:
         actions_per_chunk: Horizon (most rows used from one reply).
         request_interval: Rows dispatched between requests.
         max_adoption_offset_steps: Latest row a reply may start executing at.
+        max_first_action_offset_rad: run-policy's start check: fail when the
+            first action puts an arm joint further than this from the start
+            pose (0 disables).
         log_level: Python logging level.
     """
 
@@ -54,6 +57,7 @@ class PolicyCheckConfig:
     actions_per_chunk: int = 50
     request_interval: int = 5
     max_adoption_offset_steps: int = 6
+    max_first_action_offset_rad: float = 0.15
     log_level: LogLevel = "WARNING"
 
 
@@ -78,7 +82,11 @@ def main(argv: list[str]) -> None:
     print(f"Checking {url} …", flush=True)
     try:
         report = check_policy(
-            url, spec=spec, ticks=cfg.ticks, delay_steps=cfg.delay_steps
+            url,
+            spec=spec,
+            ticks=cfg.ticks,
+            delay_steps=cfg.delay_steps,
+            max_first_action_offset_rad=cfg.max_first_action_offset_rad,
         )
     except PolicyRemoteError as exc:
         print(f"The endpoint refused or failed a request: {exc}", file=sys.stderr)
@@ -87,5 +95,5 @@ def main(argv: list[str]) -> None:
         print(f"Could not talk to {url}: {exc}", file=sys.stderr)
         sys.exit(1)
     print(report.summary())
-    if report.recoveries:
+    if report.recoveries or report.start_rejected is not None:
         sys.exit(2)

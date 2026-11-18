@@ -22,9 +22,14 @@ The report lists:
 - requests sent and replies adopted;
 - every recovery and its reason (a late reply, or a plan that ran out of rows);
 - the endpoint's real round-trip time, against the time between requests;
-- the largest per-tick jumps where one plan hands over to the next, next to the largest steps within a plan.
+- the largest per-tick jumps where one plan hands over to the next, next to the largest steps within a plan;
+- whether the first action passes the start check.
 
-A policy that continues the motion in progress shows switch jumps no larger than its within-plan steps. The command exits `1` if the endpoint refuses the session or fails a request, and `2` if any recovery happened.
+A jump is measured from the last command the arm executed. This includes the first plan, which is measured from the start pose (every joint at 0), and a plan that takes over after a recovery hold. A policy that continues the motion in progress shows switch jumps no larger than its within-plan steps.
+
+The start check is the one `run-policy` applies. If the first action puts any arm joint more than `max_first_action_offset_rad` from the start pose, the robot sends nothing and discards the episode. Grippers are exempt.
+
+The command exits `1` if the endpoint refuses the session or fails a request. It exits `2` if any recovery happened or the start check failed.
 
 | Flag | Description |
 |---|---|
@@ -38,6 +43,7 @@ A policy that continues the motion in progress shows switch jumps no larger than
 | `--fps INT` | Control rate (default: 30) |
 | `--actions_per_chunk INT` | Horizon (default: 50) |
 | `--request_interval INT` | Rows between requests (default: 5, as run-policy) |
+| `--max_first_action_offset_rad FLOAT` | Start check limit for arm joints, in radians (default: 0.15, as run-policy). `0` turns it off. |
 | `--max_adoption_offset_steps INT` | Latest row a reply may start at (default: 6, as run-policy) |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `WARNING` |
 

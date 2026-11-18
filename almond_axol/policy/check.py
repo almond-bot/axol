@@ -11,7 +11,10 @@ action layouts share a name.
 
 The report says whether the endpoint keeps up and how smooth the executed
 trajectory is — in particular how big the jumps are where one plan hands over
-to the next, the thing a chunked policy most often gets wrong::
+to the next, the thing a chunked policy most often gets wrong. A hand-over is
+measured from the last command the arm executed, so a plan that resumes after
+a recovery hold, or the first plan after the start pose, is measured too. The
+first plan also gets run-policy's start check::
 
     from almond_axol.policy import check_policy
 
@@ -110,6 +113,10 @@ class CheckReport:
         adopted: Replies the scheduler adopted.
         recoveries: Recovery reasons (late reply, exhausted horizon), in order.
         latency_s: Wall-clock round trip per request.
+        initial_command: ``(D,)`` the command the arm holds before the first
+            plan: the initial state for every action name the state layout
+            shares, NaN elsewhere.
+        max_first_action_offset_rad: run-policy's start check limit (0: off).
     """
 
     spec: PlanSpec
@@ -119,22 +126,81 @@ class CheckReport:
     adopted: int = 0
     recoveries: list[str] = field(default_factory=list)
     latency_s: list[float] = field(default_factory=list)
+    initial_command: np.ndarray | None = None
+    max_first_action_offset_rad: float = 0.0
 
     def _steps(self) -> tuple[np.ndarray, np.ndarray]:
-        """Per-dim max |Δtarget| within a plan, and across plan switches."""
+        """Per-dim max |Δtarget| within a plan, and across plan switches.
+
+        A step is measured against the command the arm holds: the last
+        executed target, or ``initial_command`` before the first one. Rows
+        where nothing executes (waiting for the first plan, or a
+        blocking-refresh hold) keep that command, so the row that ends a hold
+        counts as a hand-over even though a NaN row precedes it.
+        """
         width = self.targets.shape[1]
         within = np.zeros(width)
         switch = np.zeros(width)
-        for tick in range(1, len(self.targets)):
-            a, b = self.targets[tick - 1], self.targets[tick]
-            if np.isnan(a).any() or np.isnan(b).any():
+        held = (
+            np.full(width, np.nan)
+            if self.initial_command is None
+            else np.asarray(self.initial_command, np.float64)
+        )
+        held_plan: str | None = None
+        executed_before = False
+        for tick, row in enumerate(self.targets):
+            if np.isnan(row).any():
+                executed_before = False
                 continue
-            step = np.abs(b - a)
-            if self.plan_ids[tick] == self.plan_ids[tick - 1]:
+            step = np.nan_to_num(np.abs(row - held), nan=0.0)
+            if executed_before and self.plan_ids[tick] == held_plan:
                 within = np.maximum(within, step)
             else:
                 switch = np.maximum(switch, step)
+            held = row.astype(np.float64)
+            held_plan = self.plan_ids[tick]
+            executed_before = True
         return within, switch
+
+    def _first_executed(self) -> np.ndarray | None:
+        rows = np.flatnonzero(~np.isnan(self.targets).any(axis=1))
+        return None if not len(rows) else self.targets[rows[0]]
+
+    @property
+    def start_offset(self) -> np.ndarray:
+        """Per-dim |first executed target - initial command| (NaN: unknown)."""
+        width = self.targets.shape[1]
+        first = self._first_executed()
+        if first is None or self.initial_command is None:
+            return np.full(width, np.nan)
+        return np.abs(first - np.asarray(self.initial_command, np.float32))
+
+    @property
+    def start_rejected(self) -> tuple[str, float] | None:
+        """``(joint, offset)`` if run-policy's start check would discard the run.
+
+        On the robot, the first joint-space action of an episode must keep
+        every arm joint within ``max_first_action_offset_rad`` of the measured
+        pose, or nothing is sent. Grippers are exempt and the Cartesian layout
+        is not checked, as on the robot.
+        """
+        if self.max_first_action_offset_rad <= 0.0:
+            return None
+        names = self.spec.action_names
+        offsets = self.start_offset
+        arm = [
+            index
+            for index, name in enumerate(names)
+            if name.endswith(".pos")
+            and "gripper" not in name
+            and not np.isnan(offsets[index])
+        ]
+        if not arm:
+            return None
+        worst = max(arm, key=lambda index: offsets[index])
+        if offsets[worst] <= self.max_first_action_offset_rad:
+            return None
+        return names[worst], float(offsets[worst])
 
     @property
     def max_step_within_plan(self) -> np.ndarray:
@@ -164,6 +230,14 @@ class CheckReport:
             )
         for reason in self.recoveries[:5]:
             lines.append(f"  recovery: {reason}")
+        rejected = self.start_rejected
+        if rejected is not None:
+            lines.append(
+                f"Start check failed: the first action puts {rejected[0]} "
+                f"{rejected[1]:.3f} rad from the start pose (limit "
+                f"{self.max_first_action_offset_rad:.3f} rad). run-policy would "
+                "send nothing and discard the episode."
+            )
         worst = np.argsort(switch)[::-1][:3]
         lines.append("Largest per-tick jumps where one plan hands over to the next:")
         for index in worst:
@@ -183,6 +257,7 @@ def check_policy(
     initial_state: np.ndarray | None = None,
     images: Callable[[int], Mapping[str, np.ndarray]] | None = None,
     late_policy: str = "blocking_refresh",
+    max_first_action_offset_rad: float = 0.15,
 ) -> CheckReport:
     """Run one virtual-clock session against the endpoint at ``url``.
 
@@ -197,6 +272,9 @@ def check_policy(
         images: ``tick -> {camera: frame}``; default mid-grey frames.
         late_policy: ``"blocking_refresh"`` (run-policy's default) records
             recoveries and continues; ``"abort"`` stops at the first one.
+        max_first_action_offset_rad: run-policy's start check. The report's
+            ``start_rejected`` names the arm joint whose first target is
+            further than this from ``initial_state`` (0 disables).
     """
     import time
 
@@ -236,11 +314,16 @@ def check_policy(
         def images(_tick: int) -> Mapping[str, np.ndarray]:
             return frames
 
+    initial_command = np.full(len(spec.action_names), np.nan, np.float32)
+    for state_index, action_index in tracked:
+        initial_command[action_index] = state[state_index]
     dt_ns = round(1e9 / spec.fps)
     report = CheckReport(
         spec=spec,
         targets=np.full((ticks, len(spec.action_names)), np.nan, np.float32),
         plan_ids=[None] * ticks,
+        initial_command=initial_command,
+        max_first_action_offset_rad=max_first_action_offset_rad,
     )
     in_flight: tuple[int, object] | None = None
     last_dispatched: tuple[int, str, int] | None = None
