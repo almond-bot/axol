@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 
+from ... import offline_bundle
 from ...utils.jetson import _is_jetson
 from ...utils.packages import failure_detail, run_package_manager
 from ...utils.sudo import prime_sudo
@@ -195,6 +196,27 @@ def _pip_install_pygobject() -> bool:
     # Target the interpreter running this CLI (the uv tool env), not whatever
     # VIRTUAL_ENV/cwd resolves to — same trick as ``axol zed.install``.
     uv = shutil.which("uv")
+    bundle = offline_bundle.active()
+    if bundle is not None:
+        # Offline: build from the bundle's sdists. Its build backends are
+        # there too, so uv's isolated build needs no index either.
+        if uv is None:
+            _logger.warning("uv not found; cannot install PyGObject offline")
+            return False
+        return _run(
+            [
+                uv,
+                "pip",
+                "install",
+                "--python",
+                sys.executable,
+                "--offline",
+                "--no-index",
+                "--find-links",
+                str(bundle.pygobject),
+                _PYGOBJECT_SPEC,
+            ]
+        )
     pip_args = ["pip", "install", "--python", sys.executable, _PYGOBJECT_SPEC]
     if uv is not None and _run([uv, *pip_args]):
         return True

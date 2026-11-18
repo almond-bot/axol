@@ -32,7 +32,8 @@
               "hardware-setup/thor"
             ]
           },
-          "installation"
+          "installation",
+          "offline-updates"
         ]
       },
       {
