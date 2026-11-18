@@ -224,6 +224,31 @@ def _wanted_firmware(jc: object) -> dict[str, float]:
     return wanted
 
 
+async def _stock_current_gains(
+    driver: object, side: str, joint: Joint
+) -> dict[str, float]:
+    """The current-loop gains ``joint``'s MyActuator firmware ships with.
+
+    Empty for another vendor, for a model or firmware with no known set
+    (``MyActuatorMotor.stock_current_gains``), and when the motor does not
+    answer the model or version read, which is logged: the joint then keeps
+    the current-loop gains it holds.
+    """
+    if not isinstance(driver, MyActuatorMotor):
+        return {}
+    try:
+        return await driver.stock_current_gains() or {}
+    except MotorError as exc:
+        _logger.warning(
+            "%s.%s: could not read the motor's model and firmware (%s). Its "
+            "current-loop gains were not checked.",
+            side,
+            joint.value,
+            exc,
+        )
+        return {}
+
+
 async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
     """Write the configured firmware loop gains of ``joints`` to their motors' ROM.
 
@@ -234,6 +259,12 @@ async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
     the *cold* joints of a bring-up, called while they are still disabled and
     the bus is quiet: a MyActuator commits a ROM write only when disabled,
     and joints found holding from a previous session are never touched.
+
+    Every MyActuator joint also gets the current-loop gains its firmware
+    ships with (``MyActuatorMotor.stock_current_gains``), whatever its
+    ``wire_mode``: the current loop runs under the impedance frame too, and a
+    motor holding another firmware's set jittered with a payload gripped.
+    A model or firmware with no known set is left as it is.
 
     A motor that took a write is **reset** afterwards (0x76, ~2 s): on the
     X6-P20's 2025070202 firmware a ROM gain write does not reach the running
@@ -257,10 +288,13 @@ async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
     side = "left" if getattr(arm, "_is_left", True) else "right"
     for joint in joints:
         jc = getattr(arm_config, joint.value, None)
-        wanted = _wanted_firmware(jc)
+        driver = getattr(arm.motors.get(joint), "_driver", None)
+        wanted = {
+            **await _stock_current_gains(driver, side, joint),
+            **_wanted_firmware(jc),
+        }
         if not wanted:
             continue
-        driver = getattr(arm.motors.get(joint), "_driver", None)
         if not isinstance(driver, (MyActuatorMotor, DamiaoMotor)):
             _logger.warning(
                 "%s.%s: firmware loop gains configured but the joint has no "
@@ -300,6 +334,34 @@ async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
             )
 
 
+async def _warn_held_current_gains(driver: object, side: str, joint: Joint) -> None:
+    """Log a held joint whose current-loop gains are not its firmware's.
+
+    A holding motor cannot take the ROM write, and this is no reason to
+    refuse the run: the joint keeps the gains it has been holding with, and
+    :func:`apply_firmware_gains` writes them once it starts from disabled.
+    """
+    stock = await _stock_current_gains(driver, side, joint)
+    if not stock or not isinstance(driver, MyActuatorMotor):
+        return
+    try:
+        differs = await driver.firmware_gain_mismatches(stock)
+    except MotorError:
+        return
+    if differs:
+        _logger.warning(
+            "%s.%s is holding with current-loop gains that do not match its "
+            "firmware: %s. They are corrected the next time the arm starts "
+            "from disabled.",
+            side,
+            joint.value,
+            ", ".join(
+                f"{n} {have:g} (expected {want:g})"
+                for n, (have, want) in differs.items()
+            ),
+        )
+
+
 async def held_firmware_gain_mismatches(
     arm: "AxolArm", joints: Iterable[Joint]
 ) -> list[str]:
@@ -314,6 +376,9 @@ async def held_firmware_gain_mismatches(
     held joint's running gains (reads work while holding) and returns one
     line per joint that differs; empty means every held joint matches. A
     joint whose gains cannot be read is skipped with a warning.
+
+    Only the configured gains count here. A held MyActuator joint whose
+    current-loop gains are not its firmware's is logged, not returned.
     """
     arm_config = getattr(arm, "_arm_config", None)
     if arm_config is None:
@@ -323,6 +388,7 @@ async def held_firmware_gain_mismatches(
     for joint in joints:
         wanted = _wanted_firmware(getattr(arm_config, joint.value, None))
         driver = getattr(arm.motors.get(joint), "_driver", None)
+        await _warn_held_current_gains(driver, side, joint)
         if not wanted or not isinstance(driver, (MyActuatorMotor, DamiaoMotor)):
             continue
         try:

@@ -12,7 +12,11 @@ from unittest.mock import MagicMock, patch
 from almond_axol.constants import ARM_JOINTS, Joint
 from almond_axol.motor import MotorError
 from almond_axol.motor.damiao import DamiaoMotor
-from almond_axol.motor.myactuator import _MA_PID_IDX, MyActuatorMotor
+from almond_axol.motor.myactuator import (
+    _MA_PID_IDX,
+    MyActuatorMotor,
+    stock_current_gains,
+)
 from almond_axol.robot import FirmwareGains, JointConfig
 from almond_axol.robot.axol import apply_firmware_gains
 from almond_axol.robot.config import (
@@ -33,10 +37,11 @@ _X8 = {
 
 class ConfigTest(unittest.TestCase):
     def test_every_arm_joint_leaves_its_motor_firmware_alone(self) -> None:
-        # The arms run impedance, where the firmware loops are inert: no joint
-        # carries a firmware set, so bring-up neither writes nor checks the
-        # motors' own loops and they stay as shipped. The tuned 0xA4 sets
-        # stay defined for an --a4 run to override with.
+        # The arms run impedance, where the firmware's position and speed
+        # loops are inert: no joint carries a firmware set, so bring-up
+        # leaves those as shipped (the current loop is checked apart from
+        # the config, see StockCurrentGainsTest). The tuned 0xA4 sets stay
+        # defined for an --a4 run to override with.
         cfg = AxolConfig()
         for arm in (cfg.left, cfg.right):
             for joint in ARM_JOINTS:
@@ -77,10 +82,15 @@ class _FakeMotor(MyActuatorMotor):
         enabled: bool = False,
         planner: tuple[int, int] = (0, 0),
         decel_floor: int = 0,
+        model: str | None = None,
+        firmware: int | None = None,
     ) -> None:
         super().__init__(MagicMock(), 0x01, kt=2.0)
         self.store = store
         self.enabled = enabled
+        # What 0xB5 / 0xB2 answer. No model: a motor with no known stock set.
+        self.model = model
+        self.firmware = firmware
         self.writes: list[tuple[int, float]] = []
         self.resets = 0
         # Position planner accel/decel (0x42 types 0/1), 0x43 writes.
@@ -91,6 +101,12 @@ class _FakeMotor(MyActuatorMotor):
 
     async def reset(self) -> None:  # type: ignore[override]
         self.resets += 1
+
+    async def _read_model(self) -> str | None:  # type: ignore[override]
+        return self.model
+
+    async def _read_firmware_version(self) -> int | None:  # type: ignore[override]
+        return self.firmware
 
     async def _request(self, data: bytes, *args, **kwargs) -> bytes:  # type: ignore[override]
         cmd, index = data[0], data[1]
@@ -484,3 +500,148 @@ class HeldGainCheckTest(unittest.IsolatedAsyncioTestCase):
             await held_firmware_gain_mismatches(arm, [Joint.SHOULDER_1]), []
         )
         self.assertEqual(await held_firmware_gain_mismatches(arm, []), [])
+
+
+def _x6(current_kp: float, current_ki: float) -> dict[int, float]:
+    """An X6-P20's gain store with the given current-loop pair."""
+    return {
+        _MA_PID_IDX["current_kp"]: current_kp,
+        _MA_PID_IDX["current_ki"]: current_ki,
+        _MA_PID_IDX["speed_kp"]: 0.01,
+        _MA_PID_IDX["speed_ki"]: 1e-4,
+        _MA_PID_IDX["position_kp"]: 0.08,
+        _MA_PID_IDX["position_ki"]: 0.0,
+        _MA_PID_IDX["position_kd"]: 1.0,
+    }
+
+
+class _SilentMotor(_FakeMotor):
+    async def _read_model(self) -> str | None:  # type: ignore[override]
+        raise MotorError("no reply")
+
+
+class StockCurrentGainsTest(unittest.IsolatedAsyncioTestCase):
+    """The current loop runs under impedance too, so bring-up keeps every
+    MyActuator joint on the current-loop gains its firmware ships with."""
+
+    async def asyncSetUp(self) -> None:
+        patcher = patch("almond_axol.motor.myactuator._MA_ROM_SETTLE_S", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_set_follows_the_series_and_the_firmware(self) -> None:
+        self.assertEqual(
+            stock_current_gains("RMD-X6-P20-60", 2026052501),
+            {"current_kp": 0.4, "current_ki": 1e-4},
+        )
+        self.assertEqual(
+            stock_current_gains("RMD-X6-P20-50", 2026052501),
+            {"current_kp": 0.4, "current_ki": 1e-4},
+        )
+        self.assertEqual(
+            stock_current_gains("RMD-X6-P20-60", 2026042402),
+            {"current_kp": 0.5, "current_ki": 0.05},
+        )
+        self.assertEqual(
+            stock_current_gains("RMD-X8-P20-120", 2026042403),
+            {"current_kp": 0.8, "current_ki": 0.08},
+        )
+        # The two older firmwares carry the same pairs.
+        self.assertEqual(
+            stock_current_gains("RMD-X6-P20-60", 2025070202),
+            {"current_kp": 0.5, "current_ki": 0.05},
+        )
+        self.assertEqual(
+            stock_current_gains("RMD-X8-P20-120", 2026042402),
+            {"current_kp": 0.8, "current_ki": 0.08},
+        )
+        self.assertEqual(
+            stock_current_gains("RMD-X8-P20-150", 2026083101),
+            {"current_kp": 1.03, "current_ki": 0.02},
+        )
+
+    def test_an_unknown_model_or_firmware_has_no_set(self) -> None:
+        self.assertIsNone(stock_current_gains("RMD-X6-P20-60", 2024010101))
+        self.assertIsNone(stock_current_gains("RMD-X8-P20-150", 2026052501))
+        self.assertIsNone(stock_current_gains("RMD-X10-P7", 2026052501))
+        self.assertIsNone(stock_current_gains(None, 2026052501))
+        self.assertIsNone(stock_current_gains("RMD-X6-P20-60", None))
+        self.assertIsNone(stock_current_gains("DM-J4310", 2026052501))
+
+    async def test_an_impedance_joint_holding_another_firmwares_set_is_written(
+        self,
+    ) -> None:
+        # The left wrist_1 this was found on: firmware 2026052501 holding the
+        # 2026042402 pair. wrist_1 carries no configured set and runs "mit".
+        w1 = _FakeMotor(_x6(0.5, 0.05), model="RMD-X6-P20-60", firmware=2026052501)
+        with self.assertLogs("almond_axol.robot.axol", level="INFO") as logs:
+            await apply_firmware_gains(_arm({Joint.WRIST_1: w1}), [Joint.WRIST_1])
+        self.assertAlmostEqual(w1.store[_MA_PID_IDX["current_kp"]], 0.4, 6)
+        self.assertAlmostEqual(w1.store[_MA_PID_IDX["current_ki"]], 1e-4, 9)
+        self.assertEqual(
+            sorted(i for i, _ in w1.writes),
+            [_MA_PID_IDX["current_kp"], _MA_PID_IDX["current_ki"]],
+        )
+        self.assertEqual(w1.resets, 1)
+        self.assertTrue(
+            any(
+                "left.wrist_1" in m and "current_ki 0.05 -> 0.0001" in m
+                for m in logs.output
+            )
+        )
+
+    async def test_a_motor_on_its_own_firmwares_set_is_left_alone(self) -> None:
+        old = _FakeMotor(_x6(0.5, 0.05), model="RMD-X6-P20-60", firmware=2026042402)
+        new = _FakeMotor(_x6(0.4, 1e-4), model="RMD-X6-P20-50", firmware=2026052501)
+        arm = _arm({Joint.SHOULDER_3: old, Joint.WRIST_1: new})
+        await apply_firmware_gains(arm, [Joint.SHOULDER_3, Joint.WRIST_1])
+        self.assertEqual((old.writes, old.resets), ([], 0))
+        self.assertEqual((new.writes, new.resets), ([], 0))
+
+    async def test_an_unknown_firmware_is_left_alone(self) -> None:
+        w1 = _FakeMotor(_x6(0.7, 0.3), model="RMD-X6-P20-60", firmware=2024010101)
+        await apply_firmware_gains(_arm({Joint.WRIST_1: w1}), [Joint.WRIST_1])
+        self.assertEqual((w1.writes, w1.resets), ([], 0))
+
+    async def test_a_motor_that_does_not_name_itself_warns_and_keeps_its_gains(
+        self,
+    ) -> None:
+        w1 = _SilentMotor(_x6(0.5, 0.05), firmware=2026052501)
+        arm = _arm({Joint.WRIST_1: w1}, is_left=False)
+        with self.assertLogs("almond_axol.robot.axol", level="WARNING") as logs:
+            await apply_firmware_gains(arm, [Joint.WRIST_1])
+        self.assertEqual((w1.writes, w1.resets), ([], 0))
+        self.assertTrue(any("right.wrist_1" in m for m in logs.output))
+
+    async def test_it_shares_one_write_pass_and_reset_with_a_configured_set(
+        self,
+    ) -> None:
+        # shoulder_1 carries the tuned 0xA4 set in _arm(): its position and
+        # speed gains and the stock current pair go in together.
+        store = _stock()
+        store[_MA_PID_IDX["current_ki"]] = 0.5
+        s1 = _FakeMotor(store, model="RMD-X8-P20-120", firmware=2026042403)
+        await apply_firmware_gains(_arm({Joint.SHOULDER_1: s1}), [Joint.SHOULDER_1])
+        self.assertAlmostEqual(s1.store[_MA_PID_IDX["current_ki"]], 0.08, 6)
+        self.assertAlmostEqual(s1.store[_MA_PID_IDX["position_kp"]], 1.0, 6)
+        self.assertNotIn(_MA_PID_IDX["current_kp"], [i for i, _ in s1.writes])
+        self.assertEqual(s1.resets, 1)
+
+    async def test_a_held_joint_is_logged_and_does_not_refuse_the_run(self) -> None:
+        from almond_axol.robot.axol import held_firmware_gain_mismatches
+
+        w1 = _FakeMotor(
+            _x6(0.5, 0.05), enabled=True, model="RMD-X6-P20-60", firmware=2026052501
+        )
+        arm = _arm({Joint.WRIST_1: w1})
+        with self.assertLogs("almond_axol.robot.axol", level="WARNING") as logs:
+            self.assertEqual(
+                await held_firmware_gain_mismatches(arm, [Joint.WRIST_1]), []
+            )
+        self.assertEqual(w1.writes, [])
+        self.assertTrue(
+            any(
+                "left.wrist_1" in m and "current_ki 0.05 (expected 0.0001)" in m
+                for m in logs.output
+            )
+        )

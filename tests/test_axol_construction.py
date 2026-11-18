@@ -390,6 +390,14 @@ class AxolEnableRollbackKeepsHeldJointsTest(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(return_value={}),
             )
         )
+        # ... as does the read of each MyActuator's model and firmware that
+        # picks its stock current-loop gains (no known set: nothing to write).
+        self.enterContext(
+            patch(
+                "almond_axol.motor.myactuator.MyActuatorMotor.stock_current_gains",
+                AsyncMock(return_value=None),
+            )
+        )
         # ... and so does the held-joint check that precedes it (reads only).
         for cls in ("myactuator.MyActuatorMotor", "damiao.DamiaoMotor"):
             self.enterContext(

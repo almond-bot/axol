@@ -197,3 +197,34 @@ All of this was with the stock gripper and camera on the wrist.
   the last commanded position. Under the tool's plain PD a -150 shoulder
   still rings about 1° at 2 Hz in the 15°/s pass (the ripple sits on the
   spring's own mode there) and when a fast pass brakes.
+
+## Current-loop gains that belong to another firmware (Nov 18, one robot)
+
+- **Symptom:** in the ROM test with 2 kg gripped, left wrist_1 wobbled
+  30–69 mdeg while holding (3–15 on the right arm) and looked jittery
+  through its sweep. With empty grippers nothing was visible.
+- **Cause:** that motor (RMD-X6-P20-60, firmware 2026052501, factory-dated
+  2026-05-16) held `current_kp` 0.5 / `current_ki` 0.05, the set every X6
+  on firmware 2026042402 carries. Its five X6 siblings on 2026052501 held
+  0.4 / 1e-4. Writing 0.4 / 1e-4 brought the loaded hold to 5–17 mdeg and
+  the operator saw no jitter. One run before, one after.
+- **What it is not:** the friction calibration (feedforward off: torque
+  chatter 0.090 against 0.071 Nm), kp or kd (kd halved 0.064, kp 120 0.065,
+  inside the 0.064–0.100 run-to-run spread), the software version, the bus.
+- **Empty-gripper tests do not show it.** Creeps and ROM-speed sweeps
+  scored the same before and after the write (torque chatter 0.07–0.10 Nm
+  on the left against 0.02 on the right, tracking equal). Only the loaded
+  run separated them. Softer wrist_1 gains made the unloaded torque ripple
+  worse (13–45 Hz: 9 cNm at 180 / 1.7, 14–16 at kp 120 or 90, 13.5 at
+  kd 2.5).
+- **Still there after the fix:** that motor's torque ripple at about 196
+  cycles per joint revolution (once per electrical cycle), 0.10–0.17 Nm
+  against a third of that on the right; 16–28 Hz at ROM speed.
+- **Sets read on assembled arms (three robots):** X6 2025070202 and
+  2026042402 0.5 / 0.05 (six motors each); X6 2026052501 0.4 / 1e-4
+  (five); X8-P20-120 2026042402 and 2026042403 0.8 / 0.08 (four each);
+  X8-P20-150 2026083101 1.03 / 0.02 (four). Bring-up writes a cold
+  MyActuator joint's set when it differs (`_MA_STOCK_CURRENT_GAINS`).
+- **Not tested:** whether the position and speed gains, which also differ
+  by firmware, matter anywhere outside the 0xA4 loop. They are left as the
+  motor holds them.

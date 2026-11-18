@@ -321,6 +321,58 @@ def _model_sample_res(model: str | None) -> float | None:
     return None
 
 
+# The current-loop gains (0x30 indices 0x01 / 0x02) each firmware ships with,
+# keyed by (X series, firmware VersionDate). The current loop is the one
+# firmware loop that still runs under the MIT impedance frame: it turns every
+# commanded torque into phase current. The set belongs to the firmware, not
+# to the model, and a motor does not always carry its own firmware's set: a
+# left wrist_1 (RMD-X6-P20-60, firmware 2026052501, factory-dated 2026-05-16)
+# held 0.5 / 0.05, the 2026042402 set, where its five X6 siblings on the same
+# firmware held 0.4 / 1e-4. With a 2 kg item gripped it wobbled 30-69 mdeg
+# while holding (3-15 on the other arm) and looked jittery through the ROM
+# sweep; with empty grippers nothing showed but a choppier torque. Writing
+# the 2026052501 set brought the hold to 5-17 mdeg (2026-11-18, one robot,
+# one run before and one after). Rows are what every motor of that series and
+# firmware read on the assembled arms:
+#
+#   X6, 2025070202   0.5  / 0.05   six RMD-X6-P20-60 of one robot
+#   X6, 2026042402   0.5  / 0.05   six RMD-X6-P20-60 of one robot
+#   X6, 2026052501   0.4  / 1e-4   two RMD-X6-P20-50, three RMD-X6-P20-60
+#   X8, 2026042402   0.8  / 0.08   four RMD-X8-P20-120
+#   X8, 2026042403   0.8  / 0.08   four RMD-X8-P20-120
+#   X8, 2026083101   1.03 / 0.02   four RMD-X8-P20-150
+#
+# A series or firmware outside the table has no known set and is left alone.
+_MA_STOCK_CURRENT_GAINS: dict[tuple[int, int], tuple[float, float]] = {
+    (6, 2025070202): (0.5, 0.05),
+    (6, 2026042402): (0.5, 0.05),
+    (6, 2026052501): (0.4, 1e-4),
+    (8, 2026042402): (0.8, 0.08),
+    (8, 2026042403): (0.8, 0.08),
+    (8, 2026083101): (1.03, 0.02),
+}
+
+
+def stock_current_gains(
+    model: str | None, firmware: int | None
+) -> dict[str, float] | None:
+    """The current-loop gains ``firmware`` ships with on ``model``'s series.
+
+    ``{"current_kp": ..., "current_ki": ...}`` (keys of ``_MA_PID_IDX``), or
+    ``None`` when the model names no X series or the pair is not in
+    ``_MA_STOCK_CURRENT_GAINS``.
+    """
+    if not model or firmware is None:
+        return None
+    match = re.search(r"X(\d+)", model.strip().upper())
+    if match is None:
+        return None
+    gains = _MA_STOCK_CURRENT_GAINS.get((int(match.group(1)), int(firmware)))
+    if gains is None:
+        return None
+    return {"current_kp": gains[0], "current_ki": gains[1]}
+
+
 def max_torque_matches(configured: float, rated: float) -> bool:
     """Whether a MAX_TORQUE setting is within tolerance of the model's rating."""
     return math.isfinite(configured) and abs(configured - rated) <= (
@@ -765,6 +817,17 @@ class MyActuatorMotor(MotorDriver):
 
     async def get_firmware_version(self) -> int | None:
         return await self._read_firmware_version()
+
+    async def stock_current_gains(self) -> dict[str, float] | None:
+        """The current-loop gains this motor's firmware ships with, else None.
+
+        Reads the model (0xB5) and firmware version (0xB2) and looks the pair
+        up (:func:`stock_current_gains`). Reads only, so it works on a motor
+        that is enabled and holding.
+        """
+        return stock_current_gains(
+            await self._read_model(), await self._read_firmware_version()
+        )
 
     async def get_planner_acceleration(self) -> tuple[int, int]:
         """The position planner's stored ``(acceleration, deceleration)`` in
