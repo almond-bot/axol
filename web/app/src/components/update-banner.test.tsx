@@ -68,6 +68,25 @@ describe("UpdateBanner", () => {
     expect(button().disabled).toBe(true)
   })
 
+  it("shows an install from a file without a release link", () => {
+    act(() =>
+      root.render(
+        <UpdateBanner
+          update={{ ...status, updateAvailable: false, remoteVersion: null }}
+          fromFileVersion="0.2.47"
+          updating
+          phase="provisioning"
+          blocked={false}
+          onUpdate={() => {}}
+        />
+      )
+    )
+    expect(container.textContent).toContain("Installing an update from a file")
+    expect(container.textContent).toContain("v0.2.10 → v0.2.47")
+    expect(container.querySelector("a")).toBeNull()
+    expect(button().textContent).toBe("Installing packages…")
+  })
+
   it("falls back to a generic label before the first phase arrives", () => {
     renderBanner(true, null)
     expect(button().textContent).toBe("Updating…")

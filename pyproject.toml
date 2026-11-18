@@ -43,6 +43,9 @@ dependencies = [
     # metadata — the fork (and its almond-jaxls companion) is what makes
     # almond-axol itself installable from PyPI.
     "almond-pyroki>=0.1.1,<0.2",
+    # Checks the Almond signature on offline update bundles uploaded through
+    # the control panel (almond_axol/offline_bundle.py).
+    "cryptography>=42",
     "python-can>=4.6.1,<5",
     "scipy>=1.17.1,<2",
     "uvicorn[standard]>=0.42.0,<0.43",

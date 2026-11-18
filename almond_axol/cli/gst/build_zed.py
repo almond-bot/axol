@@ -53,6 +53,7 @@ import stat
 import subprocess
 from pathlib import Path
 
+from ... import offline_bundle
 from ...utils.jetson import _is_jetson
 from ...utils.packages import failure_detail, run_package_manager
 from ...utils.state_files import secure_atomic_write_text
@@ -527,17 +528,26 @@ def _sync_source(src: Path) -> bool:
     if git is None:
         _logger.warning("git not found; cannot fetch zed-gstreamer source")
         return False
+    # Offline (the installer's bundle mode): the bundle's git bundle of the
+    # pinned commit stands in for zed-gstreamer's GitHub repository.
+    bundled = offline_bundle.git_remote("zed-gstreamer", _PINNED_REF)
 
     if not (src / ".git").exists():
         src.parent.mkdir(parents=True, exist_ok=True)
         if src.exists():
             shutil.rmtree(src)
-        if not _run([git, "clone", _REPO_URL, str(src)]):
+        if not _run([git, "clone", bundled or _REPO_URL, str(src)]):
+            return False
+        # A clone from the bundle keeps GitHub as origin, so a later online
+        # run can still fetch a newer pin.
+        if bundled and not _run(
+            [git, "remote", "set-url", "origin", _REPO_URL], cwd=src
+        ):
             return False
 
     # Pin to the exact ref and discard any prior patched tree so the unified
     # diff always applies against pristine upstream.
-    ok = _run([git, "fetch", "--depth", "1", "origin", _PINNED_REF], cwd=src)
+    ok = _run([git, "fetch", "--depth", "1", bundled or "origin", _PINNED_REF], cwd=src)
     if not ok:
         # Shallow clones may not have the ref; deepen via a full fetch.
         _run([git, "fetch", "origin"], cwd=src)

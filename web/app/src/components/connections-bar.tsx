@@ -4,6 +4,7 @@ import { deviceErrorText } from "@/lib/hardware-status"
 import { useCallback, useState, type ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
 import { BatteryIndicator, WheelGrid } from "@/components/jelly-status"
+import { InstallFromFile } from "@/components/install-from-file"
 import { SoftwareChannel } from "@/components/software-channel"
 import { CHANNEL_LABEL, releaseTag, shortCommit } from "@/lib/update-view"
 import {
@@ -209,6 +210,8 @@ export function ConnectionsBar({
   update,
   updating = false,
   onSwitchChannel,
+  onInstallBundle,
+  onUpdateStatus,
   onOpenSetup,
   onHostDisconnect,
   opRunning = false,
@@ -242,6 +245,10 @@ export function ConnectionsBar({
   updating?: boolean
   /** Reinstalls the host software from the other channel. */
   onSwitchChannel?: (channel: UpdateChannel) => void
+  /** Installs the uploaded offline bundle (Install from file). */
+  onInstallBundle?: () => void
+  /** Hands a fresh update status to the page (Install from file polls it). */
+  onUpdateStatus?: (status: UpdateStatus) => void
   onOpenSetup: () => void
   onHostDisconnect: () => void
   /** An operation or session is in flight — the server would refuse a power
@@ -612,6 +619,19 @@ export function ConnectionsBar({
                   />
                   <span className="text-white/80">{CHANNEL_LABEL[update.channel]}</span>
                 </span>
+              </div>
+            )}
+            {update?.enabled && update.bundle && onInstallBundle && onUpdateStatus && (
+              <div className="flex min-w-0 items-center justify-between gap-4 text-sm">
+                <span className="shrink-0 text-white/45">Offline update</span>
+                <InstallFromFile
+                  update={update}
+                  updating={updating}
+                  opRunning={opRunning}
+                  hostInstalling={hostInstalling}
+                  onStatus={onUpdateStatus}
+                  onInstall={onInstallBundle}
+                />
               </div>
             )}
           </div>

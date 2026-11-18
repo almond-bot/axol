@@ -67,9 +67,88 @@ jobs:
           if "almond_axol/serve/ui/index.html" not in names:
               sys.exit(f"{wheel} is missing almond_axol/serve/ui/index.html")
           EOF
+      # The offline bundle job ships this exact wheel (with the web UI).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: almond-axol-dist
+          path: dist/
+          if-no-files-found: error
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true
+
+  # Offline update bundle for robots on networks with no internet access:
+  # the release wheel, every locked dependency, the prebuilt axol-rt core,
+  # PyGObject's sources and the pinned camera/tracker sources, attached to the
+  # GitHub release as axol-offline-v<version>-linux-aarch64.tar (see
+  # almond_axol/offline_bundle.py and scripts/build_offline_bundle.py).
+  #
+  # Built on Ubuntu 22.04 arm64 so pip picks wheels, and the axol-rt binary
+  # links, for glibc 2.35: JetPack 6 hosts run jammy, and JetPack 7 and
+  # Raspberry Pi OS are newer.
+  #
+  # The manifest is signed with the ed25519 key in this environment's
+  # AXOL_BUNDLE_SIGNING_KEY secret; the control panel only installs uploads
+  # signed by a key in almond_axol.offline_bundle.TRUSTED_KEYS. Restrict the
+  # environment to release tags (scripts/bundle_signing_key.py sets it up).
+  offline-bundle:
+    needs: publish-sdk
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 60
+    environment: offline-bundle
+    permissions:
+      contents: write # upload the bundle to the release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: almond-axol-dist
+          path: dist
+      - name: Build axol-rt
+        working-directory: rust/axol-rt
+        run: cargo build --release --locked
+      - name: Build the offline bundle
+        env:
+          AXOL_BUNDLE_SIGNING_KEY: ${{ secrets.AXOL_BUNDLE_SIGNING_KEY }}
+        run: |
+          uv python install 3.13
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            uv run --no-project --python 3.13 --with pip --with cryptography \
+            python scripts/build_offline_bundle.py \
+              --wheel dist/almond_axol-*.whl \
+              --rt-binary rust/axol-rt/target/release/axol-rt \
+              --uv "$(command -v uv)" \
+              --out "$RUNNER_TEMP/offline"
+      # Prepare a container like a provisioned robot (uv, Python 3.13 under
+      # /opt/axol, the apt packages provisioning installs), then install and
+      # exercise the bundle with the network off.
+      - name: Test the bundle with no network
+        run: |
+          bundle="$(find "$RUNNER_TEMP/offline" -mindepth 1 -maxdepth 1 -type d)"
+          cp "$(command -v uv)" "$RUNNER_TEMP/uv"
+          docker build -t axol-offline-test -f - "$RUNNER_TEMP" <<'EOF'
+          FROM ubuntu:22.04
+          ENV DEBIAN_FRONTEND=noninteractive
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                ca-certificates curl git gcc pkg-config libcap2-bin \
+                libgirepository1.0-dev gobject-introspection libcairo2-dev \
+              && rm -rf /var/lib/apt/lists/*
+          COPY uv /usr/local/bin/uv
+          RUN UV_PYTHON_INSTALL_DIR=/opt/axol/uv/python uv python install 3.13
+          EOF
+          docker run --rm --network none \
+            -v "$bundle:/bundle:ro" \
+            -v "$PWD/scripts/offline_bundle_smoke.sh:/smoke.sh:ro" \
+            axol-offline-test bash /smoke.sh /bundle
+      - name: Attach the bundle to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "$RUNNER_TEMP"/offline/*.tar "$RUNNER_TEMP"/offline/*.tar.sha256 \
+            --clobber
 
   publish-plugin:
     runs-on: ubuntu-latest

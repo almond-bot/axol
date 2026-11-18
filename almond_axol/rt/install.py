@@ -21,6 +21,10 @@ Three concerns, each idempotent and self-gating:
   local checkout (``uv tool install /path/to/axol``) builds that checkout's
   crate. ``AXOL_RT_SOURCE`` (a checkout path, or ``<git url>@<ref>``)
   overrides all of the above.
+* **Offline bundle** — with ``AXOL_OFFLINE_BUNDLE`` set (the installer's
+  bundle mode, see :mod:`almond_axol.offline_bundle`), a tool install whose
+  ref matches the bundle's prebuilt binary installs that binary instead of
+  fetching and building.
 * **Binary** — dev checkouts leave it in ``target/release/`` (where
   :func:`almond_axol.rt.link.find_binary` already looks, and where a manual
   ``cargo build`` stays authoritative). Tool installs copy it into
@@ -43,6 +47,8 @@ from importlib.metadata import PackageNotFoundError, distribution, version
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import url2pathname
+
+from .. import offline_bundle
 
 _logger = logging.getLogger(__name__)
 
@@ -316,6 +322,29 @@ def _build(crate: Path, cargo: str) -> Path:
     return binary
 
 
+def _bundled_binary(ref: str) -> Path | None:
+    """The offline bundle's prebuilt binary, when one is active and built from ``ref``.
+
+    The bundle's binary comes from the release workflow's build of the same
+    tag, so it stands in for fetching that tag and building it here (which
+    needs GitHub, crates.io and possibly rustup). An explicit
+    ``AXOL_RT_SOURCE`` always builds, like every other override.
+    """
+    if _SOURCE_ENV in os.environ:
+        return None
+    bundle = offline_bundle.active()
+    if bundle is None:
+        return None
+    binary = bundle.rt_binary(ref)
+    if binary is None:
+        _logger.warning(
+            "the offline bundle (v%s) has no axol-rt for %s; building from source",
+            bundle.version,
+            ref,
+        )
+    return binary
+
+
 def _install(binary: Path, ref: str, dest: Path) -> Path:
     """Copy the binary onto PATH (atomic replace) and stamp the ref."""
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -450,6 +479,14 @@ def run(_args: object = None) -> None:
     ):
         _grant_realtime(dest)
         print(f"axol-rt already installed at {dest} (ref {ref}).")
+        return
+    prebuilt = _bundled_binary(ref)
+    if prebuilt is not None:
+        dest = _install(prebuilt, ref, dest)
+        _grant_realtime(dest)
+        print(
+            f"axol-rt installed: {dest} (ref {ref}, prebuilt from the offline bundle)"
+        )
         return
     cargo = _ensure_toolchain()
     print(f"Fetching axol-rt sources ({url} @ {ref}) ...")

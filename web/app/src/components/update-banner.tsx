@@ -2,7 +2,7 @@ import { Download, ExternalLink, Loader2 } from "lucide-react"
 import type { UpdateChannel, UpdatePhase, UpdateStatus } from "@/lib/supervisor"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
-import { PHASE_LABEL, describeChange } from "@/lib/update-view"
+import { PHASE_LABEL, describeChange, releaseTag } from "@/lib/update-view"
 
 /** The banner's heading, for an update within the installed channel or a switch to `to`. */
 function title(update: UpdateStatus, to: UpdateChannel): string {
@@ -22,6 +22,7 @@ function title(update: UpdateStatus, to: UpdateChannel): string {
 export function UpdateBanner({
   update,
   switchTo = null,
+  fromFileVersion = null,
   updating,
   phase,
   blocked,
@@ -31,6 +32,8 @@ export function UpdateBanner({
   update: UpdateStatus
   /** The channel being switched to, while a channel switch applies. */
   switchTo?: UpdateChannel | null
+  /** The version being installed from an uploaded offline bundle. */
+  fromFileVersion?: string | null
   updating: boolean
   /** Current update step, for the button label while updating. */
   phase: UpdatePhase | null
@@ -43,27 +46,35 @@ export function UpdateBanner({
   const hint = busyReason ?? "The Host Computer is busy"
   const updatingLabel = (phase && PHASE_LABEL[phase]) || "Updating…"
   const to = switchTo ?? update.channel ?? "release"
-  const { jump, link, linkLabel } = describeChange(update, to)
+  const change = describeChange(update, to)
+  const { link, linkLabel } = change
+  const jump = fromFileVersion
+    ? `${releaseTag(update.version)} → ${releaseTag(fromFileVersion)}`
+    : change.jump
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
       <div className="flex min-w-0 flex-col gap-0.5">
-        <span className="font-medium text-amber-200">{title(update, to)}</span>
+        <span className="font-medium text-amber-200">
+          {fromFileVersion ? "Installing an update from a file" : title(update, to)}
+        </span>
         <span className="font-mono text-amber-200/60">{jump}</span>
         {blocked && !updating && <span className="text-amber-200/60">{hint} to update.</span>}
       </div>
       <div className="flex items-center gap-2">
-        <a
-          href={link}
-          target="_blank"
-          rel="noreferrer"
-          className={cn(
-            buttonVariants({ variant: "ghost", size: "sm" }),
-            "text-amber-200/80 hover:bg-amber-400/10 hover:text-amber-200"
-          )}
-        >
-          {linkLabel}
-          <ExternalLink />
-        </a>
+        {!fromFileVersion && (
+          <a
+            href={link}
+            target="_blank"
+            rel="noreferrer"
+            className={cn(
+              buttonVariants({ variant: "ghost", size: "sm" }),
+              "text-amber-200/80 hover:bg-amber-400/10 hover:text-amber-200"
+            )}
+          >
+            {linkLabel}
+            <ExternalLink />
+          </a>
+        )}
         <Button
           variant="outline"
           size="sm"

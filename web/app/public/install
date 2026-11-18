@@ -10,6 +10,16 @@
 # registers a root systemd service that re-applies that tuning at every boot
 # and keeps `axol serve` running. Safe to re-run: re-running upgrades to the
 # latest release.
+#
+# Offline: every GitHub release also has an offline bundle
+# (axol-offline-v<version>-<platform>.tar) for robots with no internet access.
+# Extract it on the robot and run this script from inside it:
+#
+#   tar -xf axol-offline-v0.2.47-linux-aarch64.tar
+#   sudo ./axol-offline-v0.2.47-linux-aarch64/install
+#
+# (or `install --bundle DIR`). That installs the bundle's release from its own
+# files, with no network access. See almond_axol/offline_bundle.py.
 
 set -euo pipefail
 
@@ -44,24 +54,58 @@ die() { printf "\033[1;31m[axol]\033[0m %s\n" "$*" >&2; exit 1; }
 
 [ "$(uname -s)" = "Linux" ] || die "This installer only supports Linux."
 
+# Offline bundle mode: --bundle DIR, or this script run from inside an
+# extracted bundle (a manifest.json next to it). Piped from curl, there is no
+# script file, so only an explicit --bundle selects it.
+BUNDLE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --bundle)
+            [ $# -ge 2 ] || die "--bundle needs the extracted bundle's directory."
+            BUNDLE="$2"
+            shift 2
+            ;;
+        *) die "Unknown option: $1" ;;
+    esac
+done
+SELF="${BASH_SOURCE[0]:-}"
+if [ -z "${BUNDLE}" ] && [ -f "${SELF}" ] && [ -f "$(dirname "${SELF}")/manifest.json" ]; then
+    BUNDLE="$(dirname "${SELF}")"
+fi
+if [ -n "${BUNDLE}" ]; then
+    [ -d "${BUNDLE}" ] || die "No bundle directory at ${BUNDLE}."
+    BUNDLE="$(cd "${BUNDLE}" && pwd)"
+fi
+
 # The systemd service runs as root, so install everything as root. When piped
 # into a non-root shell, re-fetch ourselves and re-run elevated.
 if [ "$(id -u)" -ne 0 ]; then
     say "Root privileges are required (systemd service); re-running with sudo..."
+    if [ -n "${BUNDLE}" ]; then
+        SCRIPT="${BUNDLE}/install"
+        [ -f "${SELF}" ] && SCRIPT="${SELF}"
+        exec sudo bash "${SCRIPT}" --bundle "${BUNDLE}"
+    fi
     exec sudo bash -c "curl -fsS ${INSTALL_URL} | bash"
 fi
 
 command -v systemctl >/dev/null 2>&1 || die "systemd is required."
-command -v curl >/dev/null 2>&1 || die "curl is required."
-# git is needed both to resolve the latest release tag and by uv itself to
-# install from the GitHub URL.
-command -v git >/dev/null 2>&1 || die "git is required."
+if [ -z "${BUNDLE}" ]; then
+    command -v curl >/dev/null 2>&1 || die "curl is required."
+    # git is needed both to resolve the latest release tag and by uv itself to
+    # install from the GitHub URL.
+    command -v git >/dev/null 2>&1 || die "git is required."
+fi
 
 # -- uv -----------------------------------------------------------------------
 
 if ! command -v uv >/dev/null 2>&1; then
     say "Installing uv to ${BIN_DIR}..."
-    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="${BIN_DIR}" sh
+    if [ -n "${BUNDLE}" ]; then
+        install -m 0755 "${BUNDLE}/bin/uv" "${BIN_DIR}/uv"
+    else
+        curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="${BIN_DIR}" sh
+    fi
 else
     say "uv already installed ($(command -v uv))."
 fi
@@ -74,19 +118,52 @@ UV="$(command -v uv || echo "${BIN_DIR}/uv")"
 # every release there). The `axol serve` self-updater performs the same
 # version-pinned reinstall when a newer release appears (serve/update.py) —
 # keep the requirement here and there in sync.
-say "Resolving the latest release..."
-LATEST_TAG="$(git ls-remote --tags "${REPO_URL}" "refs/tags/v*" \
-    | awk -F/ '{print $NF}' | sed 's/\^{}$//' \
-    | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -u -V | tail -n1)"
-[ -n "${LATEST_TAG}" ] || die "No release tags (vX.Y.Z) found on ${REPO_URL}."
-VERSION="${LATEST_TAG#v}"
-say "Latest release: ${LATEST_TAG}."
+UV_SOURCE_ARGS=()
+if [ -n "${BUNDLE}" ]; then
+    # Offline: the release this bundle holds, from its own wheels. Find-links,
+    # never the wheel's path: a path install would record a direct URL, and
+    # the host would stop counting as a release install (no Update button).
+    say "Checking the offline bundle in ${BUNDLE}..."
+    [ -f "${BUNDLE}/bundle.env" ] && [ -f "${BUNDLE}/SHA256SUMS" ] \
+        || die "${BUNDLE} is not an Axol offline bundle."
+    bundle_value() { sed -n "s/^$1=//p" "${BUNDLE}/bundle.env" | head -n1; }
+    [ "$(bundle_value AXOL_BUNDLE_FORMAT)" = "1" ] \
+        || die "This bundle has a format this installer does not read. Run the install script inside the bundle."
+    (cd "${BUNDLE}" && sha256sum --quiet --strict -c SHA256SUMS) \
+        || die "The bundle is damaged. Copy the .tar from the release page again, then extract it."
+    VERSION="$(bundle_value AXOL_BUNDLE_VERSION)"
+    BUNDLE_PLATFORM="$(bundle_value AXOL_BUNDLE_PLATFORM)"
+    HOST_PLATFORM="linux-$(uname -m)"
+    [ "${BUNDLE_PLATFORM}" = "${HOST_PLATFORM}" ] \
+        || die "This bundle is for ${BUNDLE_PLATFORM}, but this computer is ${HOST_PLATFORM}. Download axol-offline-v${VERSION}-${HOST_PLATFORM}.tar from the release page."
+    [ "$(bundle_value AXOL_BUNDLE_EXTRAS)" = "${EXTRAS}" ] \
+        && [ "$(bundle_value AXOL_BUNDLE_PYTHON)" = "${PYTHON_VERSION}" ] \
+        || die "This bundle does not match this installer. Run the install script inside the bundle."
+    "${UV}" python find "${PYTHON_VERSION}" >/dev/null 2>&1 \
+        || die "Python ${PYTHON_VERSION} is not installed on this computer. The offline bundle updates an existing Axol install: run the online installer once, then use the bundle for later updates."
+    say "Offline bundle: Axol v${VERSION} (${BUNDLE_PLATFORM})."
+    UV_SOURCE_ARGS=(--offline --no-index --find-links "${BUNDLE}/wheels")
+    SOURCE_LABEL="the offline bundle"
+    # `axol provision` takes what it would download (the axol-rt core,
+    # PyGObject, pinned camera and tracker sources) from the bundle.
+    export AXOL_OFFLINE_BUNDLE="${BUNDLE}"
+else
+    say "Resolving the latest release..."
+    LATEST_TAG="$(git ls-remote --tags "${REPO_URL}" "refs/tags/v*" \
+        | awk -F/ '{print $NF}' | sed 's/\^{}$//' \
+        | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -u -V | tail -n1)"
+    [ -n "${LATEST_TAG}" ] || die "No release tags (vX.Y.Z) found on ${REPO_URL}."
+    VERSION="${LATEST_TAG#v}"
+    say "Latest release: ${LATEST_TAG}."
+    SOURCE_LABEL="PyPI"
+fi
 
-say "Installing axol ${VERSION} from PyPI (extras: ${EXTRAS}) — this can take a few minutes..."
+say "Installing axol ${VERSION} from ${SOURCE_LABEL} (extras: ${EXTRAS}) — this can take a few minutes..."
 mkdir -p "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 "${UV}" tool install \
     --python "${PYTHON_VERSION}" \
     --force \
+    ${UV_SOURCE_ARGS[@]+"${UV_SOURCE_ARGS[@]}"} \
     "almond-axol[${EXTRAS}]==${VERSION}"
 
 # uv creates the tool venv + managed Python with the root umask; make sure every
@@ -269,7 +346,9 @@ LAN_IP="$(hostname -I 2>/dev/null | awk "{print \$1}")"
 say ""
 say "Done! axol serve is running and will start automatically at boot."
 say ""
-say "  Control panel : https://axol.almond.bot"
+if [ -z "${BUNDLE}" ]; then
+    say "  Control panel : https://axol.almond.bot"
+fi
 if [ -n "${LAN_IP}" ]; then
     say "  This machine  : https://${LAN_IP}:8001 (open once to accept the certificate)"
 fi
