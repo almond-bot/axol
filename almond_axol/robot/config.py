@@ -99,9 +99,12 @@ class FirmwareGains:
     These are the gains of the motor's own cascaded controller — position
     PI → speed PI → current PI — which is the loop a joint runs on when its
     ``wire_mode`` is ``a4``. Under the MIT impedance frame (``wire_mode``
-    ``mit``, the production law) the firmware ignores them; ``kp`` / ``kd``
-    on :class:`JointConfig` are the impedance gains and travel with every
-    command. Each field is ``None`` by default, meaning "leave whatever the
+    ``mit``, the production law) the firmware ignores the position and speed
+    gains; ``kp`` / ``kd`` on :class:`JointConfig` are the impedance gains
+    and travel with every command. The current loop runs under both, and is
+    not set here: bring-up keeps it at the set the motor's firmware ships
+    with (``almond_axol.motor.myactuator.stock_current_gains``).
+    Each field is ``None`` by default, meaning "leave whatever the
     motor holds". A set value is compared against the motor's stored gain
     while the joint is still disabled at enable (the only state a MyActuator
     accepts a ROM write in) and written only if it differs, so the flash is

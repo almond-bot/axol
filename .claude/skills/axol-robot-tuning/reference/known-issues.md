@@ -42,6 +42,20 @@ calibration file and the panel settings carry no `kp` / `kd_host` /
 a new computer or after an arm swap runs the old set and logs a warning:
 start it again.
 
+**One arm's wrist_1 (or another MyActuator joint) jitters with an item in
+the gripper and looks fine with the gripper empty; its motor torque is
+several times choppier than the same joint on the other arm.**
+Cause: the motor holds another firmware's current-loop gains. The set goes
+with the firmware version (X6-P20: 0.5 / 0.05 up to 2026042402, 0.4 / 1e-4
+on 2026052501; see `history.md`), and the current loop runs under impedance
+too. Check: `axol motor.info` on the joint and on its twin (or the panel's
+motor readout) and compare `current_kp` / `current_ki` and the firmware
+version. Fix: update the checkout. A bring-up from disabled writes the
+firmware's own set and logs `firmware loop gains written to ROM`; a joint
+found holding is only logged, so disable or power-cycle the arm first. A
+motor whose model or firmware is not in the table is left alone: hand off.
+Do not copy one robot's gains onto another: they differ by firmware.
+
 **Joints sag for a moment when a tuning tool starts.**
 Expected: the motors reset (~2.5 s, no torque, no brakes) before the holds
 engage. Start with the arms hanging at rest; an arm raised at start-up will
