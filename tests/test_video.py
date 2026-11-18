@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from almond_axol.video import gst_zed
+from almond_axol.video import gst_zed, hw_video
 from almond_axol.video.gst_zed import _split_nals
 from almond_axol.video.hw_video import (
     _bitrate_for,
@@ -43,6 +43,40 @@ def test_gstreamer_command_is_shell_free_and_dimensioned() -> None:
     assert "height=480" in argv
     assert "bitrate=5000000" in argv
     assert "!" in argv
+
+
+@pytest.fixture
+def nvenc_props(monkeypatch: pytest.MonkeyPatch):
+    """Pretend ``gst-inspect-1.0 nvv4l2h264enc`` printed the given text."""
+
+    def set_inspect(text: str | None) -> None:
+        monkeypatch.setattr(hw_video, "_inspect_nvenc", lambda: text)
+        hw_video.nvenc_maxperf_prop.cache_clear()
+
+    yield set_inspect
+    hw_video.nvenc_maxperf_prop.cache_clear()
+
+
+def test_orin_encoder_gets_maxperf(nvenc_props) -> None:
+    nvenc_props("  maxperf-enable      : Enable or Disable Max Performance mode")
+    assert "maxperf-enable=true" in _gst_argv(640, 480, 30, 5_000_000)
+    assert "maxperf-enable=true" in gst_zed._enc_branch(4_000_000, 30)
+    assert "maxperf-enable=true" in gst_zed._dataset_enc_shmsink(
+        "/tmp/d.sock", 960, 600, 60, "data"
+    )
+
+
+def test_thor_encoder_omits_maxperf(nvenc_props) -> None:
+    # Thor's nvv4l2h264enc has no maxperf-enable; gst rejects the whole
+    # pipeline over an unknown property, so it must not appear at all.
+    nvenc_props("  bitrate             : Set bitrate for v4l2 encode\n  gpu-id : ...")
+    argv = _gst_argv(640, 480, 30, 5_000_000)
+    assert not any("maxperf" in a for a in argv)
+    assert "" not in argv
+    assert "maxperf" not in gst_zed._enc_branch(4_000_000, 30)
+    assert "maxperf" not in gst_zed._dataset_enc_shmsink(
+        "/tmp/d.sock", 960, 600, 60, "data"
+    )
 
 
 def test_annex_b_nal_helpers_handle_three_and_four_byte_prefixes() -> None:

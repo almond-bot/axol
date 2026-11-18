@@ -140,7 +140,7 @@ def _gst_argv(width: int, height: int, fps: int, bitrate: int) -> list[str]:
         (
             f"nvv4l2h264enc control-rate=1 bitrate={bitrate} preset-level=1 "
             f"insert-sps-pps=true insert-aud=true idrinterval={fps} "
-            "maxperf-enable=true"
+            f"{nvenc_maxperf_prop()}"
         ),
         "video/x-h264,stream-format=byte-stream",
         "fdsink fd=1 sync=false",
@@ -152,29 +152,47 @@ def _gst_argv(width: int, height: int, fps: int, bitrate: int) -> list[str]:
 
 
 @functools.cache
-def hw_h264_available() -> bool:
-    """True when GStreamer's ``nvv4l2h264enc`` element is installed."""
+def _inspect_nvenc() -> str | None:
+    """``gst-inspect-1.0 nvv4l2h264enc`` output, or ``None`` when unavailable."""
     inspect = shutil.which("gst-inspect-1.0")
     if not inspect or not shutil.which("gst-launch-1.0"):
-        return False
+        return None
     try:
         # A full inspect, not `--exists`: nvvideo4linux2 registers its
         # elements by probing the V4L2 device when the plugin loads, so the
         # registry-cache-only `--exists` check misses them on some JetPacks.
-        ok = (
-            subprocess.run(
-                [inspect, "nvv4l2h264enc"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            ).returncode
-            == 0
+        result = subprocess.run(
+            [inspect, "nvv4l2h264enc"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            errors="replace",  # odd bytes must not cost the hardware path
+            timeout=10,
         )
     except Exception:  # noqa: BLE001 - inspection failure → no hardware path
-        return False
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+@functools.cache
+def hw_h264_available() -> bool:
+    """True when GStreamer's ``nvv4l2h264enc`` element is installed."""
+    ok = _inspect_nvenc() is not None
     if ok:
         _logger.info("Jetson hardware H.264 encoder (nvv4l2h264enc) available")
     return ok
+
+
+@functools.cache
+def nvenc_maxperf_prop() -> str:
+    """``maxperf-enable=true`` when the encoder has it, else ``""``.
+
+    Orin's ``nvv4l2h264enc`` (the msenc engine) exposes ``maxperf-enable``;
+    Thor's (JetPack 7, encoding on the GPU's NVENC) does not, and
+    ``gst-launch`` / ``Gst.parse_launch`` reject the whole pipeline over an
+    unknown property — which silently dropped Thor to software x264.
+    """
+    return "maxperf-enable=true" if "maxperf-enable" in (_inspect_nvenc() or "") else ""
 
 
 class _GstH264Pipeline:

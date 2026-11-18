@@ -57,7 +57,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ..video.hw_video import dataset_vbr_bitrate, hw_h264_available
+from ..video.hw_video import (
+    dataset_vbr_bitrate,
+    hw_h264_available,
+    nvenc_maxperf_prop,
+)
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -163,7 +167,7 @@ def _gst_argv(
             # preset-level=1 is the fast NVENC preset; idrinterval keeps a ~1 s
             # keyframe cadence.
             f"nvv4l2h264enc control-rate=0 bitrate={target} peak-bitrate={peak} "
-            f"preset-level=1 insert-sps-pps=true idrinterval={fps} maxperf-enable=true"
+            f"preset-level=1 insert-sps-pps=true idrinterval={fps} {nvenc_maxperf_prop()}"
         ),
         "h264parse",
         # trak-timescale a multiple of fps so each sample duration is an exact
