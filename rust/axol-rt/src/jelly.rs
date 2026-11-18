@@ -16,12 +16,25 @@
 //! - While the Python target is fresh (`Config::timeout`) every tick sends
 //!   one frame per wheel — velocity, or the parked MIT hold — which is what
 //!   keeps the alarm fed.
-//! - When the target goes stale while *driving*, the wheels get one
-//!   zero-velocity frame and then **silence**: no keepalive, no re-send of
-//!   the stale command. The alarm trips and the wheels torque off. Once that
-//!   has certainly happened (`can_timeout_ms` plus two ticks) and the wheels
+//! - When the target goes stale (`Config::timeout`) while *driving*, the
+//!   loop stops the base itself: it ramps the command to zero at
+//!   `Config::stop_slew`, never replaying the stale command, and parks the
+//!   wheels into the hold as soon as they are slow. The wheels stay enabled
+//!   and every tick still sends one frame per wheel, so a short headset or
+//!   Wi-Fi gap costs a stop, not a torque-off. A fresh target inside
+//!   `Config::link_timeout` resumes from there with the normal slew.
+//! - Only once the target has been stale for `Config::link_timeout` is the
+//!   link treated as lost. Wheels that are still not parked then (parking
+//!   off or failed) get one zero-velocity frame and then **silence**: no
+//!   keepalive. The alarm trips and the wheels torque off. Once that has
+//!   certainly happened (`can_timeout_ms` plus two ticks) and the wheels
 //!   have stopped rolling they are re-enabled straight into the park hold
 //!   (IMPEDANCE mode set *before* enable, so no velocity target can replay).
+//! - Nothing here keeps the alarm fed except this loop's own ticks. If the
+//!   Python side stops sending targets, the target ages out exactly as for a
+//!   headset gap. If the Python side's socket closes, this service disables
+//!   the wheels and exits. If this process dies or wedges, no frame reaches
+//!   the wheels and the alarm torques them off within `can_timeout_ms`.
 //! - A stationary hold is not a runaway risk, so a parked Jelly keeps its
 //!   hold with or without a source — the hold frames are the one thing
 //!   streamed unlinked, and they carry no velocity.
@@ -131,8 +144,16 @@ struct Config {
     /// Damping of both holds (Nm·s/rad); 0 disables parking.
     hold_kd: f64,
     frequency: f64,
+    /// Seconds a target stays fresh. Past it, a driving base ramps to a stop
+    /// and parks with the wheels still enabled.
     timeout: f64,
     can_timeout_ms: f64,
+    /// Ramp (normalized command per second) used to stop on a stale target.
+    stop_slew: f64,
+    /// Seconds without a fresh target before the link counts as lost and
+    /// wheels that are not parked go quiet (the CAN alarm torques them off).
+    /// Equal to `timeout` skips the ramp-and-hold stop.
+    link_timeout: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -188,10 +209,10 @@ fn f64_at(data: &[u8], at: usize) -> io::Result<f64> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated Jelly message"))
 }
 fn parse_config(data: &[u8]) -> io::Result<Config> {
-    if data.len() != 88 {
+    if data.len() != 104 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Jelly config must contain 11 f64 values",
+            "Jelly config must contain 13 f64 values",
         ));
     }
     let c = Config {
@@ -206,6 +227,8 @@ fn parse_config(data: &[u8]) -> io::Result<Config> {
         frequency: f64_at(data, 64)?,
         timeout: f64_at(data, 72)?,
         can_timeout_ms: f64_at(data, 80)?,
+        stop_slew: f64_at(data, 88)?,
+        link_timeout: f64_at(data, 96)?,
     };
     if !(1.0..=500.0).contains(&c.frequency)
         || !(c.timeout.is_finite() && c.timeout > 0.0)
@@ -217,6 +240,21 @@ fn parse_config(data: &[u8]) -> io::Result<Config> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid Jelly config values",
+        ));
+    }
+    if !(c.stop_slew.is_finite() && c.stop_slew > 0.0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Jelly stop_slew must be a positive number",
+        ));
+    }
+    if !(c.link_timeout.is_finite() && c.link_timeout >= c.timeout) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Jelly link_timeout ({} s) must be a number at least command_timeout ({} s)",
+                c.link_timeout, c.timeout
+            ),
         ));
     }
     // The motor-side timeout is the safety layer; refuse a config that
@@ -898,6 +936,57 @@ fn recover_wheels(
     Ok((healthy, touched))
 }
 
+/// What the loop does with the command source this tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    /// Fresh target: drive it.
+    Live,
+    /// Stale target inside `link_timeout` on a base that was driving (or is
+    /// already stopping): ramp to zero at `stop_slew` and park, wheels on.
+    Stopping,
+    /// No target, or the link is lost: motion is off; only a park hold
+    /// streams (see the module docs).
+    Lost,
+}
+
+/// Decide the tick's [`Phase`] from the target's age (seconds, `None` before
+/// the first target) and the previous tick's state. `parked` is whether a
+/// park hold is active; `tripped` whether any wheel has dropped out of
+/// enable. A base parked when its target goes stale keeps its hold in
+/// `Lost`, and a tripped wheel ends a stop early so the lost path can
+/// re-anchor it.
+fn link_phase(
+    target_age: Option<f64>,
+    linked: bool,
+    stopping: bool,
+    parked: bool,
+    tripped: bool,
+    cfg: &Config,
+) -> Phase {
+    match target_age {
+        Some(age) if age <= cfg.timeout => Phase::Live,
+        Some(age) if age <= cfg.link_timeout && (stopping || (linked && !parked)) && !tripped => {
+            Phase::Stopping
+        }
+        _ => Phase::Lost,
+    }
+}
+
+/// Move `cmd` toward `target` by at most `max_delta` (one vector limit across
+/// translation and rotation together).
+fn slew_toward(cmd: &mut [f64; 3], target: [f64; 3], max_delta: f64) {
+    let delta = [target[0] - cmd[0], target[1] - cmd[1], target[2] - cmd[2]];
+    let norm = delta.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let k = if norm > max_delta && norm > 0.0 {
+        max_delta / norm
+    } else {
+        1.0
+    };
+    for i in 0..3 {
+        cmd[i] += delta[i] * k;
+    }
+}
+
 fn control_loop(
     iface: &str,
     cfg: Config,
@@ -996,6 +1085,8 @@ fn control_loop(
 
     // Source-link state (see the module docs).
     let mut linked = false; // the target was fresh on the previous tick
+    let mut stopping = false; // stale while driving: stopping, wheels on (`Phase::Stopping`)
+    let mut stop_since = Instant::now();
     let mut wheels_ok = true; // every wheel enabled and healthy
     let mut last_faults: Vec<String> = Vec::new();
     let mut next_recover = Instant::now();
@@ -1047,36 +1138,69 @@ fn control_loop(
             let now = Instant::now();
             next += period;
             let input = *inputs.lock().unwrap();
+            let target_age = input.target.map(|t| now.duration_since(t.at).as_secs_f64());
             let fresh_target = input
                 .target
-                .filter(|t| now.duration_since(t.at).as_secs_f64() <= cfg.timeout);
+                .filter(|_| target_age.is_some_and(|age| age <= cfg.timeout));
+            let phase = link_phase(
+                target_age,
+                linked,
+                stopping,
+                hold.is_some(),
+                wheels.any_tripped(),
+                &cfg,
+            );
 
             let mut speeds = [0.0; 4];
             let mut yaw_corr = 0.0;
             let mut sent = false;
             let mut poll_failed = false;
             let send_result: io::Result<()> = (|| {
-                if fresh_target.is_none() {
+                if phase == Phase::Lost {
                     // ---- no live source: motion is off; only the hold streams
-                    if linked {
+                    if linked || stopping {
+                        let was_stopping = stopping;
                         linked = false;
+                        stopping = false;
                         if hold.is_none() {
-                            // Driving: one stop, then silence. From here the
+                            // Not parked: one stop, then silence. From here the
                             // CAN timeout is what stops the wheels — never a
                             // re-sent stale command.
-                            eprintln!(
-                                "{iface}: Jelly command source silent for {:.0} ms while \
-                                 driving — stopping and going quiet on CAN (wheels torque \
-                                 off after {:.0} ms, then re-anchor)",
-                                cfg.timeout * 1e3,
-                                cfg.can_timeout_ms
-                            );
+                            if was_stopping && wheels.any_tripped() {
+                                eprintln!(
+                                    "{iface}: Jelly wheel dropped out of enable while stopping \
+                                     for a silent command source — link lost, wheels off; \
+                                     going quiet on CAN, then re-anchor"
+                                );
+                            } else if was_stopping {
+                                eprintln!(
+                                    "{iface}: Jelly command source still silent after {:.0} ms \
+                                     — link lost, wheels not parked; going quiet on CAN \
+                                     (wheels torque off after {:.0} ms, then re-anchor)",
+                                    cfg.link_timeout * 1e3,
+                                    cfg.can_timeout_ms
+                                );
+                            } else {
+                                eprintln!(
+                                    "{iface}: Jelly command source silent for {:.0} ms while \
+                                     driving — link lost, going quiet on CAN (wheels torque \
+                                     off after {:.0} ms, then re-anchor)",
+                                    cfg.timeout * 1e3,
+                                    cfg.can_timeout_ms
+                                );
+                            }
                             send_all(velocity_frames(&[0.0; 4]), &mut enobufs)?;
                             sent = true;
                             silent_since = now;
                             next_park = now + trip_settle;
                             wheels_ok = false; // the silence is about to trip them
                             next_recover = now;
+                        } else if was_stopping {
+                            eprintln!(
+                                "{iface}: Jelly command source still silent after {:.0} ms \
+                                 — link lost; the base is stopped, keeping the park hold",
+                                cfg.link_timeout * 1e3
+                            );
                         } else {
                             eprintln!(
                                 "{iface}: Jelly command source silent for {:.0} ms while \
@@ -1142,17 +1266,53 @@ fn control_loop(
                     return Ok(());
                 }
 
-                // ---- live source
-                let mut target = fresh_target.unwrap();
-                if !linked {
-                    linked = true;
-                    eprintln!("{iface}: Jelly command source live — resuming control");
-                }
+                // ---- live source, or stopping on a stale one
+                let (mut target, slew) = match fresh_target {
+                    Some(t) => {
+                        if stopping {
+                            stopping = false;
+                            linked = true;
+                            eprintln!(
+                                "{iface}: Jelly command source live again after a {:.0} ms \
+                                 gap — resuming control from the stop",
+                                now.duration_since(stop_since).as_secs_f64() * 1e3
+                                    + cfg.timeout * 1e3
+                            );
+                        } else if !linked {
+                            linked = true;
+                            eprintln!("{iface}: Jelly command source live — resuming control");
+                        }
+                        (t, cfg.slew)
+                    }
+                    None => {
+                        if !stopping {
+                            stopping = true;
+                            linked = false;
+                            stop_since = now;
+                            eprintln!(
+                                "{iface}: Jelly command source silent for {:.0} ms while \
+                                 driving — ramping to a stop and holding, wheels stay on \
+                                 (link counts as lost after {:.0} ms)",
+                                cfg.timeout * 1e3,
+                                cfg.link_timeout * 1e3
+                            );
+                        }
+                        // Never the stale command: ramp to zero.
+                        let zero = Target {
+                            vx: 0.0,
+                            vy: 0.0,
+                            wz: 0.0,
+                            at: now,
+                        };
+                        (zero, cfg.stop_slew)
+                    }
+                };
                 // A wheel the CAN timeout tripped (a source outage, or a stall
                 // of this very loop) reports LOST_COMM on the feedback it echoes
                 // for each command; re-enable it before commanding it, and ramp
-                // from rest since it has stopped.
-                if wheels_ok && wheels.any_tripped() {
+                // from rest since it has stopped. Only for a live source: a
+                // stopping base never re-enables wheels.
+                if fresh_target.is_some() && wheels_ok && wheels.any_tripped() {
                     wheels_ok = false;
                     next_recover = now;
                     eprintln!(
@@ -1160,7 +1320,7 @@ fn control_loop(
                          or torque-off) — re-enabling"
                     );
                 }
-                if !wheels_ok && now >= next_recover {
+                if fresh_target.is_some() && !wheels_ok && now >= next_recover {
                     next_recover = now + WHEEL_RECOVER_MIN;
                     let (healthy, reenabled) =
                         match recover_wheels(&sock, iface, &mut wheels, &mut last_faults) {
@@ -1189,17 +1349,11 @@ fn control_loop(
                 }
 
                 (target.vx, target.vy) = snap(target.vx, target.vy, cfg.axis_snap_deg);
-                let delta = [target.vx - cmd[0], target.vy - cmd[1], target.wz - cmd[2]];
-                let norm = delta.iter().map(|v| v * v).sum::<f64>().sqrt();
-                let max_delta = cfg.slew * period.as_secs_f64();
-                let k = if norm > max_delta && norm > 0.0 {
-                    max_delta / norm
-                } else {
-                    1.0
-                };
-                for i in 0..3 {
-                    cmd[i] += delta[i] * k;
-                }
+                slew_toward(
+                    &mut cmd,
+                    [target.vx, target.vy, target.wz],
+                    slew * period.as_secs_f64(),
+                );
                 let moving = cmd.iter().any(|v| v.abs() >= 1e-3);
                 let driving = moving
                     || [target.vx, target.vy, target.wz]
@@ -1397,16 +1551,20 @@ mod tests {
             frequency: 50.0,
             timeout: 0.3,
             can_timeout_ms: 200.0,
+            stop_slew: 4.0,
+            link_timeout: 1.0,
         };
         assert_eq!(mix(1.0, 0.0, 0.0, c), [20.0, -20.0, 20.0, -20.0]);
     }
 
-    /// Mirrors `struct.pack("<11d", ...)` in `almond_axol/robot/jelly.py`.
-    fn wire(values: [f64; 11]) -> Vec<u8> {
+    /// Mirrors `struct.pack("<13d", ...)` in `almond_axol/robot/jelly.py`.
+    fn wire(values: [f64; 13]) -> Vec<u8> {
         values.into_iter().flat_map(f64::to_le_bytes).collect()
     }
 
-    const PY_CONFIG: [f64; 11] = [20.0, 1.0, 0.5, 15.0, 2.0, 0.3, 60.0, 1.5, 50.0, 0.2, 200.0];
+    const PY_CONFIG: [f64; 13] = [
+        20.0, 1.0, 0.5, 15.0, 2.0, 0.3, 60.0, 1.5, 50.0, 0.2, 200.0, 4.0, 1.0,
+    ];
 
     #[test]
     fn python_config_layout_roundtrips() {
@@ -1415,18 +1573,113 @@ mod tests {
         assert_eq!(cfg.hold_kp, 60.0);
         assert_eq!(cfg.timeout, 0.2);
         assert_eq!(cfg.can_timeout_ms, 200.0);
+        assert_eq!(cfg.stop_slew, 4.0);
+        assert_eq!(cfg.link_timeout, 1.0);
     }
 
     #[test]
-    fn old_ten_value_config_is_rejected() {
+    fn older_config_layouts_are_rejected() {
         // A Python side that predates the CAN-timeout field must not be able
-        // to start the core with an implicit (zero = disabled) alarm.
-        let old: Vec<u8> = PY_CONFIG[..10]
-            .iter()
-            .copied()
-            .flat_map(f64::to_le_bytes)
-            .collect();
-        assert!(parse_config(&old).is_err());
+        // to start the core with an implicit (zero = disabled) alarm, nor one
+        // that predates the stop ramp with an implicit (zero) link timeout.
+        for n in [10, 11, 12] {
+            let old: Vec<u8> = PY_CONFIG[..n]
+                .iter()
+                .copied()
+                .flat_map(f64::to_le_bytes)
+                .collect();
+            assert!(parse_config(&old).is_err(), "{n} values");
+        }
+    }
+
+    #[test]
+    fn stop_slew_must_be_positive() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut values = PY_CONFIG;
+            values[11] = bad;
+            let err = parse_config(&wire(values)).unwrap_err();
+            assert!(err.to_string().contains("stop_slew"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn link_timeout_must_be_at_least_the_command_timeout() {
+        for bad in [0.1, f64::NAN, f64::INFINITY] {
+            let mut values = PY_CONFIG;
+            values[12] = bad;
+            let err = parse_config(&wire(values)).unwrap_err();
+            assert!(err.to_string().contains("link_timeout"), "{bad}: {err}");
+        }
+        // Equal turns the ramp-and-hold stop off.
+        let mut values = PY_CONFIG;
+        values[12] = values[9];
+        assert!(parse_config(&wire(values)).is_ok());
+    }
+
+    #[test]
+    fn a_stale_target_while_driving_stops_and_holds_until_the_link_timeout() {
+        let cfg = test_config(); // timeout 0.2 s, link_timeout 1.0 s
+        let phase = |age: Option<f64>, linked, stopping, parked, tripped| {
+            link_phase(age, linked, stopping, parked, tripped, &cfg)
+        };
+        // Fresh is live whatever came before.
+        assert_eq!(phase(Some(0.0), false, false, false, false), Phase::Live);
+        assert_eq!(phase(Some(0.2), false, true, true, false), Phase::Live);
+        // Driving when it went stale: stop and hold, wheels on.
+        assert_eq!(
+            phase(Some(0.25), true, false, false, false),
+            Phase::Stopping
+        );
+        // Already stopping: stays stopping, parked or not, up to the link timeout.
+        assert_eq!(phase(Some(0.6), false, true, false, false), Phase::Stopping);
+        assert_eq!(phase(Some(1.0), false, true, true, false), Phase::Stopping);
+        // Past the link timeout the link is lost.
+        assert_eq!(phase(Some(1.01), false, true, false, false), Phase::Lost);
+        assert_eq!(phase(Some(1.01), false, true, true, false), Phase::Lost);
+        // Parked when it went stale: keep the hold on the lost path, as before.
+        assert_eq!(phase(Some(0.25), true, false, true, false), Phase::Lost);
+        // A wheel that dropped out of enable ends the stop so it can re-anchor.
+        assert_eq!(phase(Some(0.25), true, false, false, true), Phase::Lost);
+        assert_eq!(phase(Some(0.5), false, true, false, true), Phase::Lost);
+        // No source yet, or a source already lost, never starts a stop.
+        assert_eq!(phase(None, false, false, false, false), Phase::Lost);
+        assert_eq!(phase(Some(0.5), false, false, false, false), Phase::Lost);
+    }
+
+    #[test]
+    fn link_timeout_equal_to_command_timeout_skips_the_stop() {
+        let mut values = PY_CONFIG;
+        values[12] = values[9];
+        let cfg = parse_config(&wire(values)).unwrap();
+        assert_eq!(
+            link_phase(Some(0.21), true, false, false, false, &cfg),
+            Phase::Lost
+        );
+    }
+
+    #[test]
+    fn stop_ramp_reaches_zero_from_full_speed_in_a_quarter_second() {
+        let cfg = test_config();
+        let dt = 1.0 / cfg.frequency;
+        let mut cmd: [f64; 3] = [0.6, -0.8, 0.0]; // full deflection, diagonal
+        let mut ticks = 0;
+        while cmd.iter().any(|v| v.abs() > 1e-9) {
+            let before = cmd;
+            slew_toward(&mut cmd, [0.0; 3], cfg.stop_slew * dt);
+            ticks += 1;
+            // Never overshoots or reverses: each axis shrinks toward zero.
+            for i in 0..3 {
+                assert!(cmd[i].abs() <= before[i].abs() + 1e-12);
+                assert!(cmd[i] * before[i] >= -1e-12);
+            }
+            assert!(ticks <= 100, "ramp never settled");
+        }
+        // 1.0 at 4.0/s and 50 Hz: 12.5 ticks, so 13.
+        assert_eq!(ticks, 13);
+        // The normal ramp would take 4 s.
+        let mut slow: [f64; 3] = [0.6, -0.8, 0.0];
+        slew_toward(&mut slow, [0.0; 3], 0.25 * dt);
+        assert!((slow[0].hypot(slow[1]) - (1.0 - 0.25 * dt)).abs() < 1e-12);
     }
 
     #[test]

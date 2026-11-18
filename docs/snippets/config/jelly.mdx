@@ -19,7 +19,9 @@ Jelly is detected from the CAN devices present, so you never enable it by hand.
 | <F>--{prefix}hold_kp</F> | `60.0` | Stiffness (Nm/rad) holding parked wheels in place. `0` only brakes them. |
 | <F>--{prefix}hold_kd</F> | `1.5` | How strongly parked wheels resist rolling (Nm·s/rad), up to `5`. `0` leaves them idle. |
 | <F>--{prefix}frequency</F> | `50.0` | Wheel command rate (Hz). |
-| <F>--{prefix}command_timeout</F> | `0.2` | Seconds without a stick command before Jelly stops. |
+| <F>--{prefix}command_timeout</F> | `0.2` | Seconds without a stick command before Jelly stops. A moving Jelly ramps to a stop and holds with its wheels on. |
+| <F>--{prefix}stop_slew</F> | `4.0` | Stopping ramp when commands stop arriving. The default stops from full speed in 0.25 s. |
+| <F>--{prefix}link_timeout</F> | `1.0` | Seconds without a command before the headset link counts as lost. Wheels that aren't parked by then turn off. Set it equal to `command_timeout` to turn the wheels off at the first gap. |
 | <F>--{prefix}can_timeout_ms</F> | `200.0` | Motor-side loss-of-comms timeout (ms). Stops the wheels even if the host hangs. |
 | <F>--{prefix}lift</F> | `true` | Run the lift when its CAN bus is attached (right thumbstick, forward and back). `false` leaves an attached lift off. |
 | <F>--{prefix}lift_channel</F> | `null` (auto) | CAN interface of the lift controller. `null` uses the chest bus `can_alm_axol_c` if it exists, otherwise the wheel bus `can_alm_axol_b`. |
