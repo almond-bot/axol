@@ -13,6 +13,8 @@ The tool streams a sine or a constant-speed triangle to the joint with the firmw
 - the speed cap (`--cap`)
 - the position planner's acceleration (`--accel`)
 
+Bring-up sets each MyActuator motor's current-loop gains back to the values its firmware ships with. A `current_kp` or `current_ki` you save with `--persist` lasts until the arm next starts from disabled.
+
 ## Planner acceleration
 
 Use one of two values for `--accel`. Try both and compare.

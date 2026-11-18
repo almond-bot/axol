@@ -47,6 +47,7 @@ from ..utils.can_channels import require_distinct_axol_channels, require_mantis_
 from ..utils.certs import ACCEPT_PAGE_HTML
 from ..utils.state_files import mark_privileged_service
 from ..utils.sudo import prime_sudo
+from .bundle_upload import BundleStore, UploadError
 from .commands import (
     COMMANDS,
     NoSuggestionProvider,
@@ -69,7 +70,6 @@ from .runner import OperationRunner, prove_motors_torque_free
 from .safety_link import SafetyLink
 from .settings import SettingsStore, advanced_schema, settings_schema
 from .telemetry import DiagnosticsRunStore, TelemetryHub
-from .bundle_upload import BundleStore, UploadError
 from .update import SelfUpdater
 
 _logger = logging.getLogger(__name__)
