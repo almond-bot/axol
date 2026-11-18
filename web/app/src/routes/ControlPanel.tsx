@@ -58,6 +58,7 @@ import {
   setServerBase,
   startOperation,
   startUpdate,
+  startBundleUpdate,
   stopOperation,
   stopOperationOrAsk,
   usbConnect,
@@ -272,6 +273,8 @@ export default function ControlPanel() {
   // The channel this browser asked to switch to, until the host's status
   // reports the switch itself (`update.target`).
   const [pendingSwitch, setPendingSwitch] = useState<UpdateChannel | null>(null)
+  // The version an Install from file started, until the server reports it.
+  const [pendingBundle, setPendingBundle] = useState<string | null>(null)
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [simRobotChoice, setSimRobotChoice] = useState<SimRobot | null>(loadSimRobot)
@@ -507,6 +510,7 @@ export default function ControlPanel() {
       setUpdateAbandoned(false)
       setUpdatePhase(null)
       setPendingSwitch(null)
+      setPendingBundle(null)
       setRobot(null)
       setRobotBusy(false)
       setCanProfiles(null)
@@ -901,6 +905,7 @@ export default function ControlPanel() {
     setUpdateAbandoned(false)
     setUpdatePhase(null)
     setPendingSwitch(null)
+    setPendingBundle(null)
     setRobotBusy(false)
     robotStatusKnownRef.current = false
     canInventoryKnownRef.current = false
@@ -2096,15 +2101,25 @@ export default function ControlPanel() {
   // hard-reloads once the backend is back on the new release.
   //
   // With `channel`, switch the host to the latest release or to main instead.
-  async function handleUpdate(channel?: UpdateChannel) {
-    if (!channel && !update?.updateAvailable) return
+  // Install from file polls the host while it checks an upload; drop an answer
+  // that arrives after the panel moved to another host.
+  const applyUpdateStatus = useCallback(
+    (status: UpdateStatus) => {
+      if (connectionGeneration === connectionGenerationRef.current) setUpdate(status)
+    },
+    [connectionGeneration]
+  )
+
+  async function handleUpdate(channel?: UpdateChannel, fromFile = false) {
+    if (!fromFile && !channel && !update?.updateAvailable) return
     const generation = connectionGenerationRef.current
     setUpdateAbandoned(false)
     setStartingUpdate(true)
     setUpdatePhase("upgrading")
     setPendingSwitch(channel ?? null)
+    setPendingBundle(fromFile ? (update?.bundle?.version ?? null) : null)
     try {
-      await startUpdate(channel)
+      await (fromFile ? startBundleUpdate() : startUpdate(channel))
       if (generation !== connectionGenerationRef.current) return
     } catch (e) {
       if (generation !== connectionGenerationRef.current) return
@@ -2112,6 +2127,7 @@ export default function ControlPanel() {
       setStartingUpdate(false)
       setUpdatePhase(null)
       setPendingSwitch(null)
+      setPendingBundle(null)
       return
     }
     // Pull the now-"updating" status so `updating` derives true and the watcher
@@ -2202,7 +2218,12 @@ export default function ControlPanel() {
 
   // The channel a running switch installs, so the banner shows it like a
   // release update. Null for an update within the installed channel.
-  const switchTarget = updating ? (update?.target ?? pendingSwitch) : null
+  const fromFileVersion = updating
+    ? update?.source === "bundle"
+      ? (update.targetVersion ?? pendingBundle)
+      : pendingBundle
+    : null
+  const switchTarget = updating && !fromFileVersion ? (update?.target ?? pendingSwitch) : null
   const switchTo = switchTarget !== (update?.channel ?? "release") ? switchTarget : null
 
   // Alerts that apply wherever the operator is: an update, a version skew, a
@@ -2211,10 +2232,11 @@ export default function ControlPanel() {
   // in the header pill, and on the pages that need it.
   const notices = (
     <>
-      {update && (update.updateAvailable || switchTo) && (
+      {update && (update.updateAvailable || switchTo || fromFileVersion) && (
         <UpdateBanner
           update={update}
           switchTo={switchTo}
+          fromFileVersion={fromFileVersion}
           updating={updating}
           phase={updatePhase}
           blocked={hostBusy}
@@ -2592,6 +2614,8 @@ export default function ControlPanel() {
               update={update}
               updating={updating}
               onSwitchChannel={(channel) => void handleUpdate(channel)}
+              onInstallBundle={() => void handleUpdate(undefined, true)}
+              onUpdateStatus={applyUpdateStatus}
               onOpenSetup={() => setSetupOpen(true)}
               onHostDisconnect={hostDisconnectClick}
               opRunning={hostBusy}

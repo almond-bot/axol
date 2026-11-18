@@ -188,6 +188,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiortc" },
     { name = "almond-pyroki" },
+    { name = "cryptography" },
     { name = "daqp" },
     { name = "draccus" },
     { name = "fastapi" },
@@ -239,6 +240,7 @@ dev = [
 requires-dist = [
     { name = "aiortc", specifier = ">=1.14.0,<1.15" },
     { name = "almond-pyroki", specifier = ">=0.1.1,<0.2" },
+    { name = "cryptography", specifier = ">=42" },
     { name = "daqp", specifier = "==0.8.7" },
     { name = "datasets", marker = "extra == 'lerobot'", specifier = ">=4.8,<5" },
     { name = "draccus", specifier = ">=0.11.6,<0.12" },

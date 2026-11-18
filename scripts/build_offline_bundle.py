@@ -42,6 +42,9 @@ UI_MARKER = "almond_axol/serve/ui/index.html"
 # the host. The release's offline smoke test builds PyGObject from exactly
 # this set with the network off, so a missing backend fails the release.
 PYGOBJECT_BUILD_BACKENDS = ("meson-python", "meson", "ninja", "patchelf")
+# The release workflow's secret: the base64 ed25519 private key that signs
+# manifest.json (see scripts/bundle_signing_key.py).
+SIGNING_KEY_ENV = "AXOL_BUNDLE_SIGNING_KEY"
 # The third-party repositories `axol provision` builds at a pinned commit:
 # (name used by offline_bundle.git_remote, module that pins it).
 PINNED_SOURCES = (
@@ -171,8 +174,15 @@ def write_metadata(
     python: str,
     extras: str,
     sources: dict[str, dict[str, str]],
+    signing_key: str | None,
+    trusted_keys: dict[str, str] | None = None,
 ) -> None:
-    """manifest.json, bundle.env and SHA256SUMS over everything staged."""
+    """manifest.json, manifest.sig, bundle.env and SHA256SUMS over everything staged.
+
+    ``signing_key`` is the base64 ed25519 private key; ``None`` builds an
+    unsigned bundle (installable over SSH only). A signature must verify
+    against ``trusted_keys`` (default: this release's own trusted keys).
+    """
     (stage / ob.BUNDLE_ENV).write_text(
         "".join(
             f"{key}={value}\n"
@@ -205,8 +215,16 @@ def write_metadata(
     # Validate with the reader the robot runs, so a malformed manifest fails
     # the release instead of an install.
     ob.parse_manifest(stage, manifest)
-    (stage / ob.MANIFEST).write_text(json.dumps(manifest, indent=2) + "\n")
+    manifest_bytes = (json.dumps(manifest, indent=2) + "\n").encode()
+    (stage / ob.MANIFEST).write_bytes(manifest_bytes)
     sums = {**files, ob.MANIFEST: ob.sha256_file(stage / ob.MANIFEST)}
+    if signing_key is not None:
+        signature = ob.sign_manifest(manifest_bytes, signing_key)
+        # A key the robots don't trust would make every upload fail; catch it
+        # here instead.
+        ob.verify_signature(manifest_bytes, signature, trusted_keys)
+        (stage / ob.SIGNATURE).write_bytes(signature)
+        sums[ob.SIGNATURE] = ob.sha256_file(stage / ob.SIGNATURE)
     (stage / ob.SHA256SUMS).write_text(
         "".join(f"{digest}  {path}\n" for path, digest in sorted(sums.items()))
     )
@@ -246,7 +264,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--rt-binary", type=Path, required=True)
     parser.add_argument("--uv", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--unsigned",
+        action="store_true",
+        help=f"build without {SIGNING_KEY_ENV} (the control panel refuses it)",
+    )
     args = parser.parse_args(argv)
+    signing_key = os.environ.get(SIGNING_KEY_ENV, "").strip() or None
+    if signing_key is None and not args.unsigned:
+        raise SystemExit(
+            f"{SIGNING_KEY_ENV} is not set; the control panel only installs "
+            "signed bundles (pass --unsigned for a local test build)"
+        )
 
     extras = module_constant("almond_axol/serve/update.py", "_EXTRAS")
     python = module_constant("almond_axol/serve/update.py", "_PYTHON_VERSION")
@@ -296,6 +325,7 @@ def main(argv: list[str] | None = None) -> None:
         python=python,
         extras=extras,
         sources=sources,
+        signing_key=signing_key,
     )
     mtime = int(os.environ.get("SOURCE_DATE_EPOCH", "0") or 0)
     tar_path = args.out / f"{name}.tar"

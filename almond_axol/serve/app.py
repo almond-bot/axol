@@ -69,6 +69,7 @@ from .runner import OperationRunner, prove_motors_torque_free
 from .safety_link import SafetyLink
 from .settings import SettingsStore, advanced_schema, settings_schema
 from .telemetry import DiagnosticsRunStore, TelemetryHub
+from .bundle_upload import BundleStore, UploadError
 from .update import SelfUpdater
 
 _logger = logging.getLogger(__name__)
@@ -196,6 +197,21 @@ class UpdateStartRequest(BaseModel):
     """
 
     channel: Literal["release", "main"] | None = None
+    # Install the uploaded offline bundle (Install from file) instead.
+    bundle: bool = False
+
+
+class BundleUploadRequest(BaseModel):
+    """Start (or resume) uploading an offline bundle of ``size`` bytes."""
+
+    name: str
+    size: int
+
+
+class BundleCheckRequest(BaseModel):
+    """Accept a bundle older than the installed version."""
+
+    allowOlder: bool = False
 
 
 class OpStopRequest(BaseModel):
@@ -1070,6 +1086,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # restarting the service. Nothing upgrades automatically. No-ops for
     # dev checkouts.
     updater = SelfUpdater(_is_idle)
+    # Offline bundles uploaded with Install from file (bundle_upload.py).
+    bundles = BundleStore(lambda: updater.version)
 
     def _discovery_running() -> bool:
         return can_discovery_task is not None and not can_discovery_task.done()
@@ -1427,19 +1445,106 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         load) so the result is current; the steady-state poll omits it and gets
         the cheap debounced/cached value.
         """
-        return await updater.status(force=refresh)
+        status = await updater.status(force=refresh)
+        status["bundle"] = bundles.status()
+        return status
 
     @app.post("/api/update/start")
     async def update_start(req: UpdateStartRequest | None = None) -> JSONResponse:
         """Apply a user-initiated upgrade; the server restarts onto new code.
 
         An empty body updates within the installed channel; ``channel``
-        switches between the latest release and main.
+        switches between the latest release and main; ``bundle`` installs the
+        uploaded offline bundle.
         """
-        started, reason = updater.start(req.channel if req is not None else None)
+        if req is not None and req.bundle:
+            bundle = bundles.ready_bundle()
+            if bundle is None:
+                return JSONResponse(
+                    {"error": "No checked file to install. Upload it again."},
+                    status_code=409,
+                )
+            started, reason = updater.start(
+                bundle=bundle, after_install=bundles.discard_installed
+            )
+        else:
+            started, reason = updater.start(req.channel if req is not None else None)
         if not started:
             return JSONResponse({"error": reason}, status_code=409)
         return JSONResponse({"started": True})
+
+    # -- offline bundle upload (Install from file) -----------------------------
+    #
+    # The panel uploads an offline bundle .tar in chunks (resumable), the host
+    # checks its Almond signature and extracts it, and /api/update/start with
+    # {"bundle": true} installs it. See serve/bundle_upload.py.
+
+    def _upload_error(exc: UploadError) -> JSONResponse:
+        body: dict[str, Any] = {"error": str(exc), "bundle": bundles.status()}
+        if exc.code:
+            body["code"] = exc.code
+        return JSONResponse(body, status_code=exc.status)
+
+    def _bundle_refusal() -> JSONResponse | None:
+        if not updater.enabled:
+            return JSONResponse(
+                {"error": "This Host Computer can't install updates from a file."},
+                status_code=409,
+            )
+        if updater.installing or updater.updating:
+            return JSONResponse(
+                {"error": "An update is installing. Wait for it to finish."},
+                status_code=409,
+            )
+        return None
+
+    @app.post("/api/update/bundle")
+    async def bundle_upload_begin(req: BundleUploadRequest) -> JSONResponse:
+        if (refusal := _bundle_refusal()) is not None:
+            return refusal
+        try:
+            return JSONResponse(await bundles.begin(req.name, req.size))
+        except UploadError as exc:
+            return _upload_error(exc)
+
+    @app.put("/api/update/bundle/{upload_id}", response_model=None)
+    async def bundle_upload_chunk(
+        upload_id: str, offset: int, request: Request
+    ) -> JSONResponse:
+        try:
+            return JSONResponse(
+                await bundles.append(upload_id, offset, request.stream())
+            )
+        except UploadError as exc:
+            return _upload_error(exc)
+
+    @app.post("/api/update/bundle/{upload_id}/check")
+    async def bundle_upload_check(
+        upload_id: str, req: BundleCheckRequest | None = None
+    ) -> JSONResponse:
+        allow_older = req.allowOlder if req is not None else False
+        try:
+            return JSONResponse(await bundles.finish(upload_id, allow_older))
+        except UploadError as exc:
+            return _upload_error(exc)
+
+    @app.post("/api/update/bundle/recheck")
+    async def bundle_recheck(req: BundleCheckRequest) -> JSONResponse:
+        if (refusal := _bundle_refusal()) is not None:
+            return refusal
+        try:
+            return JSONResponse(await bundles.recheck(req.allowOlder))
+        except UploadError as exc:
+            return _upload_error(exc)
+
+    @app.delete("/api/update/bundle")
+    async def bundle_discard() -> JSONResponse:
+        if (refusal := _bundle_refusal()) is not None:
+            return refusal
+        try:
+            return JSONResponse(await bundles.discard())
+        except UploadError as exc:
+            return _upload_error(exc)
 
     # -- host power ----------------------------------------------------------
 

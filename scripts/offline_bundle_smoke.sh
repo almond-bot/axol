@@ -47,10 +47,11 @@ assert update.installed_version() == sys.argv[1], update.installed_version()
 assert update.installed_from_index(), "find-links install wrote a direct_url.json"
 EOF
 
-step "Bundle manifest is valid for this host"
-AXOL_OFFLINE_BUNDLE="${BUNDLE}" "${TOOL_PY}" - <<'EOF'
+step "Bundle is signed with a trusted key and valid for this host"
+"${TOOL_PY}" - "${BUNDLE}" <<'EOF'
+import sys
 from almond_axol import offline_bundle
-bundle = offline_bundle.active()
+bundle = offline_bundle.load_signed(sys.argv[1])
 bundle.check_host()
 bundle.verify()
 EOF

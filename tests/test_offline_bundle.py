@@ -90,6 +90,7 @@ class _BundleCase(unittest.TestCase):
             python="3.13",
             extras="lerobot,sim",
             sources=sources or {},
+            signing_key=None,
         )
 
     def activate(self) -> ob.Bundle:

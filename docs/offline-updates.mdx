@@ -3,7 +3,7 @@ title: "Offline updates"
 description: "Update Axol from a downloaded file when the Host Computer has no internet access."
 ---
 
-Every Axol release has an offline bundle for Host Computers that have no internet access. Download the bundle on any computer, copy it to the Host Computer and install it there. The install doesn't use the network.
+Every Axol release has an offline bundle for Host Computers that have no internet access. Download the bundle on any computer, then install it from the control panel. The install doesn't use the network.
 
 <Note>
   The offline bundle updates an existing install. The Host Computer needs the [one-command install](/installation) once, with internet access.
@@ -13,13 +13,29 @@ Every Axol release has an offline bundle for Host Computers that have no interne
 
 1. On a computer with internet access, open the [Axol releases page](https://github.com/almond-bot/axol/releases).
 2. Under **Assets** for the release you want, download `axol-offline-v<version>-linux-aarch64.tar`. It is about 800 MB.
-3. To check the download, also get the matching `.tar.sha256` file and run `sha256sum -c` on it.
 
-The `linux-aarch64` bundle is for the Jetson Host Computers that Axol supports.
+The `linux-aarch64` bundle is for the Jetson Host Computers that Axol supports. Don't extract it.
 
-## Install the bundle
+## Install from the control panel
 
-1. Copy the bundle to the Host Computer. Use a USB drive, or `scp` from a computer on the same network:
+1. Bring the bundle to a computer on the robot's network, for example on a USB drive.
+2. Open the control panel at `https://<host-ip>:8001` and go to the **Host Computer** card.
+3. On the **Offline update** line, press **Install from file**, then **Choose file**, and pick the `.tar` file.
+4. Wait for the upload. If the connection drops, choose the same file again to continue where it stopped.
+5. The Host Computer checks the file. It installs only bundles signed by Almond, for this computer's platform.
+6. Stop any running operation, then press **Install update**.
+
+The banner at the top shows each step of the install. The Host Computer restarts when it finishes, and the panel reloads.
+
+The control panel's usual update banner checks GitHub for releases, so it doesn't appear on a Host Computer without internet access. Install each release from its bundle instead.
+
+To go back to an older release, upload its bundle. The panel says the version is older than the installed one. Press **Use older version** to install it anyway.
+
+## Install over SSH
+
+Use this the first time, when the Host Computer runs a release without **Install from file**. You can also use it instead of the control panel.
+
+1. Copy the bundle to the Host Computer:
 
    ```bash
    scp axol-offline-v0.2.47-linux-aarch64.tar user@<host-ip>:
@@ -32,23 +48,17 @@ The `linux-aarch64` bundle is for the Jetson Host Computers that Axol supports.
    sudo ./axol-offline-v0.2.47-linux-aarch64/install
    ```
 
-The installer does the following:
-
-- Checks every file in the bundle. If a file is damaged, it stops before it changes anything.
-- Installs the release and the Python packages it needs from the bundle.
-- Installs the realtime control core, the camera streaming software and Lighthouse tracking from the bundle (see [`axol provision`](/cli/provision)).
-- Restarts the `axol` service.
-
-When it finishes, open `https://<host-ip>:8001` on a computer on the same network. The Host Computer serves the control panel and the [VR app](/guides/vr-interface) itself, so neither needs internet access. You can delete the `.tar` file and the extracted folder afterwards.
-
-The control panel's update banner checks GitHub for releases, so it doesn't appear on a Host Computer without internet access. Install each release from its bundle instead.
+The installer checks every file, installs the release and its software from the bundle, then restarts the `axol` service. You can delete the `.tar` file and the extracted folder afterwards.
 
 ## If the install stops
 
 | Message | What to do |
 |---|---|
-| The bundle is damaged. | Copy the `.tar` file to the Host Computer again, then extract it again. |
+| This file is not signed by Almond. | Download the bundle again from the release page. |
+| The bundle is damaged. | Copy or upload the `.tar` file again. |
 | This bundle is for `<platform>`, but this computer is `<platform>`. | Download the bundle the message names. |
+| The Host Computer needs more free space. | Delete old datasets, then upload the file again. |
+| This bundle is signed with a key this version of Axol does not know. | Install it over SSH, as above. |
 | Python 3.13 is not installed on this computer. | Run the [one-command install](/installation) once with internet access. Later updates can use the bundle. |
 
 The bundle doesn't include the ZED SDK or Ubuntu packages. The install uses the copies already on the Host Computer. If an optional step needs something that isn't there, the install finishes with a warning that names the step. Axol works without it.

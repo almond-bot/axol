@@ -8,6 +8,7 @@ attaches an offline bundle to every GitHub release::
     axol-offline-v<version>-<platform>.tar
       axol-offline-v<version>-<platform>/
         manifest.json   what the bundle holds (see :class:`Bundle`)
+        manifest.sig    Almond's ed25519 signature of manifest.json
         SHA256SUMS      ``sha256sum -c`` input over every other file
         bundle.env      version/platform/python as KEY=VALUE, for the installer
         install         the hosted installer (run it from here: bundle mode)
@@ -29,7 +30,17 @@ derives the ``v<version>`` ref). It then runs ``axol provision`` with
 :data:`ENV` pointing here, and each step that would download something takes
 it from the bundle instead (:func:`active`).
 
-Only the standard library is imported here: ``axol provision`` steps and the
+A bundle can also be uploaded through the control panel (**Install from
+file**). ``axol serve`` has no login and runs as root, so before it installs
+anything it checks ``manifest.sig`` against :data:`TRUSTED_KEYS` (the keys
+built into the *running* version) and extracts only the files the signed
+manifest lists, each against its sha256 (:func:`extract`). The release
+workflow signs with a key held in GitHub (``scripts/bundle_signing_key.py``).
+To rotate it, ship the new public key in :data:`TRUSTED_KEYS` in one release,
+then sign with it from the next.
+
+Only the standard library is imported at module level (``cryptography`` is
+imported where a signature is made or checked): ``axol provision`` steps and the
 CI build script (``scripts/build_offline_bundle.py``) both load this module.
 """
 
@@ -52,6 +63,7 @@ FORMAT_VERSION = 1
 PACKAGE = "almond-axol"
 
 MANIFEST = "manifest.json"
+SIGNATURE = "manifest.sig"
 SHA256SUMS = "SHA256SUMS"
 BUNDLE_ENV = "bundle.env"
 INSTALLER = "install"
@@ -77,6 +89,17 @@ _TOP_LEVEL = frozenset(
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _VERSION_RE = re.compile(r"^\d+(?:\.\d+)*$")
 _HASH_CHUNK = 1 << 20
+# Public ed25519 keys whose signatures an uploaded bundle may carry, by key ID
+# (:func:`key_id`): raw 32-byte keys, base64. The private half lives only in
+# the release workflow's ``offline-bundle`` GitHub environment.
+TRUSTED_KEYS: dict[str, str] = {
+    # Created with scripts/bundle_signing_key.py.
+    "1349f54a9f032f1d": "bdJOepEYQLF8P3Juk/M/MJ9ZS9pCNsOI7WvaymAkR3A=",
+}
+# A bundle's top-level directory, as bundle_name() makes it.
+_TOP_DIR_RE = re.compile(r"^axol-offline-v\d+(?:\.\d+)*-[a-z0-9]+-[a-z0-9_]+$")
+_MAX_MANIFEST_BYTES = 16 << 20
+_MAX_SIGNATURE_BYTES = 64 << 10
 
 
 class BundleError(RuntimeError):
@@ -309,3 +332,203 @@ def git_remote(name: str, ref: str) -> str | None:
         return None
     path = bundle.git_source(name, ref)
     return None if path is None else str(path)
+
+
+# -- signatures ---------------------------------------------------------------
+
+
+def key_id(public_key_b64: str) -> str:
+    """A short, stable name for a public key: its sha256, first 16 hex digits."""
+    import base64
+
+    return hashlib.sha256(base64.b64decode(public_key_b64)).hexdigest()[:16]
+
+
+def sign_manifest(manifest: bytes, private_key_b64: str) -> bytes:
+    """``manifest.sig`` for ``manifest`` (the release workflow's signing step)."""
+    import base64
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    private = Ed25519PrivateKey.from_private_bytes(base64.b64decode(private_key_b64))
+    public = private.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
+    payload = {
+        "keyId": key_id(base64.b64encode(public).decode()),
+        "signature": base64.b64encode(private.sign(manifest)).decode(),
+    }
+    return (json.dumps(payload, indent=2) + "\n").encode()
+
+
+def verify_signature(
+    manifest: bytes, signature: bytes, keys: dict[str, str] | None = None
+) -> str:
+    """Check ``manifest.sig`` against a trusted key; returns the key ID."""
+    import base64
+    import binascii
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    trusted = TRUSTED_KEYS if keys is None else keys
+    not_signed = BundleError(
+        "This file is not signed by Almond. Download the bundle again from the "
+        "release page."
+    )
+    try:
+        payload = json.loads(signature)
+        kid = payload["keyId"]
+        raw = base64.b64decode(payload["signature"], validate=True)
+    except (ValueError, KeyError, TypeError, binascii.Error) as exc:
+        raise not_signed from exc
+    public = trusted.get(kid) if isinstance(kid, str) else None
+    if public is None:
+        raise BundleError(
+            "This bundle is signed with a key this version of Axol does not "
+            "know. Update Axol with the install script inside the bundle, or "
+            "install a release that is closer to the one installed."
+        )
+    try:
+        Ed25519PublicKey.from_public_bytes(base64.b64decode(public)).verify(
+            raw, manifest
+        )
+    except (InvalidSignature, ValueError) as exc:
+        raise not_signed from exc
+    return kid
+
+
+# -- extracting an uploaded bundle ---------------------------------------------
+
+
+def _read_member(tar: Any, member: Any, limit: int) -> bytes:
+    if member.size > limit:
+        raise BundleError(f"{member.name} is too large")
+    handle = tar.extractfile(member)
+    if handle is None:
+        raise BundleError(f"cannot read {member.name}")
+    return handle.read()
+
+
+def extract(tar_path: Path, dest: Path, keys: dict[str, str] | None = None) -> Bundle:
+    """Verify an uploaded bundle ``.tar`` and extract it to ``dest``.
+
+    Nothing is written before the signature, the manifest and the platform
+    check out. Only regular files the signed manifest lists are extracted,
+    each hashed as it is written and compared with the manifest; links,
+    devices and any path outside the bundle are refused. ``dest`` is replaced
+    only once every file is in place, so a failure leaves no partial bundle.
+    """
+    import shutil
+    import tarfile
+
+    dest = Path(dest)
+    staging = dest.with_name(dest.name + ".tmp")
+    try:
+        tar = tarfile.open(tar_path, "r:")
+    except (tarfile.TarError, OSError) as exc:
+        raise BundleError(
+            "This file is not an Axol offline bundle. Choose the "
+            "axol-offline-v<version>-<platform>.tar file from the release page."
+        ) from exc
+    with tar:
+        try:
+            members = tar.getmembers()
+        except tarfile.TarError as exc:
+            raise BundleError(
+                "The file is damaged. Download it again from the release page."
+            ) from exc
+        tops = {m.name.split("/", 1)[0] for m in members}
+        if len(tops) != 1 or not _TOP_DIR_RE.match(next(iter(tops))):
+            raise BundleError(
+                "This file is not an Axol offline bundle. Choose the "
+                "axol-offline-v<version>-<platform>.tar file from the release page."
+            )
+        top = next(iter(tops))
+        files: dict[str, Any] = {}
+        for member in members:
+            if member.name == top:
+                if not member.isdir():
+                    raise BundleError(f"unexpected entry {member.name}")
+                continue
+            rel = member.name[len(top) + 1 :]
+            if member.isdir():
+                continue
+            if not member.isfile():
+                raise BundleError(f"the bundle contains a link or device: {rel}")
+            if rel in (MANIFEST, SIGNATURE, SHA256SUMS):
+                files[rel] = member
+                continue
+            files[_safe_relpath(rel)] = member
+        if SIGNATURE not in files:
+            raise BundleError(
+                "This file is not signed by Almond. Download the bundle again "
+                "from the release page."
+            )
+        if MANIFEST not in files:
+            raise BundleError("The bundle has no manifest.json.")
+        manifest = _read_member(tar, files[MANIFEST], _MAX_MANIFEST_BYTES)
+        signature = _read_member(tar, files[SIGNATURE], _MAX_SIGNATURE_BYTES)
+        verify_signature(manifest, signature, keys)
+        try:
+            data = json.loads(manifest)
+        except ValueError as exc:
+            raise BundleError(f"cannot read {MANIFEST}: {exc}") from exc
+        bundle = parse_manifest(dest, data)
+        bundle.check_host()
+        if top != bundle_name(bundle.version, bundle.platform):
+            raise BundleError(f"{top} does not match its manifest")
+        listed = set(bundle.files)
+        present = set(files) - {MANIFEST, SIGNATURE, SHA256SUMS}
+        if present - listed:
+            raise BundleError(
+                f"the bundle has files its manifest does not list: "
+                f"{', '.join(sorted(present - listed)[:3])}"
+            )
+        if listed - present:
+            raise BundleError(
+                f"the bundle is missing {', '.join(sorted(listed - present)[:3])}"
+            )
+
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(mode=0o700, parents=True)
+        try:
+            for rel in sorted(listed):
+                member = files[rel]
+                target = staging / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = tar.extractfile(member)
+                if source is None:
+                    raise BundleError(f"cannot read {rel}")
+                digest = hashlib.sha256()
+                with source, target.open("xb") as out:
+                    for chunk in iter(lambda: source.read(_HASH_CHUNK), b""):
+                        digest.update(chunk)
+                        out.write(chunk)
+                if digest.hexdigest() != bundle.files[rel]:
+                    raise BundleError(
+                        f"{rel} is damaged. Download the bundle again from the "
+                        "release page."
+                    )
+                target.chmod(0o755 if member.mode & 0o111 else 0o644)
+            (staging / MANIFEST).write_bytes(manifest)
+            (staging / SIGNATURE).write_bytes(signature)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+    shutil.rmtree(dest, ignore_errors=True)
+    staging.rename(dest)
+    return load(dest)
+
+
+def load_signed(root: Path, keys: dict[str, str] | None = None) -> Bundle:
+    """:func:`load`, after checking ``manifest.sig`` (for a staged upload)."""
+    root = Path(root)
+    try:
+        manifest = (root / MANIFEST).read_bytes()
+        signature = (root / SIGNATURE).read_bytes()
+    except OSError as exc:
+        raise BundleError(f"cannot read the bundle in {root}: {exc}") from exc
+    verify_signature(manifest, signature, keys)
+    return parse_manifest(root.resolve(), json.loads(manifest))

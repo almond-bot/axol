@@ -86,10 +86,16 @@ jobs:
   # Built on Ubuntu 22.04 arm64 so pip picks wheels, and the axol-rt binary
   # links, for glibc 2.35: JetPack 6 hosts run jammy, and JetPack 7 and
   # Raspberry Pi OS are newer.
+  #
+  # The manifest is signed with the ed25519 key in this environment's
+  # AXOL_BUNDLE_SIGNING_KEY secret; the control panel only installs uploads
+  # signed by a key in almond_axol.offline_bundle.TRUSTED_KEYS. Restrict the
+  # environment to release tags (scripts/bundle_signing_key.py sets it up).
   offline-bundle:
     needs: publish-sdk
     runs-on: ubuntu-22.04-arm
     timeout-minutes: 60
+    environment: offline-bundle
     permissions:
       contents: write # upload the bundle to the release
     steps:
@@ -104,10 +110,12 @@ jobs:
         working-directory: rust/axol-rt
         run: cargo build --release --locked
       - name: Build the offline bundle
+        env:
+          AXOL_BUNDLE_SIGNING_KEY: ${{ secrets.AXOL_BUNDLE_SIGNING_KEY }}
         run: |
           uv python install 3.13
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
-            uv run --no-project --python 3.13 --with pip \
+            uv run --no-project --python 3.13 --with pip --with cryptography \
             python scripts/build_offline_bundle.py \
               --wheel dist/almond_axol-*.whl \
               --rt-binary rust/axol-rt/target/release/axol-rt \

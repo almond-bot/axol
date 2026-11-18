@@ -35,6 +35,13 @@ Installs follow one of two channels, chosen in the control panel:
 ``start(channel=...)`` with the other channel switches: the same reinstall,
 provision and restart, onto the latest release or onto main's head.
 
+``start(bundle=...)`` installs an offline bundle uploaded through the control
+panel (:mod:`.bundle_upload`, :mod:`almond_axol.offline_bundle`) the same way,
+for a host with no internet access: the reinstall resolves only from the
+bundle's wheels (``--offline --no-index --find-links``, which keeps the host a
+release install), and ``axol provision`` runs with ``AXOL_OFFLINE_BUNDLE`` so
+its steps take what they would download from the bundle.
+
 Because the reinstall rebuilds the tool environment, anything that isn't a
 declared PyPI dependency is dropped and must be reinstalled before we restart
 onto the new code (pyzed, PyGObject), along with the patched zedxonesrc/zedsrc
@@ -93,6 +100,7 @@ from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from typing import Callable
 
+from .. import offline_bundle
 from ..utils import reboot
 
 _logger = logging.getLogger(__name__)
@@ -302,7 +310,11 @@ def _tail(path: Path, offset: int) -> list[str]:
 
 
 async def _run_step(
-    command: list[str], *, name: str, timeout: float
+    command: list[str],
+    *,
+    name: str,
+    timeout: float,
+    env: dict[str, str] | None = None,
 ) -> tuple[int | None, list[str]]:
     """Run one update step; ``(returncode, its non-empty output lines)``.
 
@@ -314,7 +326,8 @@ async def _run_step(
     then ``None``. Package-manager runs inside it are deliberately out of
     reach (their own session and systemd scope, see :mod:`..utils.packages`):
     a killed dpkg breaks every later install on the host. On failure the output's tail is echoed to the service log.
-    Raises ``OSError`` when the command cannot be started.
+    Raises ``OSError`` when the command cannot be started. ``env`` adds to
+    (and overrides) this process's environment for the step.
     """
     log = _step_log(name)
     with log.open("ab") as out:
@@ -329,6 +342,7 @@ async def _run_step(
             stdout=out,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
+            env={**os.environ, **env} if env else None,
         )
     returncode: int | None
     try:
@@ -420,6 +434,10 @@ class SelfUpdater:
         # only takes effect at boot); empty for a plain service restart.
         self._reboot_reasons: list[str] = []
         self._reboot_only = False
+        # The uploaded offline bundle the in-flight update installs (None for
+        # a network update), and what to run once it is installed.
+        self._bundle: offline_bundle.Bundle | None = None
+        self._after_bundle: Callable[[], None] | None = None
 
     @property
     def version(self) -> str | None:
@@ -450,6 +468,13 @@ class SelfUpdater:
     def enabled(self) -> bool:
         """Updatable only for release installs with uv available."""
         return self.release_install and shutil.which("uv") is not None
+
+    @property
+    def updating(self) -> bool:
+        """An update (network or offline bundle) is in progress."""
+        return self._state == "updating" or (
+            self._update_task is not None and not self._update_task.done()
+        )
 
     @property
     def installing(self) -> bool:
@@ -523,13 +548,31 @@ class SelfUpdater:
             # The channel being installed while updating; it differs from
             # ``channel`` during a switch. ``None`` when not updating.
             "target": self._target if self._state == "updating" else None,
+            # "bundle" while installing an uploaded offline bundle, whose
+            # version is ``targetVersion``; None otherwise.
+            "source": (
+                "bundle"
+                if self._state == "updating" and self._bundle is not None
+                else None
+            ),
+            "targetVersion": (
+                self._bundle.version
+                if self._state == "updating" and self._bundle is not None
+                else None
+            ),
             "phase": self._phase,
             "error": self._error,
             "warning": self._provision_warning,
             "installing": self.installing,
         }
 
-    def start(self, channel: str | None = None) -> tuple[bool, str | None]:
+    def start(
+        self,
+        channel: str | None = None,
+        *,
+        bundle: offline_bundle.Bundle | None = None,
+        after_install: Callable[[], None] | None = None,
+    ) -> tuple[bool, str | None]:
         """Begin a user-initiated upgrade; returns ``(started, reason)``.
 
         ``channel`` (``"release"`` or ``"main"``) switches the install to that
@@ -540,9 +583,31 @@ class SelfUpdater:
         disables the button in those cases, but guard here too. On success the
         reinstall + provision run in the background and the process exits when
         idle so systemd relaunches the new code.
+
+        ``bundle`` installs that extracted offline bundle instead (a release,
+        so the install lands on the ``release`` channel); ``after_install``
+        runs once it is installed and provisioned, before the restart.
         """
         if not self.enabled:
             return False, "not a release install"
+        if bundle is not None:
+            if channel is not None:
+                return False, "choose a channel or a bundle, not both"
+            if self._state == "updating" or (
+                self._update_task is not None and not self._update_task.done()
+            ):
+                return False, "an update is already in progress"
+            if bundle.extras != _EXTRAS or bundle.python != _PYTHON_VERSION:
+                return False, "this bundle does not match this install"
+            if not self._is_idle():
+                return False, "server is busy; stop the running operation first"
+            self._state = "updating"
+            self._error = None
+            self._target = "release"
+            self._bundle = bundle
+            self._after_bundle = after_install
+            self._update_task = asyncio.create_task(self._run_update("release"))
+            return True, None
         target = channel or self._channel
         if target not in CHANNELS:
             return False, f"unknown channel {target!r}"
@@ -560,6 +625,8 @@ class SelfUpdater:
         self._state = "updating"
         self._error = None
         self._target = target
+        self._bundle = None
+        self._after_bundle = None
         self._update_task = asyncio.create_task(self._run_update(target))
         return True, None
 
@@ -683,11 +750,27 @@ class SelfUpdater:
         # take ``_env_lock``; we release it before the post-upgrade
         # `_provision()` below, which re-acquires it (the lock is not reentrant).
         channel = channel or self._channel
+        bundle = self._bundle
+        # Extra arguments and environment for an offline bundle install.
+        source_args: list[str] = []
+        step_env: dict[str, str] | None = None
         try:
             if not self.release_install:
                 self._fail("no release to install")
                 return
-            if channel == "main":
+            if bundle is not None:
+                target = f"v{bundle.version} (offline bundle)"
+                requirement = bundle.requirement
+                # Find-links, never the wheel's path: a path install records
+                # a direct URL and the host would stop being a release install.
+                source_args = [
+                    "--offline",
+                    "--no-index",
+                    "--find-links",
+                    str(bundle.wheels),
+                ]
+                step_env = {offline_bundle.ENV: str(bundle.root)}
+            elif channel == "main":
                 # The branch, not a pinned commit: uv records the requested
                 # revision, which is how the next start knows it is on main.
                 target = f"{_MAIN_BRANCH} ({(self._remote_commit or 'head')[:7]})"
@@ -727,10 +810,12 @@ class SelfUpdater:
                             # must not count as already satisfied.
                             "--reinstall-package",
                             _PACKAGE,
+                            *source_args,
                             requirement,
                         ],
                         name="uv-tool-install",
                         timeout=_UV_INSTALL_TIMEOUT_S,
+                        env=step_env,
                     )
                 except OSError as exc:
                     self._fail(f"could not run uv: {exc}")
@@ -750,9 +835,15 @@ class SelfUpdater:
             # The reinstall rebuilt the env, so reprovision before restarting
             # onto the new code (pyzed/PyGObject were pruned).
             self._phase = "provisioning"
-            if not await self._provision(require_rt=True):
+            if not await self._provision(require_rt=True, env=step_env):
                 self._fail(self._provision_failure_message())
                 return
+            if bundle is not None and self._after_bundle is not None:
+                # Installed: the uploaded bundle is no longer needed.
+                try:
+                    self._after_bundle()
+                except Exception as exc:  # noqa: BLE001 - cleanup only
+                    _logger.warning("self-update: bundle cleanup failed: %s", exc)
 
             self._reboot_reasons = reboot.pending()
 
@@ -813,7 +904,9 @@ class SelfUpdater:
         detail = self._provision_failure or "no output"
         return f"axol provision failed: {detail} (see service logs)"
 
-    async def _provision(self, *, require_rt: bool = False) -> bool:
+    async def _provision(
+        self, *, require_rt: bool = False, env: dict[str, str] | None = None
+    ) -> bool:
         """Provision system deps, optionally requiring a working ``axol-rt``.
 
         The upgrade reinstall rebuilds the tool env and drops everything that
@@ -841,7 +934,10 @@ class SelfUpdater:
         async with self._env_lock:
             try:
                 returncode, lines = await _run_step(
-                    command, name="axol-provision", timeout=_PROVISION_TIMEOUT_S
+                    command,
+                    name="axol-provision",
+                    timeout=_PROVISION_TIMEOUT_S,
+                    env=env,
                 )
             except OSError as exc:
                 _logger.warning("self-update: could not run axol provisioning: %s", exc)

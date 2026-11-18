@@ -267,6 +267,101 @@ export interface UpdateStatus {
   warning?: string | null
   /** A reinstall or `axol provision` is running; power actions are refused. Absent on older hosts. */
   installing?: boolean
+  /** "bundle" while installing an uploaded offline bundle; null otherwise. Absent on older hosts. */
+  source?: "bundle" | null
+  /** The version being installed from an offline bundle; null otherwise. */
+  targetVersion?: string | null
+  /** The uploaded offline bundle (Install from file). Absent on older hosts. */
+  bundle?: BundleStatus
+}
+
+/** Where an uploaded offline bundle is: uploading, being checked, ready to install, or refused. */
+export type BundleState = "idle" | "uploading" | "checking" | "ready" | "error"
+
+export interface BundleStatus {
+  state: BundleState
+  /** Set while uploading; chunks are sent to this upload. */
+  uploadId: string | null
+  /** File name and size of the upload. */
+  name: string | null
+  size: number
+  /** Bytes the host has stored so far. */
+  received: number
+  /** The bundle's Axol version, once checked. */
+  version: string | null
+  error: string | null
+  /** "older" (allowed after confirming), "installed" or "space". */
+  errorCode: string | null
+}
+
+/** The size of each upload request. */
+export const BUNDLE_CHUNK_BYTES = 32 * 1024 * 1024
+
+/** Start uploading an offline bundle, or resume the host's unfinished upload of the same file. */
+export async function beginBundleUpload(name: string, size: number): Promise<BundleStatus> {
+  return json(
+    await fetch(apiUrl("/api/update/bundle"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, size }),
+    })
+  )
+}
+
+/**
+ * Send one chunk starting at `offset`. A 409 carries the host's current
+ * status, so the caller resumes from `bundle.received`.
+ */
+export async function uploadBundleChunk(
+  uploadId: string,
+  offset: number,
+  chunk: Blob
+): Promise<BundleStatus> {
+  const res = await fetch(
+    apiUrl(`/api/update/bundle/${encodeURIComponent(uploadId)}?offset=${offset}`),
+    { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: chunk }
+  )
+  if (res.status === 409) {
+    const body = (await res.json().catch(() => ({}))) as { bundle?: BundleStatus; code?: string }
+    if (body.code === "offset" && body.bundle) return body.bundle
+  }
+  return json(res)
+}
+
+/** Ask the host to check the complete upload (signature, platform, version, files). */
+export async function checkBundleUpload(uploadId: string): Promise<BundleStatus> {
+  return json(
+    await fetch(apiUrl(`/api/update/bundle/${encodeURIComponent(uploadId)}/check`), {
+      method: "POST",
+    })
+  )
+}
+
+/** Check the uploaded bundle again, accepting a version older than the installed one. */
+export async function recheckBundle(allowOlder: boolean): Promise<BundleStatus> {
+  return json(
+    await fetch(apiUrl("/api/update/bundle/recheck"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ allowOlder }),
+    })
+  )
+}
+
+/** Delete the uploaded bundle (or the unfinished upload) from the host. */
+export async function discardBundle(): Promise<BundleStatus> {
+  return json(await fetch(apiUrl("/api/update/bundle"), { method: "DELETE" }))
+}
+
+/** Install the checked offline bundle; the host restarts onto it when idle. */
+export async function startBundleUpdate(): Promise<{ started: boolean }> {
+  return json(
+    await fetch(apiUrl("/api/update/start"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bundle: true }),
+    })
+  )
 }
 
 /**
