@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import os
 import subprocess
@@ -496,15 +497,143 @@ class CanSetupAssignmentTest(unittest.TestCase):
         # Lock handling matches the bring-up script, which it hands over to
         # with the global lock still held.
         self.assertIn(f'exec 8<"{setup._GLOBAL_LOCK_FILE}"', text)
+        # Only the reset hub's fresh interfaces are brought up afterwards: the
+        # Jelly buses stay up, so a silent arm hub's recovery never drops them.
         self.assertTrue(
             text.rstrip().endswith(
                 f"exec env {setup._GLOBAL_LOCK_ENV}=1 bash "
-                f'"{setup._AXOL_PROFILE.cron_script}"'
+                f'"{setup._AXOL_PROFILE.cron_script}" {setup._ONLY_DOWN_ARG}'
             )
         )
         # The single-channel wheel/chest adapters are never reset.
         self.assertNotIn(setup.CAN_BASE, text)
         self.assertNotIn(setup.CAN_CHEST, text)
+
+    def test_bring_up_script_only_down_mode_leaves_up_buses_alone(self) -> None:
+        text = setup._cron_script_text()
+        self.assertIn(f'if [ "${{1:-}}" = "{setup._ONLY_DOWN_ARG}" ]; then', text)
+        # The arm pair is skipped only when both halves are already up, and
+        # each Jelly bus is skipped on its own.
+        self.assertIn(
+            f'if [ "${{ONLY_DOWN}}" = "1" ] && is_up {setup.CAN_LEFT} '
+            f"&& is_up {setup.CAN_RIGHT}; then",
+            text,
+        )
+        self.assertIn(f"for IFACE in {setup.CAN_BASE} {setup.CAN_CHEST}; do", text)
+        self.assertIn('if [ "${ONLY_DOWN}" = "1" ] && is_up "${IFACE}"; then', text)
+        # Mantis has no Jelly section at all.
+        self.assertNotIn(setup.CAN_BASE, setup._cron_script_text(setup._MANTIS_PROFILE))
+        # Hotplug re-enumeration uses the mode: one adapter's replug must not
+        # cycle another adapter's live bus.
+        for profile in (setup._AXOL_PROFILE, setup._MANTIS_PROFILE):
+            self.assertIn(
+                f"ExecStart=/bin/bash {profile.cron_script} {setup._ONLY_DOWN_ARG}\n",
+                setup._hotplug_unit_text(profile),
+            )
+
+    def test_bring_up_script_only_down_mode_runs_in_bash(self) -> None:
+        # Run the generated logic against a fake sysfs and a fake `ip`: with
+        # the mode, an up bus is left alone and a down bus is configured;
+        # without it, every present bus is cycled.
+        with tempfile.TemporaryDirectory(dir="/tmp") as scratch:
+            root = Path(scratch)
+            net = root / "net"
+            for name, flags in (
+                (setup.CAN_LEFT, "0x40c1"),
+                (setup.CAN_RIGHT, "0x40c1"),
+                (setup.CAN_BASE, "0x40c1"),
+                (setup.CAN_CHEST, "0x80"),
+            ):
+                (net / name).mkdir(parents=True)
+                (net / name / "flags").write_text(f"{flags}\n")
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            log = root / "ip.log"
+            fake_ip = bin_dir / "ip"
+            fake_ip.write_text(
+                "#!/bin/bash\n"
+                f'echo "$*" >> "{log}"\n'
+                'if [ "$1 $2" = "link show" ]; then '
+                f'[ -d "{net}/$3" ]; exit $?; fi\n'
+                "exit 0\n"
+            )
+            fake_ip.chmod(0o755)
+            for tool in ("flock", "sleep"):
+                stub = bin_dir / tool
+                stub.write_text("#!/bin/bash\nexit 0\n")
+                stub.chmod(0o755)
+            lock = root / "lock"
+            lock.write_text("")
+            script = (
+                setup._cron_script_text()
+                .replace("/sys/class/net/", f"{net}/")
+                .replace(str(setup._GLOBAL_LOCK_FILE), str(lock))
+                .replace(str(setup._AXOL_PROFILE.lock_file), str(lock))
+            )
+            path = root / "startup.sh"
+            path.write_text(script)
+            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": scratch}
+
+            def cycled(*args: str) -> set[str]:
+                log.write_text("")
+                subprocess.run(
+                    ["bash", str(path), *args], check=True, env=env, capture_output=True
+                )
+                return {
+                    line.split()[2]
+                    for line in log.read_text().splitlines()
+                    if line.startswith("link set") and line.endswith(" up")
+                }
+
+            self.assertEqual(cycled(setup._ONLY_DOWN_ARG), {setup.CAN_CHEST})
+            self.assertEqual(
+                cycled(),
+                {setup.CAN_LEFT, setup.CAN_RIGHT, setup.CAN_BASE, setup.CAN_CHEST},
+            )
+
+    def test_discovery_refreshes_only_installed_outdated_scripts(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as scratch:
+            root = Path(scratch)
+            cron = root / "startup.sh"
+            cron.write_text("#!/bin/bash\n# older release\n")
+            reset = root / "reset_adapter.sh"
+            reset.write_text("#!/bin/bash\n# older release\n")
+            axol = dataclasses.replace(setup._AXOL_PROFILE, cron_script=cron)
+            # Already current: left as it is, and no daemon-reload.
+            (root / axol.hotplug_unit).write_text(setup._hotplug_unit_text(axol))
+            # Mantis was never set up on this host: nothing is created for it.
+            mantis = dataclasses.replace(
+                setup._MANTIS_PROFILE, cron_script=root / "startup_mantis.sh"
+            )
+            installed: list[Path] = []
+            published: list[Path] = []
+            with (
+                patch.object(setup, "_AXOL_PROFILE", axol),
+                patch.object(setup, "_MANTIS_PROFILE", mantis),
+                patch.object(setup, "CAN_RESET_SCRIPT", reset),
+                patch.object(
+                    type(axol),
+                    "hotplug_unit_file",
+                    property(lambda profile: root / profile.hotplug_unit),
+                ),
+                patch.object(
+                    setup,
+                    "_install_privileged_script",
+                    side_effect=lambda path, _text: installed.append(path),
+                ),
+                patch.object(
+                    setup,
+                    "_publish_privileged_text",
+                    side_effect=lambda path, _text, **_kw: published.append(path),
+                ),
+                patch.object(setup, "run_root") as run_root,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                setup._refresh_generated_can_scripts()
+
+            self.assertEqual(installed, [cron, reset])
+            self.assertEqual(published, [])
+            run_root.assert_not_called()
 
     def test_reset_script_passes_bash_syntax_check(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".sh") as script:

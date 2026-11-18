@@ -45,6 +45,7 @@ import {
   autoConnectSignature,
   canDiscoveryAttemptSignature,
   canDiscoveryBlocksAutoConnect,
+  jellyDiscoveryBlocksAutoConnect,
   canServerEpoch,
   chooseDiagnosticsAutoConnectProfile,
   claimCanInventoryPollResponse,
@@ -888,25 +889,19 @@ export default function Diagnostics() {
   ])
 
   // Bring up each detected Jelly device once per (device, interface, server
-  // epoch), like the control panel does: only from an idle page, only after
-  // CAN discovery has settled, and never for a device the operator
+  // epoch), like the control panel does: only from an idle page, only once
+  // discovery no longer holds that device, and never for a device the operator
   // disconnected by hand (the server refuses those, and this tab stops
   // asking). Absence is not latched — a replug gets a fresh attempt.
   useEffect(() => {
     if (!serverOk || !jelly || !jellySupported || !canDevices || !sessionInventoryReady) return
-    if (
-      canDiscoveryBlocksAutoConnect(canDiscovery) ||
-      activeRun ||
-      hardwareSessionBusy ||
-      launchBusy ||
-      !autoRobotPollStateKnown()
-    )
-      return
+    if (activeRun || hardwareSessionBusy || launchBusy || !autoRobotPollStateKnown()) return
     const serverEpoch = currentCanServerEpoch()
     for (const device of JELLY_DEVICES) {
       const presence = canDevices[device]
       const status = jelly[device]
       if (!presence?.present || presence.automaticConnectSuppressed) continue
+      if (jellyDiscoveryBlocksAutoConnect(canDiscovery, presence)) continue
       if (status.state !== "disconnected" && status.state !== "error") continue
       if (jellyBusy[device] || manualJellyOverrideRef.current.has(device)) continue
       const signature = `${device}:${presence.channel}:host-${serverEpoch}`

@@ -94,6 +94,7 @@ import {
   autoConnectSignature,
   canDiscoveryAttemptSignature,
   canDiscoveryBlocksAutoConnect,
+  jellyDiscoveryBlocksAutoConnect,
   canServerEpoch,
   chooseAutoConnectTarget,
   chooseDetectedHardwareProfile,
@@ -1353,24 +1354,19 @@ export default function ControlPanel() {
 
   // Bring up each detected Jelly device once per (device, interface, server
   // epoch), the way the Axol/Mantis link auto-connects: only from an idle
-  // panel, only after CAN discovery has settled, and never for a device the
+  // panel, only once discovery no longer holds that device (a silent arm hub
+  // does not hold a pinned Jelly bus), and never for a device the
   // operator disconnected by hand (the server refuses those, and this tab
   // stops asking). Absence is not latched — a replug gets a fresh attempt.
   useEffect(() => {
     if (conn.state !== "ok" || !jelly || !jellySupported || !canDevices) return
-    if (
-      canDiscoveryBlocksAutoConnect(canDiscovery) ||
-      isLive ||
-      hardwareSessionBusy ||
-      activeCommandSession ||
-      !sessionInventoryReady
-    )
-      return
+    if (isLive || hardwareSessionBusy || activeCommandSession || !sessionInventoryReady) return
     const serverEpoch = currentCanServerEpoch()
     for (const device of JELLY_DEVICES) {
       const presence = canDevices[device]
       const status = jelly[device]
       if (!presence?.present || presence.automaticConnectSuppressed) continue
+      if (jellyDiscoveryBlocksAutoConnect(canDiscovery, presence)) continue
       if (status.state !== "disconnected" && status.state !== "error") continue
       if (jellyBusy[device] || manualJellyOverrideRef.current.has(device)) continue
       const signature = `${device}:${presence.channel}:host-${serverEpoch}`
