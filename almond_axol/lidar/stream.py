@@ -12,11 +12,19 @@ unless PTP or GPS sync is set up). The stream maps that onto this host's
 sensor`` offset, which is the network delay floor. Every frame and IMU sample
 carries host-monotonic times, so they line up with Jelly's wheel samples and
 the rest of Axol.
+
+Sharing: only one program can bind the lidar's ports. That program also
+listens on ``config.tap_port`` (loopback only) and forwards every packet to
+any local program that asks for them. A :class:`LidarStream` that finds the
+ports taken asks the owner for a copy instead, and takes the ports over if
+the owner goes quiet. So ``axol serve``, ``nav.*`` and ``lidar.view`` can all
+read the lidar at once.
 """
 
 from __future__ import annotations
 
 import collections
+import errno
 import logging
 import select
 import socket
@@ -43,6 +51,19 @@ _RCVBUF = 8 * 1024 * 1024
 _OFFSET_WINDOW_S = 10.0
 
 _TS = struct.Struct("<Q")  # packet timestamp (ns) at offset 28
+
+# Tap protocol: a reader sends this to the owner's tap port at least every
+# _TAP_HELLO_S; the owner forwards packets to it until _TAP_EXPIRE_S passes
+# without one. A reader that hears nothing for _TAP_TAKEOVER_S tries to bind
+# the lidar's ports itself (the owner has exited).
+TAP_HELLO = b"axol-lidar-tap/1"
+_TAP_HELLO_S = 0.5
+_TAP_EXPIRE_S = 3.0
+_TAP_TAKEOVER_S = 1.5
+
+
+class LidarBusy(RuntimeError):
+    """Another program on this computer has the lidar's ports."""
 
 
 @dataclass
@@ -283,6 +304,12 @@ class LidarStream:
         self._counts = collections.deque(maxlen=64)  # (t, packets, points, imu, frames)
         self._n = [0, 0, 0, 0]
         self._last_packet: float | None = None
+        # True while reading another program's copy (see the module docs).
+        self.shared = False
+        self._tap_clients: dict[tuple[str, int], float] = {}
+        self._tap_addr: tuple[str, int] = ("127.0.0.1", self.config.tap_port)
+        self._last_hello = 0.0
+        self._tap_since = time.monotonic()
 
     # -- lifecycle -----------------------------------------------------
 
@@ -292,20 +319,26 @@ class LidarStream:
             raise RuntimeError(
                 "The lidar's address isn't set up. Run `axol lidar.setup` first."
             )
-        bind_ip = cfg.host_ip
-        points = self._bind(bind_ip, cfg.point_port)
-        imu = self._bind(bind_ip, cfg.imu_port)
-        self._socks = [points, imu]
-        if self.configure:
-            with livox.LivoxClient(cfg.lidar_ip, cfg.host_ip) as client:
-                client.configure_streams(
-                    cfg.host_ip, point_port=cfg.point_port, imu_port=cfg.imu_port
-                )
-                self.status = client.status()
+        try:
+            self._socks = self._bind_owner()
+        except LidarBusy:
+            # Another program reads the lidar: ask it for a copy.
+            self._socks = [self._open_tap()]
+            self.shared = True
+        if self.configure and not self.shared:
+            try:
+                with livox.LivoxClient(cfg.lidar_ip, cfg.host_ip) as client:
+                    client.configure_streams(
+                        cfg.host_ip, point_port=cfg.point_port, imu_port=cfg.imu_port
+                    )
+                    self.status = client.status()
+            except BaseException:
+                for s in self._socks:
+                    s.close()
+                self._socks = []
+                raise
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run, args=(points, imu), name="lidar-rx", daemon=True
-        )
+        self._thread = threading.Thread(target=self._run, name="lidar-rx", daemon=True)
         self._thread.start()
         return self
 
@@ -326,10 +359,55 @@ class LidarStream:
     def __exit__(self, *exc: object) -> None:
         self.stop()
 
+    def tap_readers(self) -> int:
+        """How many other local programs this stream is forwarding to."""
+        return len(self._tap_clients)
+
+    def _bind_owner(self) -> list[socket.socket]:
+        """Bind the point and IMU ports, plus the tap port when it's free."""
+        cfg = self.config
+        points = self._bind(cfg.host_ip, cfg.point_port)
+        try:
+            imu = self._bind(cfg.host_ip, cfg.imu_port)
+        except BaseException:
+            points.close()
+            raise
+        socks = [points, imu]
+        tap = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            tap.bind(("127.0.0.1", cfg.tap_port))
+            socks.append(tap)
+        except OSError as exc:
+            tap.close()
+            _logger.warning(
+                "Can't share the lidar on port %d (%s).", cfg.tap_port, exc.strerror
+            )
+        return socks
+
+    def _open_tap(self) -> socket.socket:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _RCVBUF)
+        except OSError:
+            pass
+        s.bind(("127.0.0.1", 0))
+        self._tap_addr = ("127.0.0.1", self.config.tap_port)
+        self._tap_since = time.monotonic()
+        self._send_hello(s)
+        return s
+
+    def _send_hello(self, s: socket.socket) -> None:
+        try:
+            s.sendto(TAP_HELLO, self._tap_addr)
+        except OSError:
+            pass
+        self._last_hello = time.monotonic()
+
     @staticmethod
     def _bind(ip: str, port: int) -> socket.socket:
+        # No SO_REUSEADDR: with it a second program binds too and silently
+        # takes the packets from the first.
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _RCVBUF)
         except OSError:
@@ -338,10 +416,13 @@ class LidarStream:
             s.bind((ip, port))
         except OSError as exc:
             s.close()
+            if exc.errno == errno.EADDRINUSE:
+                raise LidarBusy(
+                    f"Another program is reading the lidar on {ip}:{port}."
+                ) from exc
             raise RuntimeError(
                 f"Can't listen on {ip}:{port} ({exc.strerror}). Check that "
-                f"{ip} is assigned to the lidar's port (`axol lidar.setup`) and "
-                "that no other lidar program is running."
+                f"{ip} is assigned to the lidar's port (`axol lidar.setup`)."
             ) from exc
         return s
 
@@ -418,47 +499,47 @@ class LidarStream:
             except Exception:  # noqa: BLE001 - a consumer bug must not kill rx
                 _logger.exception("lidar frame callback failed")
 
-    def _run(self, points: socket.socket, imu: socket.socket) -> None:
+    def _on_point(self, buf: bytes, now_ns: int) -> None:
+        self._n[0] += 1
+        self._n[1] += buf[5] | (buf[6] << 8) if len(buf) > 6 else 0
+        frame = self._assembler.add(buf, now_ns)
+        if frame is not None:
+            self._emit(frame)
+
+    def _on_imu_packet(self, buf: bytes) -> None:
+        try:
+            pkt = livox.parse_imu_packet(buf)
+        except livox.LivoxError:
+            return
+        self._n[2] += 1
+        if not self._clock.ready:
+            return
+        sample = ImuSample(self._clock.to_host(pkt.timestamp_ns), pkt.gyro, pkt.accel)
+        self._imu.append(sample)
+        if self._on_imu is not None:
+            try:
+                self._on_imu(sample)
+            except Exception:  # noqa: BLE001
+                _logger.exception("lidar IMU callback failed")
+
+    def _forward(self, tap: socket.socket | None, buf: bytes) -> None:
+        if tap is None or not self._tap_clients:
+            return
+        for addr in list(self._tap_clients):
+            try:
+                tap.sendto(buf, addr)
+            except OSError:
+                self._tap_clients.pop(addr, None)
+
+    def _run(self) -> None:
         try:
             last_tick = 0.0
             while not self._stop.is_set():
-                ready, _, _ = select.select([points, imu], [], [], 0.2)
-                now_ns = time.monotonic_ns()
-                if points in ready:
-                    for _ in range(64):
-                        try:
-                            buf = points.recv(2048, socket.MSG_DONTWAIT)
-                        except BlockingIOError:
-                            break
-                        self._n[0] += 1
-                        self._n[1] += buf[5] | (buf[6] << 8) if len(buf) > 6 else 0
-                        frame = self._assembler.add(buf, now_ns)
-                        if frame is not None:
-                            self._emit(frame)
-                    self._last_packet = now_ns * 1e-9
-                if imu in ready:
-                    for _ in range(16):
-                        try:
-                            buf = imu.recv(2048, socket.MSG_DONTWAIT)
-                        except BlockingIOError:
-                            break
-                        try:
-                            pkt = livox.parse_imu_packet(buf)
-                        except livox.LivoxError:
-                            continue
-                        self._n[2] += 1
-                        if not self._clock.ready:
-                            continue
-                        sample = ImuSample(
-                            self._clock.to_host(pkt.timestamp_ns), pkt.gyro, pkt.accel
-                        )
-                        self._imu.append(sample)
-                        if self._on_imu is not None:
-                            try:
-                                self._on_imu(sample)
-                            except Exception:  # noqa: BLE001
-                                _logger.exception("lidar IMU callback failed")
-                t = now_ns * 1e-9
+                if self.shared:
+                    self._run_shared_step()
+                else:
+                    self._run_owner_step()
+                t = time.monotonic()
                 if t - last_tick >= 0.25:
                     last_tick = t
                     self._counts.append((t, *self._n))
@@ -467,3 +548,72 @@ class LidarStream:
             _logger.exception("lidar receive thread stopped")
             with self._cond:
                 self._cond.notify_all()
+
+    def _run_owner_step(self) -> None:
+        points, imu, *rest = self._socks
+        tap = rest[0] if rest else None
+        ready, _, _ = select.select(self._socks, [], [], 0.2)
+        now_ns = time.monotonic_ns()
+        if points in ready:
+            for _ in range(64):
+                try:
+                    buf = points.recv(2048, socket.MSG_DONTWAIT)
+                except BlockingIOError:
+                    break
+                self._forward(tap, buf)
+                self._on_point(buf, now_ns)
+            self._last_packet = now_ns * 1e-9
+        if imu in ready:
+            for _ in range(16):
+                try:
+                    buf = imu.recv(2048, socket.MSG_DONTWAIT)
+                except BlockingIOError:
+                    break
+                self._forward(tap, buf)
+                self._on_imu_packet(buf)
+        if tap is not None:
+            if tap in ready:
+                for _ in range(16):
+                    try:
+                        msg, addr = tap.recvfrom(64, socket.MSG_DONTWAIT)
+                    except BlockingIOError:
+                        break
+                    if msg == TAP_HELLO:
+                        self._tap_clients[addr] = now_ns * 1e-9
+            cutoff = now_ns * 1e-9 - _TAP_EXPIRE_S
+            for addr, seen in list(self._tap_clients.items()):
+                if seen < cutoff:
+                    del self._tap_clients[addr]
+
+    def _run_shared_step(self) -> None:
+        (tap,) = self._socks
+        ready, _, _ = select.select([tap], [], [], 0.1)
+        now = time.monotonic()
+        now_ns = int(now * 1e9)
+        if ready:
+            for _ in range(80):
+                try:
+                    buf = tap.recv(2048, socket.MSG_DONTWAIT)
+                except BlockingIOError:
+                    break
+                if len(buf) < livox.PACKET_HEADER_SIZE:
+                    continue
+                if buf[10] == livox.DATA_TYPE_IMU:
+                    self._on_imu_packet(buf)
+                else:
+                    self._on_point(buf, now_ns)
+                    self._last_packet = now
+        if now - self._last_hello >= _TAP_HELLO_S:
+            self._send_hello(tap)
+        last = max(self._last_packet or 0.0, self._tap_since)
+        if now - last >= _TAP_TAKEOVER_S:
+            # The owner has gone quiet: try to take the lidar's ports.
+            try:
+                socks = self._bind_owner()
+            except LidarBusy:
+                self._tap_since = now
+                return
+            tap.close()
+            self._socks = socks
+            self.shared = False
+            _logger.info("Reading the lidar directly now.")

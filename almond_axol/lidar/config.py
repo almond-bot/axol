@@ -22,6 +22,9 @@ from . import livox
 
 CONFIG_FILENAME = "lidar.json"
 
+# Loopback port for sharing one lidar between programs (see ``stream.py``).
+TAP_PORT = 56601
+
 
 def config_path() -> Path:
     return almond_path(CONFIG_FILENAME)
@@ -86,6 +89,8 @@ class LidarConfig:
         serial:      Serial number recorded at setup (informational).
         point_port:  UDP port this computer receives points on.
         imu_port:    UDP port this computer receives IMU samples on.
+        tap_port:    Loopback UDP port where the program reading the lidar
+                     shares its packets with other programs on this computer.
         frame_period: Seconds of points per frame. The Mid-360 covers its
                      full field of view in about 0.1 s.
         min_range:   Drop points closer than this (m). The Mid-360 can't
@@ -100,6 +105,7 @@ class LidarConfig:
     serial: str = ""
     point_port: int = livox.HOST_POINT_PORT
     imu_port: int = livox.HOST_IMU_PORT
+    tap_port: int = TAP_PORT
     frame_period: float = 0.1
     min_range: float = 0.15
     max_range: float = 40.0

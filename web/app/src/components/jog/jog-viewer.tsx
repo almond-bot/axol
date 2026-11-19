@@ -50,6 +50,8 @@ import {
   type JogPreview,
   type JogState,
 } from "@/lib/jog"
+import { LidarMarker, LidarPoints } from "@/components/lidar/lidar-points"
+import { type LidarCloud, type LidarMount, type LidarSettings } from "@/lib/lidar"
 
 const PLAN_COLOR = "#ff9a3c"
 const PATH_COLOR = "#eff483"
@@ -230,6 +232,35 @@ function TorsoFrame({ robot, children }: { robot: URDFRobot; children: React.Rea
   return (
     <group ref={group} matrixAutoUpdate={false}>
       {children}
+    </group>
+  )
+}
+
+/** What the view needs to draw the live lidar scan. */
+export interface JogLidar {
+  cloud: LidarCloud
+  settings: LidarSettings
+  mount: LidarMount | null
+}
+
+/**
+ * The lidar scan, in the frame of the base it is mounted on (Jelly, or the
+ * Ox Cart), so it moves and turns with the base. Hidden on a model without one.
+ */
+function LidarLayer({ robot, lidar }: { robot: URDFRobot; lidar: JogLidar }) {
+  const group = useRef<Group>(null)
+  const base = robot.links.jelly ?? robot.links.cart
+  useFrame(() => {
+    const g = group.current
+    if (!base || !g) return
+    g.matrix.copy(base.matrixWorld)
+    g.matrixWorldNeedsUpdate = true
+  })
+  if (!base) return null
+  return (
+    <group ref={group} matrixAutoUpdate={false}>
+      <LidarPoints cloud={lidar.cloud} settings={lidar.settings} />
+      {lidar.mount && <LidarMarker mount={lidar.mount} />}
     </group>
   )
 }
@@ -544,10 +575,12 @@ const SceneCanvas = memo(function SceneCanvas({
   live,
   planned,
   store,
+  lidar,
 }: {
   live: LoadedRobot
   planned: LoadedRobot
   store: SceneStore
+  lidar: JogLidar | null
 }) {
   // Frame the whole robot once per model.
   const view = useMemo(() => framing(live.scene, FOV), [live])
@@ -570,6 +603,7 @@ const SceneCanvas = memo(function SceneCanvas({
       <directionalLight position={[3, 5, 2]} intensity={1.5} />
       <directionalLight position={[-3, 2.5, -2]} intensity={0.45} />
       <LiveScene live={live} planned={planned} store={store} />
+      {lidar && <LidarLayer robot={live.robot} lidar={lidar} />}
       <gridHelper
         args={[12, 48, "#3a3d44", "#24262b"]}
         position={[view.target.x, view.floor, view.target.z]}
@@ -591,6 +625,7 @@ export default function JogViewer({
   onTargetChange,
   onSelectArm,
   onDragging = () => undefined,
+  lidar = null,
 }: {
   robotModel: AxolModel
   gripper: GripperType
@@ -603,6 +638,8 @@ export default function JogViewer({
   onTargetChange: (pose: JogPose) => void
   onSelectArm: (arm: JogArm) => void
   onDragging?: (dragging: boolean) => void
+  /** The live lidar scan to draw around the base, or null for none. */
+  lidar?: JogLidar | null
 }) {
   const [live, setLive] = useState<LoadedRobot | null>(null)
   const [planned, setPlanned] = useState<LoadedRobot | null>(null)
@@ -654,5 +691,5 @@ export default function JogViewer({
         <Loader2 className="size-4 animate-spin" /> Loading the robot model…
       </div>
     )
-  return <SceneCanvas live={live} planned={planned} store={store} />
+  return <SceneCanvas live={live} planned={planned} store={store} lidar={lidar} />
 }

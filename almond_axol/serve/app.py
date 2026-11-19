@@ -64,6 +64,7 @@ from .commands import (
     safety_flags,
 )
 from .jelly_link import JELLY_DEVICES, JellyLink, device_presence
+from .lidar_link import DEFAULT_POINTS, LidarHub, lidar_configured
 from .manager import Session, SessionManager
 from .robot_link import STATE_ERROR, RobotLink, scoped_motor_faults
 from .runner import OperationRunner, prove_motors_torque_free
@@ -999,6 +1000,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     manager = SessionManager()
     hub = TelemetryHub()
+    lidar_hub = LidarHub()
     settings = SettingsStore()
     # The link opens the interfaces configured in the shared settings (the
     # Axol hub's persistent names unless the operator picked others).
@@ -2061,6 +2063,36 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             pass
         finally:
             hub.unsubscribe(queue)
+
+    # -- lidar (live scans for the 3D views) ---------------------------------
+
+    @app.get("/api/lidar/status")
+    async def lidar_status() -> dict[str, Any]:
+        """Whether a lidar is set up, so the panel knows to show its view."""
+        configured = await asyncio.to_thread(lidar_configured)
+        return {"configured": configured}
+
+    @app.websocket("/api/lidar/ws")
+    async def lidar_ws(ws: WebSocket, points: int = DEFAULT_POINTS) -> None:
+        """Live lidar frames in the base frame (see :mod:`.lidar_link`).
+
+        ``points`` caps the points per frame (about 10 frames a second).
+        """
+        await ws.accept()
+        sub = lidar_hub.subscribe(points)
+        try:
+            async with contextlib.aclosing(
+                _stream_until_disconnect(ws, sub.queue)
+            ) as stream:
+                async for message in stream:
+                    if isinstance(message, bytes):
+                        await ws.send_bytes(message)
+                    else:
+                        await ws.send_json(message)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            lidar_hub.unsubscribe(sub)
 
     # -- diagnostics runs (script launches with telemetry capture) -----------
 
@@ -3772,6 +3804,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         await asyncio.to_thread(robot.shutdown)
         await asyncio.to_thread(jelly.shutdown)
         await asyncio.to_thread(safety.shutdown)
+        await asyncio.to_thread(lidar_hub.shutdown)
 
     if static_dir is not None:
         _mount_spa(app, static_dir)

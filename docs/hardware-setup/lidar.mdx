@@ -73,6 +73,24 @@ The lidar can't see the floor close to Jelly. Mounted 1 m above the floor, its v
   </Step>
 </Steps>
 
+## See the scan in the control panel
+
+Once the lidar is set up, the control panel shows its live scan around the robot:
+
+- **Teleop and data collection**: a **Lidar** view under the camera feeds, with the robot model at its live pose.
+- **Jog**: the scan around the robot in the 3D view. Turn it off with **Show lidar**.
+
+Drag to orbit, scroll to zoom, and press the reset button to go back to the starting view.
+
+| Control | What it does |
+|---|---|
+| **History** | How many seconds of scans to show at once. More fills in the scene. Less keeps up better while the robot moves. |
+| **Point size** | The size of each point. |
+| **Hide above** | Hides points above this height, so you can see under a ceiling. |
+| **Color by** | Colors points by their height or by how much light they reflect. |
+
+The control panel, `lidar.view` and the `nav` commands can all read the lidar at the same time.
+
 `lidar.setup` asks for your password, because it changes the network settings. It gives the lidar's port its own address, so the lidar can't clash with your network. See [`lidar.setup`](/cli/lidar-setup) for details.
 
 ## Troubleshooting

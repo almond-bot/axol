@@ -2358,6 +2358,13 @@ export default function ControlPanel() {
     currentEntry.summary && currentEntry.summary !== meta.description
       ? { ...meta, description: currentEntry.summary }
       : meta
+  // The robot the host drives, for the 3D views.
+  const hostRobot = settingsSnap
+    ? {
+        model: settingsSnap.robotModel ?? "classic",
+        gripper: parseGripper(settingsSnap.values["axol.gripper"]),
+      }
+    : null
   const runningEntry = runningOp
     ? catalogEntry(
         runningOp,
@@ -2715,6 +2722,7 @@ export default function ControlPanel() {
               onStart={handleStart}
               onStop={handleStop}
               onEpisode={handleEpisode}
+              hostRobot={hostRobot}
               workspace={
                 opId === "jog" ? (
                   <Suspense
@@ -2732,14 +2740,7 @@ export default function ControlPanel() {
                           : isSimRun(meta, settings)
                       }
                       simRobot={simRobot}
-                      hostRobot={
-                        settingsSnap
-                          ? {
-                              model: settingsSnap.robotModel ?? "classic",
-                              gripper: parseGripper(settingsSnap.values["axol.gripper"]),
-                            }
-                          : null
-                      }
+                      hostRobot={hostRobot}
                       video={{ host: viewerHost, vrPort: hostInfo?.vrPort ?? 8000 }}
                     />
                   </Suspense>

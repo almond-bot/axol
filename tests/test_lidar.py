@@ -325,6 +325,47 @@ class StreamTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             LidarStream(LidarConfig()).start()
 
+    def test_second_reader_shares_and_takes_over(self) -> None:
+        cfg = LidarConfig(
+            lidar_ip="127.0.0.1",
+            host_ip="127.0.0.1",
+            point_port=_free_port(),
+            imu_port=_free_port(),
+            tap_port=_free_port(),
+        )
+        fake = _FakeLidar(cfg.point_port, cfg.imu_port)
+        fake.start()
+        try:
+            first = LidarStream(cfg, configure=False).start()
+            second = LidarStream(cfg, configure=False).start()
+            try:
+                self.assertFalse(first.shared)
+                self.assertTrue(second.shared)
+                # Both get frames from the one set of ports.
+                self.assertIsNotNone(first.get(3.0))
+                self.assertIsNotNone(second.get(3.0))
+                np.testing.assert_allclose(second.latest().xyz[0], [2, 2, 2], atol=1e-3)
+                deadline = time.monotonic() + 2
+                while not second.imu_recent(1) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(second.imu_recent(1))
+                self.assertEqual(first.tap_readers(), 1)
+                # When the owner exits, the reader binds the ports itself.
+                first.stop()
+                deadline = time.monotonic() + 5
+                while second.shared and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertFalse(second.shared)
+                while second.get(0.01) is not None:
+                    pass
+                self.assertIsNotNone(second.get(3.0))
+            finally:
+                first.stop()
+                second.stop()
+        finally:
+            fake.stop.set()
+            fake.join(1)
+
 
 class NetworkTest(unittest.TestCase):
     def test_choose_host_ip(self) -> None:

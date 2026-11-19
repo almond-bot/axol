@@ -124,7 +124,7 @@ def run(args: argparse.Namespace) -> None:
         2.2,
         hint="Hide points higher than this above the floor, such as the ceiling.",
     )
-    color_by = server.gui.add_dropdown("Colour by", ["Height", "Reflectivity"])
+    color_by = server.gui.add_dropdown("Color by", ["Height", "Reflectivity"])
 
     @size.on_update
     def _(_) -> None:
