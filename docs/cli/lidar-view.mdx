@@ -3,11 +3,18 @@ title: "lidar.view"
 description: "Show the live lidar point cloud in a browser."
 ---
 
-Shows the live point cloud at `http://<robot>:8010`, coloured by height. Points are drawn on the robot's base, using the mount saved by [`lidar.setup`](/cli/lidar-setup), so the floor sits on the grid.
+Shows the live point cloud at `http://<robot>:8010`. Points are drawn on the robot's base, using the mount saved by [`lidar.setup`](/cli/lidar-setup), so the floor sits on the grid.
 
 ```bash
 axol lidar.view
-axol lidar.view --port 8011 --history 1.0
+axol lidar.view --port 8011 --history 5
 ```
 
-`--history` sets how many seconds of points are shown at once. The Mid-360 fills in its view over about a second, so a longer history looks denser.
+| Control | What it does |
+|---|---|
+| **History (s)** | Seconds of points shown at once, up to 10. |
+| **Point size (cm)** | How big each point is drawn. |
+| **Hide above (m)** | Hides points higher than this above the floor, such as the ceiling. |
+| **Colour by** | Colours points by their height or by how much light they reflect. |
+
+The Mid-360 never measures the same spot twice, so the picture gets sharper the longer points are kept. Keep the robot still for a sharp picture. Large point clouds refresh less often, so the browser keeps up over Wi-Fi.
