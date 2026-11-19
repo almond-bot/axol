@@ -1,0 +1,77 @@
+---
+title: "Troubleshooting"
+description: "Find and fix common problems with Axol and its Compute Kit."
+---
+
+## The compute does not turn on
+
+Use these steps when you can't reach the Host Computer. The control panel doesn't load, and SSH doesn't connect.
+
+How the Compute Kit gets power depends on your setup:
+
+- **Axol on Jelly**: the Compute Kit runs on Jelly's battery, through a **12V, 8A** regulator in Jelly's base.
+- **Every other setup**: the Compute Kit runs on its own DC adapter, separate from Axol's power supply.
+
+Steps marked **Axol on Jelly only** don't apply to other setups. Skip them.
+
+<Note>
+  The power light and reflash steps are for the **ZED Box Orin** (Jetson Orin NX 16GB). If you have a Jetson AGX Orin or a Jetson Thor, do the power checks, then email [support@almond.bot](mailto:support@almond.bot).
+</Note>
+
+### Check that Jelly has power (Axol on Jelly only)
+
+<Steps>
+  <Step title="Charge the battery">
+    Make sure Jelly's battery is charged. See [Charging Jelly](/hardware-setup/jelly#charging-jelly).
+  </Step>
+  <Step title="Turn Jelly on">
+    Release the E-Stop, turn the red power switch on and press the green on-switch. See [Power panel](/hardware-setup/jelly#power-panel).
+  </Step>
+  <Step title="Check the motor lights">
+    Check that the lights on Axol's motors are on. If they are off, Jelly has no power. Charge the battery and try again.
+  </Step>
+</Steps>
+
+### Check the ZED Box power light
+
+The ZED Box has a green power light. If the light is on, the ZED Box has power. Go to [Reflash the operating system](#reflash-the-operating-system).
+
+If the light is off, work through these steps:
+
+<Steps>
+  <Step title="Re-seat the power plug">
+    Unplug the power plug from the ZED Box, then push it back in firmly.
+  </Step>
+  <Step title="Measure the voltage">
+    Unplug the power plug from the ZED Box again, and leave the power source on. Measure the plug with a multimeter. Put one probe inside the barrel plug and the other on its outer sleeve.
+
+    | Setup | Expected reading |
+    |---|---|
+    | Axol on Jelly | 12V from Jelly's regulator |
+    | Every other setup | The voltage printed on the adapter's label |
+
+    If you read 0V or a low value, the power source is the problem. On Jelly, the regulator or its lead is faulty. Email [support@almond.bot](mailto:support@almond.bot). On other setups, check the adapter's wall outlet, then try another adapter.
+  </Step>
+  <Step title="Try the ZED Box's own adapter (Axol on Jelly only)">
+    On Jelly, the ZED Box's own AC adapter stays in the ZED Box packaging. Unplug Jelly's power lead from the ZED Box and plug in that adapter instead. If the green light turns on, Jelly's regulator or its lead is the problem. Email [support@almond.bot](mailto:support@almond.bot).
+  </Step>
+</Steps>
+
+If the green light stays off with a good power source, email [support@almond.bot](mailto:support@almond.bot).
+
+### Reflash the operating system
+
+If the green light is on but you still can't connect, first check the basics:
+
+- Your computer is on the same network as the Host Computer.
+- You are using the Host Computer's correct IP address.
+
+If you still can't connect over SSH, the operating system is probably corrupted. This can happen when power is cut while the computer is running. Reflash it with the Stereolabs [ZED Box reset and update guide](https://docs.stereolabs.com/docs/products/embedded/zed-box-series/zed-box/reset-update).
+
+<Warning>
+  Reflashing erases everything on the computer, including recordings saved on it.
+</Warning>
+
+After you reflash, install the Axol software again. Follow [Installation](/installation).
+
+To avoid a corrupted operating system, shut the computer down from its operating system before you cut its power.

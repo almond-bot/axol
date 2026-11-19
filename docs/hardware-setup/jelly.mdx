@@ -108,7 +108,7 @@ Some Jelly builds include a safety board. On those, you can also cut power from 
 
 The Compute Kit ships separately and goes inside the compartment in Jelly's base. Every cable it needs is already in the compartment, so you only plug them in:
 
-- A **19V DC power lead** (up to **5A**) from Jelly's battery.
+- A **12V DC power lead** from Jelly's **12V, 8A regulator**, which runs on Jelly's battery.
 - The **USB-to-CAN adapters** for the wheels and the lift.
 - Two **antenna cables** (the braided pair on the right in the photo).
 - Axol's **USB-C** control cable.
@@ -122,7 +122,7 @@ The Compute Kit ships separately and goes inside the compartment in Jelly's base
     - **Jetson AGX Orin**: 4× **M6×12** Torx bolts (T30).
   </Step>
   <Step title="Connect power, CAN, and antennas">
-    - Plug the **19V, 5A** DC power lead into the computer's power input.
+    - Plug the **12V, 8A** DC power lead into the computer's power input.
     - Plug the wheel and lift **USB-to-CAN** adapters into its USB ports.
     - Connect the two **antenna cables** to its antenna connectors.
   </Step>
@@ -130,6 +130,8 @@ The Compute Kit ships separately and goes inside the compartment in Jelly's base
     Plug Axol's USB-C control cable into a USB port on the computer. Plug the camera cables into its **GMSL2** inputs.
   </Step>
 </Steps>
+
+If the computer does not turn on, see [The compute does not turn on](/troubleshooting#the-compute-does-not-turn-on).
 
 <MountAxol />
 
