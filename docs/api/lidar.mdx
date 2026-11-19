@@ -1,0 +1,80 @@
+---
+title: "almond_axol.lidar"
+description: "Read the Livox Mid-360's points and IMU in Python, frame by frame."
+---
+
+`LidarStream` receives the lidar's point and IMU streams in a background thread and cuts the points into frames. It needs the address saved by [`axol lidar.setup`](/cli/lidar-setup). The driver is plain Python and needs no Livox software.
+
+```python
+from almond_axol.lidar import LidarConfig, LidarStream, LidarFrame, ImuSample, LivoxClient
+```
+
+## `LidarStream`
+
+```python
+from almond_axol.lidar import LidarConfig, LidarStream
+
+with LidarStream(LidarConfig.load()) as lidar:
+    for frame in lidar.frames():
+        print(len(frame), "points, first at", frame.stamp)
+        imu = lidar.imu_between(frame.stamp, frame.stamp + frame.duration)
+```
+
+On start, the stream points the lidar at this computer and starts it sampling. Frames arrive at 10 Hz with about 17,000 points each. All times are on this computer's `time.monotonic()` clock, so they line up with the rest of Axol.
+
+| Method | What it does |
+|---|---|
+| `frames(timeout)` | Yields frames as they arrive. Raises `TimeoutError` if none come for `timeout` seconds. |
+| `get(timeout)` | Returns the oldest waiting frame, or `None` after `timeout` seconds. Up to 4 frames wait. Older ones are dropped. |
+| `latest()` | Returns the newest frame, or `None`. |
+| `imu_between(t0, t1)` | Returns the IMU samples from `t0` up to `t1`. |
+| `imu_recent(n)` | Returns the last `n` IMU samples. |
+| `stats()` | Returns the measured packet, point, IMU and frame rates. |
+
+`on_frame` and `on_imu` callbacks run on the receive thread. Keep them short.
+
+## `LidarFrame`
+
+Points are in the lidar's own frame. Use `LidarConfig.mount.matrix()` to move them onto the robot's base.
+
+| Field | What it holds |
+|---|---|
+| `stamp` | Time of the first point (s, `time.monotonic()` clock). |
+| `xyz` | Points in metres, float32, shape `(n, 3)`. |
+| `reflectivity` | 0 to 255 per point. |
+| `tag` | Livox confidence tag per point. |
+| `times` | Seconds of each point after `stamp`. |
+| `duration` | Seconds from the first to the last point. |
+| `seq` | Frame counter. |
+
+## `ImuSample`
+
+| Field | What it holds |
+|---|---|
+| `stamp` | Time of the sample (s, `time.monotonic()` clock). |
+| `gyro` | Angular rate in rad/s, lidar frame. |
+| `accel` | Acceleration in m/s², lidar frame. Reads about +9.81 on the up axis at rest. |
+
+## `LidarConfig`
+
+`LidarConfig.load()` reads `~/.almond/lidar.json`. `mount` is a `LidarMount`: where the lidar sits on the base, in metres and degrees.
+
+```python
+from almond_axol.lidar import LidarConfig
+
+config = LidarConfig.load()
+t_base_lidar = config.mount.matrix()   # 4x4: lidar frame to base frame
+```
+
+## `LivoxClient`
+
+Sends commands to the lidar and reads its status.
+
+```python
+from almond_axol.lidar import LidarConfig, LivoxClient
+
+config = LidarConfig.load()
+with LivoxClient(config.lidar_ip, config.host_ip) as client:
+    status = client.status()
+    print(status.serial, status.firmware, status.temperature_c)
+```

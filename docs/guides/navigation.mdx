@@ -1,0 +1,100 @@
+---
+title: "Mapping and Navigation"
+description: "Map a space with the lidar, save waypoints, and drive Axol on Jelly to them."
+---
+
+With a [lidar](/hardware-setup/lidar) on the robot, Axol on Jelly can find its way around a space you have mapped. You map the space once, save the places it should go as waypoints, and then send it to them.
+
+<Warning>
+  Jelly drives itself in this mode. Keep the E-Stop within reach and people out of its way. Put the arms at rest before you start: navigation doesn't move them, and it only keeps the base clear of obstacles.
+</Warning>
+
+## Before you start
+
+- Set up the lidar with [`lidar.setup`](/cli/lidar-setup), including `--measure-mount`.
+- Run navigation on the Compute Kit that Jelly is connected to.
+- Stop teleoperation first. Only one program can drive Jelly at a time.
+
+## Make a map
+
+<Steps>
+  <Step title="Pick a starting spot">
+    Put the robot where the map should start, such as a charging spot or a mark on the floor. This spot becomes the map's origin. Starting each later session here lets the robot find itself right away.
+  </Step>
+  <Step title="Start mapping">
+    ```bash
+    axol nav.map office
+    ```
+
+    Open `http://<robot>:8010` to watch the map grow.
+  </Step>
+  <Step title="Drive through the space">
+    Drive the robot with the headset, using teleoperation from the control panel. Drive slowly, turn slowly, and pass through every area and doorway the robot should reach. Come back to the starting spot at the end.
+  </Step>
+  <Step title="Save it">
+    Press **Save map** in the map view, or Ctrl-C in the terminal.
+  </Step>
+</Steps>
+
+Map an empty space if you can. A cell counts as an obstacle when the lidar saw something there at a height the robot could hit. People who walked through while you mapped are mostly removed, but objects that stood still for a while stay in the map. Map again after you move furniture.
+
+The map is saved in `~/.almond/maps/office/`. `map.png` is a picture of it: white is clear floor, black is an obstacle, and grey is unexplored.
+
+## Drive to waypoints
+
+```bash
+axol nav.run office
+```
+
+`nav.run` finds the robot on the map and opens the map view at `http://<robot>:8010`. The view shows the map, the robot, the live scan in orange and the planned path in green.
+
+| Control | What it does |
+|---|---|
+| **Go to waypoint** | Drive to the waypoint chosen in **Waypoint**. |
+| **Visit all in order** | Drive to every waypoint in turn. Tick **Repeat** to keep going. |
+| **Click a goal on the map** | Drive to the point you click next. |
+| **Stop** | Stop right away. |
+| **Save current position** | Save where the robot is now as a waypoint, under **Name**. |
+| **Delete selected waypoint** | Delete the waypoint chosen in **Waypoint**. |
+| **Set robot pose by clicking** | Tell the robot where it is: click where it stands, then a point it faces. |
+
+To save waypoints, drive the robot to each place with the headset, then press **Save current position**. You can also add waypoints by their coordinates. See [`nav.waypoint`](/cli/nav-waypoint).
+
+To drive from a script, use [`nav.goto`](/cli/nav-run). It exits when the robot arrives:
+
+```bash
+axol nav.goto office bench
+axol nav.goto office bench dock --loop
+```
+
+## How it drives
+
+- The robot plans the shortest route that keeps it 0.45 m from obstacles, and keeps to the middle of doorways and corridors.
+- It drives at up to 0.3 m/s. Change this with `--speed`, up to 0.7 m/s.
+- It stops for anything in its way that isn't on the map, such as a person or a box. After 3 seconds it looks for a way around. After 60 seconds it gives up.
+- It slows to half speed when something is within 0.7 m of the base.
+- It stops if it can no longer match its scan to the map. The status shows **Not localized**.
+
+## When the robot can't find itself
+
+When `nav.run` starts, the robot looks for itself near where it was last, or near the map's origin. If it can't find a clear match, the status shows **Not localized** and it won't drive.
+
+- Drive the robot back to where mapping started, or
+- press **Set robot pose by clicking** and click where the robot is, then a point it faces, or
+- start with `--start X Y HEADING`, in metres and degrees on the map.
+
+## Limits
+
+- The lidar can't see low objects close to the robot, glass, or thin rails. Keep these out of its path.
+- The map is flat: ramps and stairs aren't supported.
+- Navigation keeps the base clear, not the arms. Keep the arms at rest.
+
+## Try it in simulation
+
+You can try mapping and navigation without hardware, in a simulated office:
+
+```bash
+axol nav.map demo --sim
+axol nav.waypoint demo add bench 6.5 -0.5 90
+axol nav.run demo --sim
+```

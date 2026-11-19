@@ -1,0 +1,65 @@
+---
+title: "almond_axol.nav"
+description: "Build maps, localize, plan paths and drive Jelly from Python."
+---
+
+The navigation commands are built from parts you can also use on their own. Positions are in metres and headings in radians. The map frame has its origin where mapping started, +z up and the floor at z = 0.
+
+```python
+from almond_axol.nav import Map, MapBuilder, LidarOdometry, Localizer, Planner, PathFollower, NavSession, NavWaypoints, Pose2D
+```
+
+## `Map`
+
+`Map.load(name)` reads a map saved by `axol nav.map`. It has a 3D point cloud (`cloud`) and a 2D occupancy grid (`grid`).
+
+```python
+from almond_axol.nav import Map
+
+office = Map.load("office")
+grid = office.grid
+print(grid.shape, grid.resolution, grid.value_at(1.0, 2.0))
+```
+
+`grid.data` holds 0 for unexplored, 1 for clear floor and 2 for an obstacle.
+
+## `NavSession`
+
+`NavSession` localizes on a map and drives to goals. Pass it a lidar stream and anything with a `set_command(vx, vy, wz)` method, such as `Jelly`.
+
+```python
+from almond_axol.lidar import LidarConfig, LidarStream
+from almond_axol.nav import Map, NavSession
+
+config = LidarConfig.load()
+session = NavSession(Map.load("office"), config.mount.matrix(), drive=None)
+with LidarStream(config) as lidar:
+    session.start(lidar)
+    session.goto(["bench"])
+```
+
+| Method | What it does |
+|---|---|
+| `goto(targets, loop)` | Drive to each waypoint name or `Pose2D` in turn. |
+| `cancel(message)` | Stop and forget the goals. |
+| `set_pose(pose)` | Tell the session where the robot is. |
+| `add_waypoint(name)` | Save the robot's current pose as a waypoint. |
+| `status()` | Returns a `NavStatus`: state, message, pose, path and more. |
+| `step(frame, imu)` | Process one frame. Use it to drive the session yourself instead of `start`. |
+| `stop()` | Stop the session's threads. |
+
+With `drive=None` the session finds the robot and plans, but never drives.
+
+## Building blocks
+
+| Class | What it does |
+|---|---|
+| `LidarOdometry` | Tracks the base's pose from scan to scan. `update(frame, imu)` returns the pose and the scan on the base. |
+| `MapBuilder` | Collects registered scans with `add(pose, points)`. `build(name)` returns a `Map`. |
+| `Localizer` | Finds the base on a `Map`. `initialize(frame)` searches near a guess, then `update(frame)` tracks it. |
+| `Planner` | Plans a path on a map's grid with `plan(start, goal)`. Raises `NoPath` when there is none. |
+| `PathFollower` | Turns a path and the current pose into a velocity command with `command(pose)`. |
+| `ObstacleMonitor` | Checks a scan for obstacles near the base with `check(points, vx, vy)`. |
+| `NavWaypoints` | Loads, edits and saves a map's waypoints. |
+
+`almond_axol.nav.sim` has a simulated office, lidar and base, for testing code without hardware.

@@ -500,6 +500,11 @@ class _ApiChecker(ast.NodeVisitor):
                 f"{ast.unparse(node.func)} is a property, not a method"
             )
             return
+        if isinstance(callee, (classmethod, staticmethod)):
+            # getattr_static returns the raw descriptor (a classmethod is not
+            # itself callable); check the function it wraps. Its ``cls``
+            # parameter is dropped below like a method's ``self``.
+            callee = callee.__func__
         if not callable(callee):
             self.problems.append(f"{ast.unparse(node.func)} is not callable")
             return

@@ -1,0 +1,17 @@
+---
+title: "nav.waypoint"
+description: "List, add and delete the waypoints saved on a map."
+---
+
+Lists a map's waypoints, or adds and deletes them. A waypoint is a place on the map and the direction to face there.
+
+```bash
+axol nav.waypoint office
+axol nav.waypoint office add bench 4.2 -1.5 90
+axol nav.waypoint office add dock --here
+axol nav.waypoint office remove bench
+```
+
+`add` takes the position in metres and the heading in degrees, counter-clockwise from the map's x axis. `--here` saves where the robot is now. Keep the robot still while it finds itself.
+
+To save waypoints while you drive, use **Save current position** in the [`nav.run`](/cli/nav-run) map view. Waypoints are saved in `~/.almond/maps/NAME/waypoints.json`.

@@ -1,0 +1,25 @@
+---
+title: "lidar.setup"
+description: "Find the lidar, set up its network port, and save its address and mount."
+---
+
+Finds a Livox Mid-360 on one of the Compute Kit's Ethernet ports, sets up that port, and saves the result to `~/.almond/lidar.json`. Every lidar and navigation command reads that file.
+
+```bash
+axol lidar.setup
+axol lidar.setup --iface end0
+axol lidar.setup --mount 0.2 0 0 0 0 0 --measure-mount
+```
+
+| Option | What it does |
+|---|---|
+| `--iface` | The Ethernet port the lidar is plugged into. By default, every port is searched. |
+| `--host-ip` | The address this computer takes on the lidar's port. By default, the address the lidar already sends to (`192.168.1.5` from the factory). |
+| `--mount X Y Z ROLL PITCH YAW` | Where the lidar sits: metres from the centre of the base at floor level (+x forward, +y left, +z up), then degrees. |
+| `--measure-mount` | Measure the lidar's height and tilt. Keep the robot still on a level floor. X, Y and YAW come from `--mount`. |
+| `--no-network` | Detect the lidar and save its address without changing the network. |
+| `--force` | Set up the port even if it carries this computer's internet connection. |
+
+The command asks for your password. It gives the port one address and a route to the lidar alone, so the lidar's `192.168.1.x` address never clashes with your network. The setting is saved as the `axol-lidar` network profile and comes back after a restart.
+
+At the end it prints the lidar's status and checks its data rate. See [Lidar](/hardware-setup/lidar) for wiring and mounting.

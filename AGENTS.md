@@ -93,6 +93,7 @@ For cloud development: `uv sync --extra sim --extra lerobot` (the `lerobot` extr
 - Python 3.13+ is required (`.python-version` pins `3.13`). The VM ships with 3.12; use `uv python install 3.13` if needed.
 - The `uv` package manager must be on PATH (`$HOME/.local/bin`).
 - Hardware-dependent commands (`can.setup`, `motor.*`, `gravity-comp`, `tune.*`, `zed.*`, `collect-data`, `collect-dagger`, `run-policy`) will fail without physical robot/CAN bus — this is expected.
+- Lidar and navigation: `almond_axol/lidar` is a pure-Python driver for the Livox Mid-360 (protocol in `livox.py`, streaming in `stream.py`); `almond_axol/nav` builds odometry, maps, localization, planning and driving on it with `small_gicp`. Without hardware, use the simulated office: `uv run axol nav.map demo --sim`, then `uv run axol nav.run demo --sim` (map view on port 8010). `tests/test_nav.py` runs the closed loop in that simulator. `lidar.setup` writes a NetworkManager profile (`axol-lidar`) with /32 routes so the lidar's factory `192.168.1.x` subnet never shadows the robot's LAN.
 
 ### Tuning a real robot (guiding an operator)
 

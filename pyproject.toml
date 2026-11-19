@@ -48,6 +48,9 @@ dependencies = [
     "cryptography>=42",
     "python-can>=4.6.1,<5",
     "scipy>=1.17.1,<2",
+    # Scan registration for lidar mapping, localization and navigation
+    # (almond_axol.nav). One self-contained wheel per platform, no dependencies.
+    "small-gicp==1.0.1",
     "uvicorn[standard]>=0.42.0,<0.43",
     # Custom policy protocol (almond_axol.policy): the sync client/server API.
     "websockets>=13,<16",
