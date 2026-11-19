@@ -35,6 +35,15 @@ import { fetchSavedMaps, mapStatusLine } from "@/lib/lidar-map"
 import { apiUrl, type AxolModel, type GripperType } from "@/lib/supervisor"
 
 const LIVE = "__live__"
+const SHOW_MAP_KEY = "axolSensorsShowMap"
+
+function loadShowMap(): boolean {
+  try {
+    return localStorage.getItem(SHOW_MAP_KEY) !== "0"
+  } catch {
+    return true
+  }
+}
 
 function toneClass(tone: "ok" | "wait" | "bad") {
   return tone === "ok"
@@ -61,6 +70,7 @@ export default function SensorsWorkspace({
   })
   const [settings, setSettings] = useState<LidarSettings>(loadLidarSettings)
   const [follow, setFollow] = useState(true)
+  const [showMap, setShowMap] = useState(loadShowMap)
   const [large, setLarge] = useState(false)
   const [savedMaps, setSavedMaps] = useState<string[]>([])
   const [vrSocket, setVrSocket] = useState<WebSocket | null>(null)
@@ -90,6 +100,15 @@ export default function SensorsWorkspace({
       }),
     [map]
   )
+
+  const toggleMap = (on: boolean) => {
+    setShowMap(on)
+    try {
+      localStorage.setItem(SHOW_MAP_KEY, on ? "1" : "0")
+    } catch {
+      // Private mode or blocked storage: the choice lasts until reload.
+    }
+  }
 
   const change = (next: LidarSettings) => {
     setSettings(next)
@@ -149,10 +168,19 @@ export default function SensorsWorkspace({
           </div>
           <div className="flex items-center gap-3 text-xs">
             {configured === true && (
-              <label className="flex items-center gap-2 text-white/55">
-                <Switch checked={follow} onChange={setFollow} aria-label="Follow robot" />
-                Follow robot
-              </label>
+              <>
+                <label
+                  className="flex items-center gap-2 text-white/55"
+                  title="Show the map, or only the live scan"
+                >
+                  <Switch checked={showMap} onChange={toggleMap} aria-label="Show map" />
+                  Show map
+                </label>
+                <label className="flex items-center gap-2 text-white/55">
+                  <Switch checked={follow} onChange={setFollow} aria-label="Follow robot" />
+                  Follow robot
+                </label>
+              </>
             )}
             <button
               type="button"
@@ -207,6 +235,7 @@ export default function SensorsWorkspace({
             cloud={cloud}
             map={map}
             useMap={configured === true}
+            showMap={showMap}
             mapEpoch={mapEpoch}
             settings={settings}
             mount={status.mount}

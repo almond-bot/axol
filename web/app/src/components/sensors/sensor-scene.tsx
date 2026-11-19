@@ -307,6 +307,7 @@ export function SensorScene({
   cloud,
   map,
   useMap,
+  showMap,
   mapEpoch,
   settings,
   mount,
@@ -319,6 +320,8 @@ export function SensorScene({
   map: LidarMap
   /** Place the robot by the map's pose. */
   useMap: boolean
+  /** Draw the map's points. Off shows only the live scan. */
+  showMap: boolean
   /** The live map whose frame the scans are drawn in, or null for around the robot. */
   mapEpoch: number | null
   settings: LidarSettings
@@ -356,7 +359,7 @@ export function SensorScene({
         fadeStrength={1.5}
       />
       <group rotation={[-Math.PI / 2, 0, 0]}>
-        {useMap && <MapPoints map={map} clip={clip} />}
+        {useMap && showMap && <MapPoints map={map} clip={clip} />}
         {useMap && <Trail map={map} />}
         {/* On a map, each scan is drawn where it was taken. */}
         {mapEpoch !== null && <LidarPoints cloud={cloud} settings={settings} mapEpoch={mapEpoch} />}
