@@ -6,8 +6,8 @@
  * that frame from `/api/lidar/ws`; the robot model is shifted so its `jelly`
  * link sits there too.
  */
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react"
-import { Canvas, useFrame } from "@react-three/fiber"
+import { useMemo, useRef, useState, type RefObject } from "react"
+import { Canvas } from "@react-three/fiber"
 import { Grid, OrbitControls } from "@react-three/drei"
 import { type OrbitControls as OrbitControlsImpl } from "three-stdlib"
 import { Vector3 } from "three"
@@ -15,6 +15,7 @@ import { AlertTriangle, Loader2, Maximize2, Minimize2, RotateCcw } from "lucide-
 import { useUrdfRobot } from "@/components/settings/urdf-robot"
 import { LidarMarker, LidarPoints } from "@/components/lidar/lidar-points"
 import { LidarControls } from "@/components/lidar/lidar-controls"
+import { useJointPose, useJointPush } from "@/components/lidar/joint-push"
 import { useLidarStream } from "@/lib/lidar-stream"
 import {
   lidarStatusLine,
@@ -22,43 +23,14 @@ import {
   saveLidarSettings,
   type LidarSettings,
 } from "@/lib/lidar"
-import { liveRobotTargets, type LiveRobotSample } from "@/lib/live-robot"
+import { type LiveRobotSample } from "@/lib/live-robot"
 import { type AxolModel, type GripperType } from "@/lib/supervisor"
 
 const CAMERA_START = new Vector3(-3.2, 2.6, 3.2) // Y-up: behind-left of the robot, above
 const TARGET_START = new Vector3(0, 0.6, 0)
-const SMOOTHING_TAU = 0.06
 
 /** The base link the lidar's mount is measured from, by robot model. */
 const BASE_LINKS = ["jelly", "cart"]
-
-/** Latest `joints` push from the teleop server on `socket`. */
-function useJointPush(socket: WebSocket | null): RefObject<LiveRobotSample | null> {
-  const ref = useRef<LiveRobotSample | null>(null)
-  useEffect(() => {
-    ref.current = null
-    if (!socket) return
-    const onMessage = (event: MessageEvent) => {
-      if (typeof event.data !== "string" || !event.data.includes('"joints"')) return
-      try {
-        const msg = JSON.parse(event.data) as { type?: string; value?: Partial<LiveRobotSample> }
-        const v = msg.type === "joints" ? msg.value : null
-        if (!v || typeof v.q !== "object" || v.q === null) return
-        ref.current = {
-          q: v.q,
-          l_grip: typeof v.l_grip === "number" ? v.l_grip : 1,
-          r_grip: typeof v.r_grip === "number" ? v.r_grip : 1,
-          lift: typeof v.lift === "number" ? v.lift : null,
-        }
-      } catch {
-        // not ours
-      }
-    }
-    socket.addEventListener("message", onMessage)
-    return () => socket.removeEventListener("message", onMessage)
-  }, [socket])
-  return ref
-}
 
 function RobotAtPose({
   robotModel,
@@ -78,20 +50,7 @@ function RobotAtPose({
     model.scene.updateWorldMatrix(true, true)
     return link.getWorldPosition(new Vector3()).negate()
   }, [model])
-  const smooth = useRef<Record<string, number> | null>(null)
-
-  useFrame((_, delta) => {
-    const sample = joints.current
-    if (!model || !sample) return
-    const targets = liveRobotTargets(sample, model.robot)
-    if (!smooth.current) smooth.current = { ...targets }
-    const alpha = 1 - Math.exp(-delta / SMOOTHING_TAU)
-    for (const [name, value] of Object.entries(targets)) {
-      const prev = smooth.current[name] ?? value
-      smooth.current[name] = prev + (value - prev) * alpha
-      model.robot.joints[name]?.setJointValue(smooth.current[name])
-    }
-  })
+  useJointPose(model?.robot ?? null, joints)
 
   if (!model || !offset) return null
   return (

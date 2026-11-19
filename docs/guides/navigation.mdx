@@ -29,7 +29,7 @@ With a [lidar](/hardware-setup/lidar) on the robot, Axol on Jelly can find its w
     Open `http://<robot>:8010` to watch the map grow.
   </Step>
   <Step title="Drive through the space">
-    Drive the robot with the headset, using teleoperation from the control panel. The teleop screen shows the live lidar scan. Drive slowly, turn slowly, and pass through every area and doorway the robot should reach. Come back to the starting spot at the end.
+    Drive the robot with the headset, using teleoperation from the control panel. The teleop screen shows the live lidar scan, and the [Sensors](/guides/control-panel#sensors) page shows the map so far. Drive slowly, turn slowly, and pass through every area and doorway the robot should reach. Come back to the starting spot at the end.
   </Step>
   <Step title="Save it">
     Press **Save map** in the map view, or Ctrl-C in the terminal.
@@ -74,6 +74,8 @@ axol nav.goto office bench dock --loop
 - It stops for anything in its way that isn't on the map, such as a person or a box. After 3 seconds it looks for a way around. After 60 seconds it gives up.
 - It slows to half speed when something is within 0.7 m of the base.
 - It stops if it can no longer match its scan to the map. The status shows **Not localized**.
+
+To see where the robot is on a saved map without driving it, pick the map on the [Sensors](/guides/control-panel#sensors) page.
 
 ## When the robot can't find itself
 

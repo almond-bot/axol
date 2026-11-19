@@ -1561,7 +1561,9 @@ class OperationRunner:
         stereo_slots = sorted(s for s in cam_map if cam_map[s] in detected)
         stereo_note = f" (stereo: {', '.join(stereo_slots)})" if stereo_slots else ""
         resolution_note = f" @ {stream_res}" if stream_res else ""
-        viewer = "the Jog page" if op_id == "jog" else "the headset"
+        viewer = {"jog": "the Jog page", "sensors": "the Sensors page"}.get(
+            op_id, "the headset"
+        )
         session.emit(
             f"[serve] {op_id}: streaming cameras to {viewer} "
             f"({', '.join(sorted(cam_map))}){stereo_note}{resolution_note}"

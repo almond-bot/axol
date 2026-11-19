@@ -1,0 +1,15 @@
+---
+title: "sensors"
+description: "Stream the cameras to the control panel's Sensors page."
+---
+
+Stream the cameras to the [Sensors](/guides/control-panel#sensors) page of the control panel. Nothing moves: it doesn't connect to the arms, the lift or Jelly.
+
+Start and stop it from the control panel with **Start** on the Sensors page. The panel fills in the cameras from **Settings → Cameras**. The page shows the lidar and its map without this command.
+
+This command is configured through draccus (see [Command configuration](/cli/configuration)).
+
+| Flag | Description |
+|---|---|
+| `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+| `--config_path PATH` | Load a whole-config JSON/YAML file. Flags override it. |

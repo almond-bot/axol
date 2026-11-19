@@ -108,6 +108,7 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
         "Teach waypoints by hand, then replay them as straight-line moves.",
     ),
     "jog": ("jog", "Jog the arms, lift and base from the control panel."),
+    "sensors": ("sensors", "Stream the cameras to the control panel's Sensors page."),
     "collect-data": ("collect_data", "Record teleoperation episodes."),
     "collect-dagger": (
         "collect_dagger",

@@ -184,7 +184,7 @@ def _run(cfg: JogCmdConfig, stop_event: threading.Event | None = None) -> None:
 
 
 async def _run_with_cameras(
-    cfg: JogCmdConfig, session: Any, stop_event: threading.Event | None
+    cfg: Any, session: Any, stop_event: threading.Event | None, name: str = "jog"
 ) -> None:
     """Run ``session``, streaming the configured cameras to the Jog page.
 
@@ -194,10 +194,14 @@ async def _run_with_cameras(
     seconds, and a camera that fails never stops jogging. A sim run, or one
     with no cameras, streams nothing. The VR server takes no poses: nothing
     a headset sends moves the robot.
+
+    ``cfg`` needs ``cameras``, ``camera_eyes`` and ``resolution`` (and may
+    have ``sim``); the Sensors operation streams through this too, under
+    ``name`` in the log.
     """
     import asyncio
 
-    if cfg.sim or not cfg.cameras:
+    if getattr(cfg, "sim", False) or not cfg.cameras:
         await session.run(stop_event)
         return
 
@@ -215,11 +219,11 @@ async def _run_with_cameras(
             stereo = await asyncio.to_thread(_stereo_serials_for, cfg)
             relay = await asyncio.to_thread(_start_video_relay, cfg, stereo)
         except Exception:  # noqa: BLE001 - jogging goes on without video
-            _logger.exception("jog: camera streaming unavailable")
+            _logger.exception("%s: camera streaming unavailable", name)
             relay = None
         server.set_video_manager(relay)
         if relay is not None:
-            _logger.info("jog: streaming %s", ", ".join(sorted(cfg.cameras)))
+            _logger.info("%s: streaming %s", name, ", ".join(sorted(cfg.cameras)))
 
     async with server:
         cameras = asyncio.create_task(start_relay())

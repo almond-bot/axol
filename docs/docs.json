@@ -133,6 +133,7 @@
                   "cli/gravity-comp",
                   "cli/waypoints",
                   "cli/jog",
+                  "cli/sensors",
                   "cli/collect-data",
                   "cli/collect-dagger",
                   "cli/replay-dataset",

@@ -50,6 +50,8 @@ export interface LidarFrame {
   reflectivity: Uint8Array
   /** `performance.now()` when it arrived (ms). */
   receivedAt: number
+  /** Where the robot was on the live map for this scan (see `LidarCloud.setPose`). */
+  pose?: { epoch: number; m: number[] }
 }
 
 const MAGIC = 0x3152444c // "LDR1" little-endian
@@ -170,6 +172,35 @@ export class LidarCloud {
     this.changed()
   }
 
+  /**
+   * The robot's pose on the live map when scan `seq` was taken: the first
+   * three rows of T_map_base. Lets `fill` draw scans on the map.
+   */
+  setPose(seq: number, epoch: number, m: number[]) {
+    for (let i = this.frames.length - 1; i >= 0; i--) {
+      const f = this.frames[i]
+      if (f.seq === seq) {
+        f.pose = { epoch, m }
+        this.changed()
+        return
+      }
+      if (f.seq < seq) return
+    }
+  }
+
+  /** The pose for frame `i`: its own, or the nearest posed frame's. */
+  private poseFor(i: number, epoch: number): number[] | null {
+    const own = this.frames[i].pose
+    if (own?.epoch === epoch) return own.m
+    for (let d = 1; d < this.frames.length; d++) {
+      for (const j of [i - d, i + d]) {
+        const p = this.frames[j]?.pose
+        if (p?.epoch === epoch) return p.m
+      }
+    }
+    return null
+  }
+
   /** Call `listener` whenever the frames change; returns the unsubscribe. */
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener)
@@ -191,31 +222,56 @@ export class LidarCloud {
    * Merge the frames newer than `history` seconds before the newest one
    * into `positions` and `colors`, leaving out points above `hideAbove`.
    * Returns the arrays (new ones when the old were too small) and the count.
+   *
+   * With `mapEpoch`, points come out in that live map's frame instead of the
+   * base frame, each scan placed where the robot was when it was taken, so
+   * the history doesn't smear as the robot turns. Scans without a pose on
+   * that map are left out.
    */
   fill(
     settings: LidarSettings,
     positions: Float32Array,
-    colors: Float32Array
+    colors: Float32Array,
+    mapEpoch: number | null = null
   ): { positions: Float32Array; colors: Float32Array; count: number } {
     const newest = this.frames[this.frames.length - 1]
     if (!newest) return { positions, colors, count: 0 }
     // Always keep the newest frame, however short the history.
     const cutoff = newest.receivedAt - settings.history * 1000
-    const shown = this.frames.filter((f) => f === newest || f.receivedAt > cutoff)
-    const total = shown.reduce((n, f) => n + f.count, 0)
+    const shown: { f: LidarFrame; m: number[] | null }[] = []
+    this.frames.forEach((f, i) => {
+      if (f !== newest && f.receivedAt <= cutoff) return
+      if (mapEpoch === null) {
+        shown.push({ f, m: null })
+        return
+      }
+      const m = this.poseFor(i, mapEpoch)
+      if (m) shown.push({ f, m })
+    })
+    const total = shown.reduce((n, s) => n + s.f.count, 0)
     if (positions.length < total * 3) {
       positions = new Float32Array(total * 3)
       colors = new Float32Array(total * 3)
     }
     let n = 0
-    for (const f of shown) {
+    for (const { f, m } of shown) {
       const p = f.positions
       for (let i = 0; i < f.count; i++) {
-        const z = p[i * 3 + 2]
+        let x = p[i * 3]
+        let y = p[i * 3 + 1]
+        let z = p[i * 3 + 2]
+        if (m) {
+          const bx = x
+          const by = y
+          const bz = z
+          x = m[0] * bx + m[1] * by + m[2] * bz + m[3]
+          y = m[4] * bx + m[5] * by + m[6] * bz + m[7]
+          z = m[8] * bx + m[9] * by + m[10] * bz + m[11]
+        }
         if (z > settings.hideAbove) continue
         const o = n * 3
-        positions[o] = p[i * 3]
-        positions[o + 1] = p[i * 3 + 1]
+        positions[o] = x
+        positions[o + 1] = y
         positions[o + 2] = z
         if (settings.colorBy === "height") heightColor(z, colors, o)
         else reflectivityColor(f.reflectivity[i], colors, o)

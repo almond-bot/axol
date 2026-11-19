@@ -332,6 +332,18 @@ def _jog_run() -> Callable[..., Any]:
     return _run
 
 
+def _sensors() -> type:
+    from ..cli.sensors import SensorsCmdConfig
+
+    return SensorsCmdConfig
+
+
+def _sensors_run() -> Callable[..., Any]:
+    from ..cli.sensors import _run
+
+    return _run
+
+
 def _waypoints_control() -> Callable[..., Any]:
     from ..cli.waypoints import _QueueWaypointControl
 
@@ -497,6 +509,22 @@ COMMANDS: dict[str, CommandDef] = {
         # teleop: off jogs just Jelly, with no Axol connection needed.
         arms_flag="arms",
         per_run_fields=("sim",),
+    ),
+    "sensors": CommandDef(
+        "sensors",
+        "sensors",
+        "Sensors",
+        "Stream the cameras to the Sensors page, next to the lidar and the "
+        "live map. Nothing moves.",
+        "Operate",
+        "draccus",
+        _sensors,
+        entrypoint=_sensors_run,
+        # Opens only the cameras: the motors' idle telemetry keeps streaming
+        # and no motor-fault gate applies.
+        uses_can_bus=False,
+        camera_mode="teleop",
+        streams_video=True,
     ),
     "collect-data": CommandDef(
         "collect-data",

@@ -25,8 +25,20 @@ function discTexture(): Texture {
   return disc
 }
 
-/** The live scans, redrawn whenever a frame arrives or a setting changes. */
-export function LidarPoints({ cloud, settings }: { cloud: LidarCloud; settings: LidarSettings }) {
+/**
+ * The live scans, redrawn whenever a frame arrives or a setting changes.
+ * With `mapEpoch`, they are drawn in that live map's frame (see
+ * `LidarCloud.fill`).
+ */
+export function LidarPoints({
+  cloud,
+  settings,
+  mapEpoch = null,
+}: {
+  cloud: LidarCloud
+  settings: LidarSettings
+  mapEpoch?: number | null
+}) {
   const invalidate = useThree((s) => s.invalidate)
   const geometry = useMemo(() => new BufferGeometry(), [])
   const texture = useMemo(() => discTexture(), [])
@@ -34,7 +46,11 @@ export function LidarPoints({ cloud, settings }: { cloud: LidarCloud; settings: 
     positions: new Float32Array(0),
     colors: new Float32Array(0),
   })
-  const drawn = useRef({ revision: -1, settings: null as LidarSettings | null })
+  const drawn = useRef({
+    revision: -1,
+    settings: null as LidarSettings | null,
+    mapEpoch: null as number | null,
+  })
 
   // Views that render on demand redraw when a frame arrives.
   useEffect(() => cloud.subscribe(() => invalidate()), [cloud, invalidate])
@@ -43,11 +59,17 @@ export function LidarPoints({ cloud, settings }: { cloud: LidarCloud; settings: 
 
   useFrame(() => {
     const last = drawn.current
-    if (last.revision === cloud.revision && last.settings === settings) return
+    if (
+      last.revision === cloud.revision &&
+      last.settings === settings &&
+      last.mapEpoch === mapEpoch
+    )
+      return
     last.revision = cloud.revision
     last.settings = settings
+    last.mapEpoch = mapEpoch
     const prev = buffers.current
-    const out = cloud.fill(settings, prev.positions, prev.colors)
+    const out = cloud.fill(settings, prev.positions, prev.colors, mapEpoch)
     if (out.positions !== prev.positions || !geometry.getAttribute("position")) {
       buffers.current = { positions: out.positions, colors: out.colors }
       geometry.setAttribute("position", new BufferAttribute(out.positions, 3))

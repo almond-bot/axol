@@ -7,6 +7,7 @@ import {
   Merge,
   Move3d,
   Play,
+  Radar,
   Route,
   type LucideIcon,
 } from "lucide-react"
@@ -29,6 +30,8 @@ export interface CatalogEntry {
   group: OperationGroup
   /** What the operator brings, shown on the tile ("VR headset", "Cameras"). */
   needs: string[]
+  /** Runs without the Axol arms connected. */
+  robotFree?: boolean
 }
 
 export type OperationGroup = "drive" | "record" | "playback" | "more"
@@ -72,6 +75,15 @@ export const OPERATION_CATALOG: CatalogEntry[] = [
     icon: Move3d,
     group: "drive",
     needs: [],
+  },
+  {
+    id: "sensors",
+    label: "Sensors",
+    summary: "See the cameras, the lidar and a live 3D map. Nothing moves.",
+    icon: Radar,
+    group: "drive",
+    needs: [],
+    robotFree: true,
   },
   {
     id: "collect-data",
@@ -139,7 +151,7 @@ export function catalogMeta(id: OperationId): OperationMeta | null {
     fields: [],
     suggestedFields: [],
     strictFields: [],
-    requiresRobot: true,
+    requiresRobot: !entry.robotFree,
     requiresCameras: entry.needs.includes("Cameras"),
     simCapable: false,
     simFlag: null,
