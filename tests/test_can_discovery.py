@@ -17,6 +17,7 @@ from almond_axol.serve.manager import Session
 from almond_axol.serve.settings import SettingsStore
 from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 from tests.test_serve_session_reservation import (
+    _Jelly,
     _Manager,
     _Robot,
     _Runner,
@@ -51,11 +52,13 @@ def _state(
     profiles: set[str] | frozenset[str] = frozenset(),
     candidates: tuple[tuple[str, str], ...] = (),
     validation: tuple[tuple[str, ...], ...] = (),
+    jelly_bus_unresolved: bool = True,
 ) -> setup.AttachedHubState:
     return setup.AttachedHubState(
         configured_profiles=frozenset(profiles),
         candidate_identities=candidates,
         validation_identity=validation,
+        jelly_bus_unresolved=jelly_bus_unresolved,
     )
 
 
@@ -132,6 +135,51 @@ class AttachedHubStateTest(unittest.TestCase):
         self.assertEqual(state.configured_profiles, frozenset({"axol"}))
         self.assertEqual(state.candidate_count, 0)
         self.assertTrue(state.validation_identity)
+
+    def test_silent_hub_with_pinned_wheel_leaves_the_jelly_bus_resolved(
+        self,
+    ) -> None:
+        # Axol on Jelly with the arms unpowered: only the hub is unresolved,
+        # so retrying it has no reason to touch the pinned wheel bus.
+        hub_only = self._snapshot(
+            devices=(("1-1", "HUB"), ("1-2", "WHEEL")),
+            adapters={
+                "HUB": _adapter("HUB", "1-1", ("can1", "can2"), (0, 1)),
+                "WHEEL": _adapter("WHEEL", "1-2", (setup.CAN_BASE,), (0,)),
+            },
+            wheels="WHEEL",
+        )
+        self.assertEqual(hub_only.candidate_identities, (("1-1", "HUB"),))
+        self.assertFalse(hub_only.jelly_bus_unresolved)
+
+        nothing = self._snapshot(
+            devices=(("1-2", "WHEEL"),),
+            adapters={"WHEEL": _adapter("WHEEL", "1-2", (setup.CAN_BASE,), (0,))},
+            wheels="WHEEL",
+        )
+        self.assertFalse(nothing.jelly_bus_unresolved)
+
+    def test_unresolved_single_or_reclaimed_pin_marks_the_jelly_bus(self) -> None:
+        fresh_single = self._snapshot(
+            devices=(("1-1", "HUB"), ("1-2", "SINGLE")),
+            adapters={
+                "HUB": _adapter("HUB", "1-1", ("can1", "can2"), (0, 1)),
+                "SINGLE": _adapter("SINGLE", "1-2", ("can0",), (0,)),
+            },
+        )
+        self.assertTrue(fresh_single.jelly_bus_unresolved)
+
+        # A dual hub enumerating under a serial pinned as the wheel bus: its
+        # identity rewrites the wheel assignment, so Jelly is at stake too.
+        reclaimed = self._snapshot(
+            devices=(("1-1", "HUB"),),
+            adapters={"HUB": _adapter("HUB", "1-1", ("can1", "can2"), (0, 1))},
+            wheels="HUB",
+        )
+        self.assertTrue(reclaimed.jelly_bus_unresolved)
+
+        before_driver = self._snapshot(devices=(("1-1", "RAW"),), adapters={})
+        self.assertTrue(before_driver.jelly_bus_unresolved)
 
     def test_cross_role_or_duplicate_physical_claim_is_never_trusted(self) -> None:
         overlap = self._snapshot(
@@ -223,6 +271,8 @@ class HeadlessHubResolverTest(unittest.TestCase):
         legacy_mantis: bool = False,
         raw_names: frozenset[str] = frozenset(),
         single_adapters: dict[str, setup.SingleBusIdentity | None] | None = None,
+        probe_pinned_single: bool = True,
+        before_single_bus_reset: Mock | None = None,
     ) -> tuple[setup.HeadlessHubSetupResult, dict[str, Mock]]:
         # Dual-channel hubs first, then single-channel (wheel/chest-class)
         # adapters; every serial is one attached supported USB device.
@@ -310,6 +360,7 @@ class HeadlessHubResolverTest(unittest.TestCase):
                 setup, "_attached_supported_usb_devices", return_value=devices
             ),
             patch.object(setup.driver, "ensure_driver", return_value=False),
+            patch.object(setup, "_refresh_generated_can_scripts"),
             patch.object(setup, "_wait_for_dual_channel_serial", return_value=True),
             patch.object(
                 setup, "_headless_topology_snapshot", side_effect=topology_sequence
@@ -347,7 +398,10 @@ class HeadlessHubResolverTest(unittest.TestCase):
             ),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            result = setup._setup_detected_hubs_locked()
+            result = setup._setup_detected_hubs_locked(
+                probe_pinned_single=probe_pinned_single,
+                before_single_bus_reset=before_single_bus_reset,
+            )
         return result, operations
 
     def test_fresh_axol_and_mantis_are_assigned_only_by_positive_identity(self) -> None:
@@ -565,6 +619,68 @@ class HeadlessHubResolverTest(unittest.TestCase):
         calls["apply"].assert_not_called()
         # A pinned adapter is re-probed with bounded silence recovery.
         calls["identify_single"].assert_called_once_with("W")
+
+    def test_hub_only_retry_never_probes_or_rewrites_a_pinned_jelly_bus(
+        self,
+    ) -> None:
+        # The arms stay silent: the live wheel bus is neither probed nor
+        # reset, nothing is written, and Jelly's links are never released.
+        release = Mock()
+        result, calls = self._run(
+            {"A": "silent"},
+            strict_axol="A",
+            wheels="W",
+            single_adapters={"W": "wheels"},
+            candidates_before=("A",),
+            candidates_after=("A",),
+            probe_pinned_single=False,
+            before_single_bus_reset=release,
+        )
+        self.assertEqual(result.status, "unidentified")
+        calls["identify_single"].assert_not_called()
+        calls["apply"].assert_not_called()
+        release.assert_not_called()
+
+    def test_hub_only_retry_releases_jelly_before_the_bring_up_that_cycles_it(
+        self,
+    ) -> None:
+        # The arms answer this time: the robot profile is rewritten and its
+        # bring-up cycles the wheel bus, so the caller releases Jelly first.
+        # How many times the (patched) rewrite had run when Jelly was released.
+        applies_at_release: list[int] = []
+        release = Mock(
+            side_effect=lambda: applies_at_release.append(
+                setup._apply_setup.call_count  # type: ignore[attr-defined]
+            )
+        )
+        result, calls = self._run(
+            {"A": "axol"},
+            wheels="W",
+            single_adapters={"W": "wheels"},
+            candidates_before=("A",),
+            profiles_after={"axol"},
+            probe_pinned_single=False,
+            before_single_bus_reset=release,
+        )
+        self.assertEqual(result.status, "configured")
+        calls["identify_single"].assert_not_called()
+        # The unprobed pin keeps its role in the rewritten assignment.
+        calls["apply"].assert_called_once_with("A", "W", None)
+        release.assert_called_once_with()
+        self.assertEqual(applies_at_release, [0])
+
+    def test_failed_jelly_release_aborts_before_anything_is_written(self) -> None:
+        release = Mock(side_effect=RuntimeError("Jelly link did not release CAN"))
+        with self.assertRaises(RuntimeError):
+            self._run(
+                {"A": "axol"},
+                wheels="W",
+                single_adapters={"W": "wheels"},
+                candidates_before=("A",),
+                profiles_after={"axol"},
+                probe_pinned_single=False,
+                before_single_bus_reset=release,
+            )
 
     def test_silent_pinned_base_is_not_replaced_by_a_second_wheel_responder(
         self,
@@ -1669,6 +1785,139 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(connected.status_code, 200)
         self.assertEqual(events[:2], ["discover", "connect:wheels"])
+
+    async def _silent_hub_session(
+        self, *, jelly_bus_unresolved: bool
+    ) -> tuple[_Jelly, Mock, list[str], dict[str, httpx.Response]]:
+        """Axol on Jelly with the arms unpowered, driven through the panel's calls.
+
+        A first (full) pass finds the hub silent, Jelly auto-connects if it
+        may, then the panel's automatic re-check retries the hub.
+        """
+        attached = _state(
+            candidates=(("usb-1", "HUB"),),
+            validation=(("usb", "usb-1", "HUB"), ("claim", "wheels", "WHEEL")),
+            jelly_bus_unresolved=jelly_bus_unresolved,
+        )
+        result = setup.HeadlessHubSetupResult(
+            "unidentified",
+            0,
+            message="power the arms",
+            validation_identity=attached.validation_identity,
+        )
+        events: list[str] = []
+
+        class _Safety:
+            def pause(self) -> None:
+                events.append("pause")
+
+            def resume(self) -> None:
+                events.append("resume")
+
+            def shutdown(self) -> None:
+                pass
+
+        jelly = _Jelly()
+        discover = Mock(return_value=result)
+        responses: dict[str, httpx.Response] = {}
+        with (
+            patch.object(app_module, "SafetyLink", _Safety),
+            patch.object(app_module.os, "geteuid", return_value=0),
+            patch.object(app_module, "_list_can_interfaces", return_value=[]),
+            patch.object(app_module, "_attached_hub_state", return_value=attached),
+            patch.object(setup, "setup_detected_hubs", discover),
+        ):
+            app = _test_app(_Manager(), _Runner(), _Robot(), jelly=jelly)
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                responses["first"] = await client.post("/api/can/discover")
+                events.append("first pass done")
+                responses["auto_jelly"] = await client.post(
+                    "/api/jelly/wheels/connect", json={"automatic": True}
+                )
+                responses["inventory"] = await client.get("/api/can/interfaces")
+                events.append("retry")
+                responses["retry"] = await client.post("/api/can/discover?force=true")
+        return jelly, discover, events, responses
+
+    async def test_silent_arm_retry_leaves_a_pinned_jelly_connected(self) -> None:
+        jelly, discover, events, responses = await self._silent_hub_session(
+            jelly_bus_unresolved=False
+        )
+
+        self.assertEqual(
+            responses["first"].json()["discovery"]["status"], "unidentified"
+        )
+        # Jelly connects although the arms are still unidentified.
+        self.assertEqual(responses["auto_jelly"].status_code, 200)
+        devices = responses["inventory"].json()["devices"]
+        self.assertFalse(devices["wheels"]["discoveryBlocked"])
+        self.assertFalse(devices["lift"]["discoveryBlocked"])
+        # The first pass of the epoch is full; the retry probes the hub only.
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(discover.call_args_list[0].kwargs, {})
+        retry = discover.call_args_list[1].kwargs
+        self.assertFalse(retry["probe_pinned_single"])
+        self.assertTrue(callable(retry["before_single_bus_reset"]))
+        # The retry neither disconnects Jelly nor pauses the safety board.
+        self.assertEqual(jelly.states["wheels"], "connected")
+        self.assertEqual(jelly.connects, ["wheels"])
+        self.assertEqual(events, ["pause", "resume", "first pass done", "retry"])
+        self.assertEqual(
+            responses["retry"].json()["discovery"]["status"], "unidentified"
+        )
+
+    async def test_jelly_waits_while_its_own_bus_is_unresolved(self) -> None:
+        jelly, discover, events, responses = await self._silent_hub_session(
+            jelly_bus_unresolved=True
+        )
+
+        self.assertEqual(responses["auto_jelly"].status_code, 409)
+        self.assertIn("hardware discovery", responses["auto_jelly"].json()["error"])
+        devices = responses["inventory"].json()["devices"]
+        self.assertTrue(devices["wheels"]["discoveryBlocked"])
+        # Both passes are full: the retry may probe and rename the Jelly bus.
+        self.assertEqual([call.kwargs for call in discover.call_args_list], [{}, {}])
+        self.assertEqual(
+            events,
+            ["pause", "resume", "first pass done", "retry", "pause", "resume"],
+        )
+        self.assertEqual(jelly.connects, [])
+
+    async def test_manual_jelly_connect_skips_a_silent_arm_retry(self) -> None:
+        attached = _state(
+            candidates=(("usb-1", "HUB"),),
+            validation=(("usb", "usb-1", "HUB"),),
+            jelly_bus_unresolved=False,
+        )
+        result = setup.HeadlessHubSetupResult(
+            "unidentified",
+            0,
+            message="power the arms",
+            validation_identity=attached.validation_identity,
+        )
+        jelly = _Jelly()
+        discover = Mock(return_value=result)
+        with (
+            patch.object(app_module.os, "geteuid", return_value=0),
+            patch.object(app_module, "_list_can_interfaces", return_value=[]),
+            patch.object(app_module, "_attached_hub_state", return_value=attached),
+            patch.object(setup, "setup_detected_hubs", discover),
+        ):
+            app = _test_app(_Manager(), _Runner(), _Robot(), jelly=jelly)
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                await client.post("/api/can/discover")
+                connected = await client.post("/api/jelly/wheels/connect")
+
+        self.assertEqual(connected.status_code, 200)
+        # No second pass: probing the arms again cannot help the base.
+        self.assertEqual(discover.call_count, 1)
+        self.assertEqual(jelly.connects, ["wheels"])
 
     async def test_automatic_managed_connect_rejects_unidentified_epoch(self) -> None:
         attached = _state(

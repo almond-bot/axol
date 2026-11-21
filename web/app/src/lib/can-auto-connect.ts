@@ -30,6 +30,21 @@ export function canDiscoveryBlocksAutoConnect(
 }
 
 /**
+ * Whether discovery holds back a Jelly device's automatic connect. The host
+ * reports it per device: a silent arm hub keeps discovery unidentified, but
+ * its retries never touch the pinned Jelly buses, so Jelly connects anyway.
+ * Hosts without the field fall back to the shared rule.
+ */
+export function jellyDiscoveryBlocksAutoConnect(
+  discovery: CanDiscoveryState | null | undefined,
+  presence: object | null | undefined
+): boolean {
+  const blocked = presence && "discoveryBlocked" in presence ? presence.discoveryBlocked : undefined
+  if (typeof blocked === "boolean") return blocked
+  return canDiscoveryBlocksAutoConnect(discovery)
+}
+
+/**
  * Whether discovery may take the idle robot link. A disconnected or failed
  * link qualifies, and so does one still connected to hardware the inventory
  * no longer shows: RobotLink keeps reporting `connected` after its device is

@@ -31,18 +31,30 @@ heading hold, the watchdog, and park/unpark at ``JellyConfig.frequency``:
   motor-side timeout — not any host watchdog — is the runaway safety layer,
   and the Rust core's job is to never feed it with anything but a live
   motion command.
-- If no fresh command arrives within ``command_timeout`` the command source
-  is treated as dead. Driving wheels get one zero-velocity frame and then
-  **silence** — no keepalive, no re-send of a stale command — so the alarm
+- If no fresh command arrives within ``command_timeout`` while driving, the
+  core stops the base itself: it ramps the command to zero at ``stop_slew``
+  (never re-sending the stale command) and parks the wheels, which stay
+  enabled and keep receiving frames. A headset or Wi-Fi gap shorter than
+  ``link_timeout`` therefore costs a stop, not a torque-off, and a fresh
+  command resumes from there with the normal ``slew``.
+- Only after ``link_timeout`` without a fresh command is the source treated
+  as lost. Wheels that are not parked by then (parking off or failed) get
+  one zero-velocity frame and then **silence** — no keepalive — so the alarm
   trips and torques them off; once that has certainly happened and the
   wheels have stopped rolling they are re-enabled straight into the park
-  hold. Parked wheels keep their hold (an anchor or a brake, not a motion). The lift
-  likewise gets one STOP and then nothing on its bus, so the jelly_legs
-  board's own 300 ms jog deadman is the safety layer for the legs.
-- When the source returns, wheels the alarm tripped are cleared and
-  re-enabled (mode switch before enable, so no stale target replays) and the
-  ramp restarts from rest. Other faults (over-current, thermal) are reported
-  but never cleared blindly.
+  hold. Parked wheels keep their hold (an anchor or a brake, not a motion).
+- The lift gets one STOP as soon as the command goes stale and then nothing
+  on its bus, so the jelly_legs board's own 300 ms jog deadman is the safety
+  layer for the legs. The legs just stop; the next fresh command moves them
+  again straight away.
+- When the source returns after the link was lost, wheels the alarm tripped
+  are cleared and re-enabled (mode switch before enable, so no stale target
+  replays) and the ramp restarts from rest. Other faults (over-current,
+  thermal) are reported but never cleared blindly.
+- The alarm still covers a dead host: if this process stops feeding targets
+  they age out like a headset gap, if its socket to the core closes the core
+  disables the wheels and exits, and if the core itself dies or wedges no
+  frame reaches the wheels and they torque off within ``can_timeout_ms``.
 
 Damiao feedback folds positions into ±PMAX (raised to 400 rad in RAM at
 startup) while the motor keeps counting its own multi-turn position, and the
@@ -332,16 +344,26 @@ class JellyConfig:
                          parking (wheels just idle in velocity mode). At most 5.
         frequency:       Wheel command task rate in Hz.
         command_timeout: Seconds without a fresh :meth:`Jelly.set_command`
-                         before the command source is considered dead. On
-                         that edge driving wheels get one zero-velocity frame
-                         and then nothing on CAN — no keepalive — so their
+                         before Jelly stops. A driving base ramps to a stop
+                         at ``stop_slew`` and parks with its wheels still
+                         enabled; parked wheels keep their hold; the lift
+                         gets one STOP and then silence so the legs' 300 ms
+                         jog deadman takes over. Must comfortably exceed the
+                         source's frame period (a headset streams at 72-120
+                         Hz).
+        stop_slew:       Ramp (normalized command per second) used to stop on
+                         a ``command_timeout`` gap. The default stops from full
+                         speed in 0.25 s: much faster than ``slew`` so a lost
+                         link stops the base promptly, yet still a ramp
+                         rather than a step to zero.
+        link_timeout:    Seconds without a fresh command before the source
+                         counts as lost. Wheels that are still not parked
+                         then (parking off or failed) get one zero-velocity
+                         frame and nothing more on CAN, so their
                          ``can_timeout_ms`` alarm torques them off (they are
-                         then re-enabled into the park hold); parked wheels
-                         keep their hold; the lift gets one STOP and then
-                         silence so the legs' 300 ms jog deadman takes over.
-                         Must comfortably exceed the source's frame period (a
-                         headset streams at 72-90 Hz, with occasional 50-100
-                         ms WiFi gaps).
+                         later re-enabled into the park hold). Must be at least
+                         ``command_timeout``; equal skips the ramp-and-hold
+                         stop.
         can_timeout_ms:  Damiao loss-of-comms alarm written to every wheel at
                          enable (RAM only, readback-verified; the enable
                          fails if a wheel does not take it). A wheel that
@@ -383,6 +405,8 @@ class JellyConfig:
     frequency: float = 50.0
     command_timeout: float = 0.2
     can_timeout_ms: float = 200.0
+    stop_slew: float = 4.0
+    link_timeout: float = 1.0
     lift: bool = True
     lift_channel: str | None = None
     lift_speed: int = JOG_SPEED
@@ -419,13 +443,13 @@ def _iface_exists(channel: str) -> bool:
 def _pack_config(cfg: JellyConfig) -> bytes:
     """The ``C`` message that configures the Rust core.
 
-    Eleven little-endian f64 values, in the order ``Config`` in
+    Thirteen little-endian f64 values, in the order ``Config`` in
     ``rust/axol-rt/src/jelly.rs`` reads them; the core rejects any other
     length, so an older or newer Python side cannot start it with an implicit
-    (disabled) CAN timeout.
+    (disabled) CAN timeout or link timeout.
     """
     return b"C" + struct.pack(
-        "<11d",
+        "<13d",
         cfg.max_speed,
         cfg.turn_scale,
         cfg.slew,
@@ -437,6 +461,8 @@ def _pack_config(cfg: JellyConfig) -> bytes:
         cfg.frequency,
         cfg.command_timeout,
         cfg.can_timeout_ms,
+        cfg.stop_slew,
+        cfg.link_timeout,
     )
 
 
@@ -710,6 +736,16 @@ class Jelly:
                 )
         if not math.isfinite(cfg.command_timeout) or cfg.command_timeout <= 0.0:
             raise ValueError("Jelly command_timeout must be a positive number")
+        if not math.isfinite(cfg.stop_slew) or cfg.stop_slew <= 0.0:
+            raise ValueError("Jelly stop_slew must be a positive number")
+        if (
+            not math.isfinite(cfg.link_timeout)
+            or cfg.link_timeout < cfg.command_timeout
+        ):
+            raise ValueError(
+                f"Jelly link_timeout ({cfg.link_timeout:g} s) must be a number at "
+                f"least command_timeout ({cfg.command_timeout:g} s)"
+            )
         if cfg.lift:
             # Publish the lift before its first await so cancellation during a
             # partial start can still find and close its bus.

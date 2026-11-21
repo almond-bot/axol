@@ -37,6 +37,8 @@ import asyncio
 import logging
 import queue
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import av
@@ -54,6 +56,7 @@ from aiortc.mediastreams import (
     MediaStreamError,
     MediaStreamTrack,
 )
+from aiortc.rtp import RTCP_PSFB_APP, RtcpPsfbPacket, unpack_remb_fci
 from av import VideoFrame
 from numpy.typing import NDArray
 
@@ -64,8 +67,22 @@ from ..vr.ice import (
 )
 from .constants import HEADSET_STREAM_FPS
 from .hw_video import install_hw_encoder
+from .link_control import (
+    LIVE_EDGE_PERSIST_S,
+    LIVE_EDGE_SKIP_IDR_S,
+    LIVE_EDGE_SKIP_S,
+    BitrateController,
+    LinkSample,
+    RembState,
+    transport_backlog_bytes,
+)
 
 _logger = logging.getLogger(__name__)
+
+# How often the link controller re-reads each peer and rescales the encoders,
+# and how often it logs one link-health line per peer.
+_LINK_TICK_S = 0.5
+_LINK_LOG_S = 5.0
 
 # How long a pre-encoded track waits for its next access unit before checking
 # whether the camera pipeline is still alive.
@@ -234,6 +251,14 @@ class PrecodedVideoTrack(MediaStreamTrack):
         self._queue: queue.Queue[list[bytes]] = source.subscribe()
         self._synced = False  # set once the first IDR AU has been sent
         self._ts_origin: float | None = None
+        # Seconds of video already queued for this track's peer, installed by
+        # WebRTCManager once the peer exists (None: never skip). See
+        # link_control: past LIVE_EDGE_SKIP_S the track skips to the next IDR
+        # rather than adding to a queue the link can't drain.
+        self.backlog_s: Callable[[], float] | None = None
+        self.frames_skipped = 0
+        self._over_since: float | None = None
+        self._clock: Callable[[], float] = time.monotonic
 
     def stop(self) -> None:
         self._source.unsubscribe(self._queue)
@@ -250,6 +275,30 @@ class PrecodedVideoTrack(MediaStreamTrack):
             self._ts_origin = perf_ts
         return max(0, int((perf_ts - self._ts_origin) * VIDEO_CLOCK_RATE))
 
+    def _should_skip(self, is_idr: bool) -> bool:
+        """Whether the link has held too much video for too long to send this AU.
+
+        The backlog must stay over ``LIVE_EDGE_SKIP_S`` for
+        ``LIVE_EDGE_PERSIST_S``: an IDR's own burst queues briefly even on a
+        link that carries the average rate, and skipping the P-frame after it
+        would cost a whole GOP.
+        """
+        if self.backlog_s is None:
+            return False
+        try:
+            queued = self.backlog_s()
+        except Exception:  # noqa: BLE001 - introspection is best-effort
+            return False
+        if queued <= LIVE_EDGE_SKIP_S:
+            self._over_since = None
+            return False
+        now = self._clock()
+        if self._over_since is None:
+            self._over_since = now
+        if now - self._over_since < LIVE_EDGE_PERSIST_S:
+            return False
+        return queued > LIVE_EDGE_SKIP_IDR_S if is_idr else True
+
     async def recv(self) -> av.Packet:
         loop = asyncio.get_running_loop()
         while True:
@@ -260,8 +309,18 @@ class PrecodedVideoTrack(MediaStreamTrack):
                 if not self._source.alive:
                     raise MediaStreamError
                 continue  # camera stall — keep waiting
+            if getattr(self._queue, "gap", False):
+                # The camera dropped an AU for this subscriber: the GOP is
+                # broken, so resume on the next IDR.
+                self._queue.gap = False  # type: ignore[attr-defined]
+                self._synced = False
+            is_idr = any((nal[0] & 0x1F) == _NAL_TYPE_IDR for nal in au)
+            if self._should_skip(is_idr):
+                self.frames_skipped += 1
+                self._synced = False
+                continue
             if not self._synced:
-                if not any((nal[0] & 0x1F) == _NAL_TYPE_IDR for nal in au):
+                if not is_idr:
                     continue
                 self._synced = True
             packet = av.Packet(b"".join(_ANNEXB_START + nal for nal in au))
@@ -298,6 +357,23 @@ def _track_for_source(source: Any) -> MediaStreamTrack:
     return CameraVideoTrack(source)
 
 
+@dataclass
+class _PeerLink:
+    """Link-control state for one peer connection."""
+
+    pc: RTCPeerConnection
+    tracks: list[PrecodedVideoTrack] = field(default_factory=list)
+    remb: RembState = field(default_factory=RembState)
+    bytes_sent: int | None = None
+    bytes_at: float | None = None
+    sent_bps: float = 0.0
+    last: LinkSample = field(default_factory=LinkSample)
+
+    @property
+    def frames_skipped(self) -> int:
+        return sum(t.frames_skipped for t in self.tracks)
+
+
 class WebRTCManager:
     """Manages per-client peer connections that send ZED camera video.
 
@@ -321,10 +397,170 @@ class WebRTCManager:
         # Per-client (packetsSent, packetsLost) from the last stats poll, for
         # per-interval rates.
         self._prev_stats: dict[int, tuple[int, int]] = {}
+        # Live-edge + adaptive-bitrate state (see link_control).
+        self._links: dict[int, _PeerLink] = {}
+        self._controller = BitrateController()
+        self._link_task: asyncio.Task[None] | None = None
+        self._last_link_log = 0.0
 
     @property
     def has_sources(self) -> bool:
         return bool(self._sources)
+
+    # -- link control (live edge + adaptive bitrate) --------------------------
+
+    def _adjustable_sources(self) -> list[Any]:
+        return [
+            s
+            for s in self._sources.values()
+            if int(getattr(s, "stream_bitrate_ceiling", 0) or 0) > 0
+        ]
+
+    def _ceiling_bps(self) -> int:
+        """Sum of the stream encoders' configured bitrates (scale 1.0)."""
+        return sum(int(s.stream_bitrate_ceiling) for s in self._adjustable_sources())
+
+    def _current_bps(self) -> float:
+        """What the stream encoders are asked for now, summed (bits/s)."""
+        ceiling = self._ceiling_bps()
+        if ceiling <= 0:
+            return 0.0
+        return ceiling * self._controller.scale
+
+    def _backlog_s(self, client_id: int) -> float:
+        """Seconds of video queued for ``client_id`` at the current bitrate."""
+        link = self._links.get(client_id)
+        if link is None:
+            return 0.0
+        rate = self._current_bps()
+        if rate <= 0:
+            return 0.0
+        return 8.0 * transport_backlog_bytes(link.pc) / rate
+
+    def _hook_remb(self, client_id: int, sender: RTCRtpSender) -> None:
+        """Record the receiver's bandwidth estimate (REMB) for ``client_id``.
+
+        aiortc hands REMB to the sender's encoder, which the pre-encoded path
+        never uses; wrap the sender's RTCP handler to see it too.
+        """
+        original = sender._handle_rtcp_packet
+
+        async def handle(packet: Any) -> None:
+            if isinstance(packet, RtcpPsfbPacket) and packet.fmt == RTCP_PSFB_APP:
+                link = self._links.get(client_id)
+                if link is not None:
+                    try:
+                        bitrate, _ssrcs = unpack_remb_fci(packet.fci)
+                    except ValueError:
+                        pass
+                    else:
+                        link.remb.record(bitrate, time.monotonic())
+            await original(packet)
+
+        sender._handle_rtcp_packet = handle  # type: ignore[method-assign]
+
+    async def _sample_link(self, link: _PeerLink, now: float) -> LinkSample:
+        loss: float | None = None
+        rtt: float | None = None
+        sent = 0
+        try:
+            report = await link.pc.getStats()
+        except Exception:  # noqa: BLE001 - stats are best-effort
+            report = {}
+        for stat in report.values():
+            kind = getattr(stat, "type", "")
+            if kind == "outbound-rtp":
+                sent += int(getattr(stat, "bytesSent", 0) or 0)
+            elif kind == "remote-inbound-rtp":
+                # aiortc reports the RTCP fraction-lost byte (x/256).
+                fraction = getattr(stat, "fractionLost", None)
+                if fraction is not None:
+                    value = float(fraction) / 256.0
+                    loss = value if loss is None else max(loss, value)
+                rtt_s = getattr(stat, "roundTripTime", None)
+                if rtt_s:
+                    rtt = float(rtt_s) if rtt is None else max(rtt, float(rtt_s))
+        if link.bytes_sent is not None and link.bytes_at is not None:
+            dt = now - link.bytes_at
+            if dt > 0:
+                link.sent_bps = 8.0 * max(0, sent - link.bytes_sent) / dt
+        link.bytes_sent, link.bytes_at = sent, now
+        link.last = LinkSample(
+            backlog_bytes=transport_backlog_bytes(link.pc),
+            loss=loss,
+            rtt_s=rtt,
+            remb_bps=link.remb.usable(now),
+        )
+        return link.last
+
+    def _apply_scale(self, scale: float) -> None:
+        for source in self._adjustable_sources():
+            try:
+                source.set_stream_bitrate_scale(scale)
+            except Exception as exc:  # noqa: BLE001 - keep streaming as is
+                _logger.debug("stream bitrate change failed: %s", exc)
+
+    async def _link_tick(self, now: float) -> None:
+        # Only connected peers count: one that is still timing out after its
+        # headset left must not throttle the stream for everyone else.
+        samples = [
+            await self._sample_link(link, now)
+            for link in self._links.values()
+            if getattr(link.pc, "connectionState", "connected") == "connected"
+        ]
+        ceiling = self._ceiling_bps()
+        if ceiling <= 0:
+            return
+        before = self._controller.scale
+        after = self._controller.update(now, ceiling, samples)
+        if abs(after - before) > 1e-6:
+            self._apply_scale(after)
+            if after < before:
+                _logger.info(
+                    "headset video: lowered to %.1f of %.1f Mbps (%s)",
+                    ceiling * after / 1e6,
+                    ceiling / 1e6,
+                    self._controller.reason or "link congested",
+                )
+            elif after >= 1.0:
+                _logger.info("headset video: back to the full %.1f Mbps", ceiling / 1e6)
+        if now - self._last_link_log >= _LINK_LOG_S:
+            self._last_link_log = now
+            self._log_links(ceiling)
+
+    def _log_links(self, ceiling: int) -> None:
+        for client_id, link in self._links.items():
+            s = link.last
+            _logger.info(
+                "webrtc[%d] link: sending %.1f Mbps (encoders %.1f of %.1f Mbps), "
+                "loss %s, round trip %s, queued %d KB, receiver estimate %s, "
+                "frames skipped %d",
+                client_id,
+                link.sent_bps / 1e6,
+                ceiling * self._controller.scale / 1e6,
+                ceiling / 1e6,
+                "n/a" if s.loss is None else f"{100.0 * s.loss:.1f}%",
+                "n/a" if s.rtt_s is None else f"{1e3 * s.rtt_s:.0f} ms",
+                s.backlog_bytes // 1024,
+                "n/a" if s.remb_bps is None else f"{s.remb_bps / 1e6:.1f} Mbps",
+                link.frames_skipped,
+            )
+
+    async def _link_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_LINK_TICK_S)
+            if not self._links:
+                continue
+            try:
+                await self._link_tick(time.monotonic())
+            except Exception as exc:  # noqa: BLE001 - never kill the relay
+                _logger.debug("link control tick failed: %s", exc)
+
+    def _ensure_link_loop(self) -> None:
+        if self._link_task is None or self._link_task.done():
+            self._link_task = asyncio.get_running_loop().create_task(
+                self._link_loop(), name="webrtc-link-control"
+            )
 
     async def log_stats_loop(self, period: float = 1.0) -> None:
         """Log per-client WebRTC send health every ``period`` s (until cancelled).
@@ -383,6 +619,8 @@ class WebRTCManager:
         servers = ice_servers()
         pc = RTCPeerConnection(RTCConfiguration(iceServers=servers))
         self._pcs[client_id] = pc
+        link = _PeerLink(pc=pc)
+        self._links[client_id] = link
 
         @pc.on("connectionstatechange")
         async def _on_state() -> None:
@@ -393,8 +631,13 @@ class WebRTCManager:
         track_names: dict[int, str] = {}
         for name, source in self._sources.items():
             track = _track_for_source(source)
-            pc.addTrack(track)
+            sender = pc.addTrack(track)
             track_names[id(track)] = name
+            self._hook_remb(client_id, sender)
+            if isinstance(track, PrecodedVideoTrack):
+                track.backlog_s = lambda cid=client_id: self._backlog_s(cid)
+                link.tracks.append(track)
+        self._ensure_link_loop()
 
         # On Jetson, route encoding through NVENC (software H.264 can't keep
         # up at high resolutions) and pin H.264 in the SDP so the hardware
@@ -453,6 +696,12 @@ class WebRTCManager:
     async def close(self, client_id: int) -> None:
         """Close and forget the peer connection for ``client_id``, if any."""
         pc = self._pcs.pop(client_id, None)
+        self._links.pop(client_id, None)
+        self._prev_stats.pop(client_id, None)
+        if not self._links and self._controller.scale < 1.0:
+            # Nobody is watching: the next viewer starts at the full rate.
+            self._controller.reset()
+            self._apply_scale(1.0)
         if pc is not None:
             try:
                 await pc.close()

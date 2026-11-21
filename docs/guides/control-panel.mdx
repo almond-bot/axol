@@ -147,6 +147,8 @@ If the automatic connection fails twice, press **Connect** on the card. After yo
 
 **If hardware is plugged in but not answering.** The **Overview** and **Devices** say *Hardware is plugged in but not answering*. This usually means its power is off. Turn it on: the panel checks again on its own and connects it. While Axol or Mantis is connected, press **Check again** instead. If it still doesn't connect, run `axol can.setup` in a terminal.
 
+**Axol on Jelly with the arms switched off.** Jelly's wheels and lift connect and stay connected while the panel waits for Axol to answer. Checking Axol again doesn't interrupt them.
+
 To change which CAN interface each side uses, go to **Axol settings → Robot** or **Mantis settings → CAN**.
 
 **Motor status.** While no operation runs, the panel checks every motor once a second: all 16 Axol motors, or the two Mantis grippers. Each motor is a square on the card, next to how many are OK. Hover a square to see its status and temperature.

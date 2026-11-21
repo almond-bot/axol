@@ -156,8 +156,29 @@ class JellyCanTimeoutConfigTest(unittest.IsolatedAsyncioTestCase):
     async def test_command_timeout_must_be_positive(self) -> None:
         await self._assert_refused("command_timeout", command_timeout=0.0)
 
+    async def test_stop_slew_must_be_positive(self) -> None:
+        for bad in (0.0, -1.0, float("nan"), float("inf")):
+            await self._assert_refused("stop_slew", stop_slew=bad)
+
+    async def test_link_timeout_must_cover_the_command_timeout(self) -> None:
+        await self._assert_refused(
+            "link_timeout", command_timeout=0.2, link_timeout=0.1
+        )
+        await self._assert_refused("link_timeout", link_timeout=float("nan"))
+        await self._assert_refused("link_timeout", link_timeout=float("inf"))
+
     def test_default_timeout_is_200ms(self) -> None:
         self.assertEqual(JellyConfig().can_timeout_ms, 200.0)
+
+    def test_default_gap_stops_and_holds_before_the_link_is_lost(self) -> None:
+        cfg = JellyConfig()
+        # A stale command stops the base with the wheels on; only a gap past
+        # link_timeout lets the wheels' own CAN alarm torque them off.
+        self.assertGreater(cfg.link_timeout, cfg.command_timeout)
+        self.assertEqual(cfg.link_timeout, 1.0)
+        # Full speed (1.0) to zero inside the gap, in well under 0.5 s.
+        self.assertLessEqual(1.0 / cfg.stop_slew, 0.25)
+        self.assertGreater(cfg.stop_slew, cfg.slew)
 
 
 class JellyLiftBusTest(unittest.IsolatedAsyncioTestCase):
@@ -299,14 +320,22 @@ class DetectJellyTest(unittest.TestCase):
 class JellyRustWireTest(unittest.IsolatedAsyncioTestCase):
     """The IPC layout shared with ``rust/axol-rt/src/jelly.rs``."""
 
-    def test_config_message_carries_eleven_values_ending_in_can_timeout(self) -> None:
-        cfg = JellyConfig(frequency=50.0, command_timeout=0.2, can_timeout_ms=200.0)
+    def test_config_message_carries_thirteen_values_ending_in_the_link_timeout(
+        self,
+    ) -> None:
+        cfg = JellyConfig(
+            frequency=50.0,
+            command_timeout=0.2,
+            can_timeout_ms=200.0,
+            stop_slew=4.0,
+            link_timeout=1.0,
+        )
         payload = _pack_config(cfg)
         self.assertEqual(payload[:1], b"C")
-        # 11 f64 = 88 bytes, the length the Rust ``parse_config`` insists on.
-        self.assertEqual(len(payload) - 1, 88)
-        values = struct.unpack("<11d", payload[1:])
-        self.assertEqual(values[8:], (50.0, 0.2, 200.0))
+        # 13 f64 = 104 bytes, the length the Rust ``parse_config`` insists on.
+        self.assertEqual(len(payload) - 1, 104)
+        values = struct.unpack("<13d", payload[1:])
+        self.assertEqual(values[8:], (50.0, 0.2, 200.0, 4.0, 1.0))
 
     async def test_status_packet_exposes_link_and_wheel_fault_flags(self) -> None:
         jelly = Jelly(JellyConfig(lift=False, channel=None))

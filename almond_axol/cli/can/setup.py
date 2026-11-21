@@ -69,7 +69,7 @@ import tempfile
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -226,6 +226,12 @@ class AttachedHubState:
     configured_profiles: frozenset[str]
     candidate_identities: tuple[tuple[str, str], ...]
     validation_identity: tuple[tuple[str, ...], ...]
+    # True when an unresolved device could be (or could affect) Jelly's wheel
+    # or chest/lift adapter. False when the only unresolved hardware is a live
+    # dual-channel hub (Axol or Mantis), or nothing is unresolved: a retry of
+    # that hub's identity then has no reason to touch a pinned Jelly bus.
+    # Defaults to True so a snapshot built without it is treated cautiously.
+    jelly_bus_unresolved: bool = True
 
     @property
     def candidate_count(self) -> int:
@@ -769,6 +775,8 @@ def attached_hub_state() -> AttachedHubState:
     }
     claimed_serials = set(trusted.values())
     candidates: list[tuple[str, str]] = []
+    # Candidates that are not a live, physically bound dual-channel hub.
+    non_hub_candidates = 0
     for identity in devices:
         serial = identity[1]
         # Duplicate physical devices reporting one serial can never inherit a
@@ -776,6 +784,7 @@ def attached_hub_state() -> AttachedHubState:
         # headless writer refuses to collapse them into one udev match.
         if serial_counts[serial] != 1:
             candidates.append(identity)
+            non_hub_candidates += 1
             continue
         if serial in claimed_serials:
             continue
@@ -787,6 +796,7 @@ def attached_hub_state() -> AttachedHubState:
             # authoritative; a genuinely raw hub still starts discovery.
             if serial not in single_claims or claim_counts[serial] != 1:
                 candidates.append(identity)
+                non_hub_candidates += 1
             continue
         if _adapter_has_exact_channels(
             adapter, (0, 1)
@@ -794,11 +804,16 @@ def attached_hub_state() -> AttachedHubState:
             # A live dual-channel topology overrides a stale single-bus pin;
             # positive probing will decide whether it is Axol or Mantis.
             candidates.append(identity)
+            if serial in single_claims:
+                # The hub now owns a serial pinned as a Jelly bus, so
+                # resolving it rewrites the wheel/chest assignment too.
+                non_hub_candidates += 1
         elif serial in {value for value in claims.values() if value is not None}:
             # A profile claiming a dual hub cannot be trusted when that exact
             # attached serial now enumerates as a single/incomplete device or
             # its channels descend from another USB parent.
             candidates.append(identity)
+            non_hub_candidates += 1
         elif not (
             _adapter_has_exact_channels(adapter, (0,))
             and _adapter_belongs_to_physical_device(adapter, physical_by_serial[serial])
@@ -806,6 +821,7 @@ def attached_hub_state() -> AttachedHubState:
             # More than two channels, duplicated IDs, or channels from another
             # same-serial USB parent remain visibly unresolved.
             candidates.append(identity)
+            non_hub_candidates += 1
         elif serial not in single_claims or claim_counts[serial] != 1:
             # An exact raw single channel is a wheel/chest-class adapter whose
             # bus has not been identified yet (or whose serial is pinned to
@@ -813,6 +829,7 @@ def attached_hub_state() -> AttachedHubState:
             # motors / jelly_legs lift controller. A cleanly pinned single
             # adapter is settled hardware even while its Jelly is unpowered.
             candidates.append(identity)
+            non_hub_candidates += 1
 
     claim_signature = tuple(
         sorted(
@@ -850,6 +867,7 @@ def attached_hub_state() -> AttachedHubState:
         configured_profiles=frozenset(trusted),
         candidate_identities=tuple(candidates),
         validation_identity=validation_identity,
+        jelly_bus_unresolved=bool(non_hub_candidates),
     )
 
 
@@ -2016,17 +2034,16 @@ def _legacy_profile_scripts(profile: _Profile) -> set[Path]:
     return {directory / name for directory in _LEGACY_CAN_DIRS for name in names}
 
 
-def _write_cron_script(profile: _Profile = _AXOL_PROFILE) -> None:
-    """Write a profile's bring-up script.
+# Argument the bring-up script takes to configure only interfaces that are
+# not up. Hotplug and the arm hub's USB reset pass it: a re-enumerating
+# adapter's new interfaces start down, while every other adapter's healthy
+# bus stays up and is left alone. Boot, setup and the e-stop purge run the
+# script without it and cycle every present interface.
+_ONLY_DOWN_ARG = "--only-down"
 
-    On the robot profile the script also covers the wheel and chest buses;
-    every interface is optional and checked for presence at runtime, so one
-    script serves every hardware combination — arm-only, Jelly-only, chest-
-    only, or all of them — and an unplugged adapter never blocks the rest.
-    """
-    print(f"Writing CAN startup script to {profile.cron_script}...")
-    _ensure_root_lock_file(_GLOBAL_LOCK_FILE)
-    _ensure_root_lock_file(profile.lock_file)
+
+def _cron_script_text(profile: _Profile = _AXOL_PROFILE) -> str:
+    """A profile's bring-up script (see :func:`_write_cron_script`)."""
     script = (
         f"#!/bin/bash\n"
         f"# Bring up {profile.label} CAN interfaces\n"
@@ -2041,7 +2058,21 @@ def _write_cron_script(profile: _Profile = _AXOL_PROFILE) -> None:
         f"# toggles the adapter into a state where TX works but no RX frame is\n"
         f"# delivered. Skipped entirely when the adapter is unplugged (other\n"
         f"# buses below must still come up).\n"
+        f"#\n"
+        f"# With {_ONLY_DOWN_ARG} (hotplug, and after the arm hub's USB reset) only\n"
+        f"# interfaces that are not up are configured: re-enumerating one\n"
+        f"# adapter must not take another adapter's live bus down. Without it\n"
+        f"# (boot, setup, the e-stop purge) every present interface is cycled.\n"
         f"set -euo pipefail\n\n"
+        f"ONLY_DOWN=0\n"
+        f'if [ "${{1:-}}" = "{_ONLY_DOWN_ARG}" ]; then\n'
+        f"    ONLY_DOWN=1\n"
+        f"fi\n\n"
+        f"is_up() {{\n"
+        f"    local flags\n"
+        f'    flags=$(cat "/sys/class/net/$1/flags" 2>/dev/null || echo 0)\n'
+        f"    [ $(( flags & 1 )) -eq 1 ]\n"
+        f"}}\n\n"
         f"# Every setup/hotplug profile takes the global lock first, then its\n"
         f"# profile lock. A Python setup that already owns the global lock marks\n"
         f"# that inherited fact explicitly before invoking this script.\n"
@@ -2062,16 +2093,21 @@ def _write_cron_script(profile: _Profile = _AXOL_PROFILE) -> None:
         f"done\n\n"
         f"if ip link show {profile.left} >/dev/null 2>&1 "
         f"&& ip link show {profile.right} >/dev/null 2>&1; then\n"
-        f"    for IFACE in {profile.left} {profile.right}; do\n"
-        f'        ip link set "${{IFACE}}" down 2>/dev/null || true\n'
-        f"    done\n"
-        f"    for IFACE in {profile.left} {profile.right}; do\n"
-        f'        ip link set "${{IFACE}}" type can bitrate {_BITRATE}\n'
-        f'        ip link set "${{IFACE}}" txqueuelen {_TXQUEUELEN}\n'
-        f"    done\n"
-        f"    for IFACE in {profile.left} {profile.right}; do\n"
-        f'        ip link set "${{IFACE}}" up\n'
-        f"    done\n"
+        f'    if [ "${{ONLY_DOWN}}" = "1" ] && is_up {profile.left} '
+        f"&& is_up {profile.right}; then\n"
+        f'        echo "{profile.left}/{profile.right} already up — left alone"\n'
+        f"    else\n"
+        f"        for IFACE in {profile.left} {profile.right}; do\n"
+        f'            ip link set "${{IFACE}}" down 2>/dev/null || true\n'
+        f"        done\n"
+        f"        for IFACE in {profile.left} {profile.right}; do\n"
+        f'            ip link set "${{IFACE}}" type can bitrate {_BITRATE}\n'
+        f'            ip link set "${{IFACE}}" txqueuelen {_TXQUEUELEN}\n'
+        f"        done\n"
+        f"        for IFACE in {profile.left} {profile.right}; do\n"
+        f'            ip link set "${{IFACE}}" up\n'
+        f"        done\n"
+        f"    fi\n"
         f"else\n"
         f'    echo "{profile.left}/{profile.right} not present — skipping bring-up"\n'
         f"fi\n"
@@ -2083,6 +2119,10 @@ def _write_cron_script(profile: _Profile = _AXOL_PROFILE) -> None:
             f"# unplugged adapter never blocks the others' bring-up.\n"
             f"for IFACE in {_CAN_B} {_CAN_C}; do\n"
             f'    if ip link show "${{IFACE}}" >/dev/null 2>&1; then\n'
+            f'        if [ "${{ONLY_DOWN}}" = "1" ] && is_up "${{IFACE}}"; then\n'
+            f'            echo "${{IFACE}} already up — left alone"\n'
+            f"            continue\n"
+            f"        fi\n"
             f'        ip link set "${{IFACE}}" down 2>/dev/null || true\n'
             f'        ip link set "${{IFACE}}" type can bitrate {_BITRATE}\n'
             f'        ip link set "${{IFACE}}" txqueuelen {_TXQUEUELEN}\n'
@@ -2090,7 +2130,21 @@ def _write_cron_script(profile: _Profile = _AXOL_PROFILE) -> None:
             f"    fi\n"
             f"done\n"
         )
-    _install_privileged_script(profile.cron_script, script)
+    return script
+
+
+def _write_cron_script(profile: _Profile = _AXOL_PROFILE) -> None:
+    """Write a profile's bring-up script.
+
+    On the robot profile the script also covers the wheel and chest buses;
+    every interface is optional and checked for presence at runtime, so one
+    script serves every hardware combination — arm-only, Jelly-only, chest-
+    only, or all of them — and an unplugged adapter never blocks the rest.
+    """
+    print(f"Writing CAN startup script to {profile.cron_script}...")
+    _ensure_root_lock_file(_GLOBAL_LOCK_FILE)
+    _ensure_root_lock_file(profile.lock_file)
+    _install_privileged_script(profile.cron_script, _cron_script_text(profile))
     print("  Done.")
 
 
@@ -2155,8 +2209,10 @@ def _reset_script_text() -> str:
         f'    echo "{left}/{right} not present — no hub to reset"\n'
         f"fi\n\n"
         f"# fd 8 (the global lock) survives the exec; the flag stops the bring-up\n"
-        f"# script from reopening it and deadlocking on itself.\n"
-        f'exec env {_GLOBAL_LOCK_ENV}=1 bash "{_AXOL_PROFILE.cron_script}"\n'
+        f"# script from reopening it and deadlocking on itself. Only the reset\n"
+        f"# hub's fresh interfaces are down: the Jelly buses stay up untouched.\n"
+        f'exec env {_GLOBAL_LOCK_ENV}=1 bash "{_AXOL_PROFILE.cron_script}" '
+        f"{_ONLY_DOWN_ARG}\n"
     )
 
 
@@ -2274,6 +2330,23 @@ def _remove_pre_mantis_config() -> None:
             run_root(["rm", "-f", str(path)], check=True)
 
 
+def _hotplug_unit_text(profile: _Profile = _AXOL_PROFILE) -> str:
+    """The systemd unit :func:`_write_hotplug_unit` installs."""
+    return (
+        f"# Installed by `axol can.setup`. Pulled in by {profile.rules_file}\n"
+        f"# whenever the adapter (re-)enumerates: a mid-session USB drop\n"
+        f"# recreates the interfaces down and unconfigured, and this\n"
+        f"# service brings them back up without operator action. Interfaces\n"
+        f"# that are already up belong to another adapter and are left alone.\n"
+        f"[Unit]\n"
+        f"Description=Bring up {profile.label} CAN interfaces on adapter hotplug\n"
+        f"\n"
+        f"[Service]\n"
+        f"Type=oneshot\n"
+        f"ExecStart=/bin/bash {profile.cron_script} {_ONLY_DOWN_ARG}\n"
+    )
+
+
 def _write_hotplug_unit(profile: _Profile = _AXOL_PROFILE) -> None:
     """Install the systemd unit the udev rules pull in on adapter hotplug.
 
@@ -2282,27 +2355,51 @@ def _write_hotplug_unit(profile: _Profile = _AXOL_PROFILE) -> None:
     mid-session USB drop — runs the startup script and the interfaces come
     back configured and up within a second, no operator action needed. The
     Mantis rig gets its own unit: the handheld is unplugged far more often
-    than the arm hub.
+    than the arm hub. The unit passes ``--only-down``: the arm hub and the
+    Jelly adapters share one unit, and re-enumerating one of them must not
+    cycle the others' live buses.
     """
     print(
         f"Writing hotplug bring-up unit to {profile.hotplug_unit_file} "
         "(requires sudo)..."
     )
-    content = (
-        f"# Installed by `axol can.setup`. Pulled in by {profile.rules_file}\n"
-        f"# whenever the adapter (re-)enumerates: a mid-session USB drop\n"
-        f"# recreates the interfaces down and unconfigured, and this\n"
-        f"# service brings them back up without operator action.\n"
-        f"[Unit]\n"
-        f"Description=Bring up {profile.label} CAN interfaces on adapter hotplug\n"
-        f"\n"
-        f"[Service]\n"
-        f"Type=oneshot\n"
-        f"ExecStart=/bin/bash {profile.cron_script}\n"
-    )
-    _publish_privileged_text(profile.hotplug_unit_file, content)
+    _publish_privileged_text(profile.hotplug_unit_file, _hotplug_unit_text(profile))
     run_root(["systemctl", "daemon-reload"], check=True)
     print("  Done.")
+
+
+def _refresh_generated_can_scripts() -> None:
+    """Rewrite installed bring-up scripts and hotplug units that are outdated.
+
+    Hosts set up by an older release keep their generated files until setup
+    next writes them. Discovery refreshes the ones already installed, so the
+    ``--only-down`` behaviour (a USB reset of the arm hub no longer cycles the
+    Jelly buses) reaches them without a manual ``axol can.setup``. Nothing is
+    created that setup did not install, and no interface is touched.
+    """
+
+    def outdated(path: Path, text: str) -> bool:
+        try:
+            return path.exists() and path.read_text() != text
+        except OSError:
+            return False
+
+    reload_units = False
+    for profile in (_AXOL_PROFILE, _MANTIS_PROFILE):
+        if outdated(profile.cron_script, _cron_script_text(profile)):
+            print(f"Refreshing CAN startup script {profile.cron_script}...")
+            _install_privileged_script(profile.cron_script, _cron_script_text(profile))
+        if outdated(profile.hotplug_unit_file, _hotplug_unit_text(profile)):
+            print(f"Refreshing hotplug unit {profile.hotplug_unit_file}...")
+            _publish_privileged_text(
+                profile.hotplug_unit_file, _hotplug_unit_text(profile)
+            )
+            reload_units = True
+    if outdated(CAN_RESET_SCRIPT, _reset_script_text()):
+        print(f"Refreshing CAN adapter reset script {CAN_RESET_SCRIPT}...")
+        _install_privileged_script(CAN_RESET_SCRIPT, _reset_script_text())
+    if reload_units:
+        run_root(["systemctl", "daemon-reload"], check=True)
 
 
 def _is_raspberry_pi_5() -> bool:
@@ -3042,7 +3139,11 @@ def _resolve_headless_single_roles(
     return SingleBusRoles(wheels, chest, lift_on_wheel_bus)
 
 
-def setup_detected_hubs() -> HeadlessHubSetupResult:
+def setup_detected_hubs(
+    *,
+    probe_pinned_single: bool = True,
+    before_single_bus_reset: Callable[[], None] | None = None,
+) -> HeadlessHubSetupResult:
     """Identify and persist attached CAN adapters without prompting.
 
     Covers every role ``axol can.setup`` manages: the dual-channel Axol and
@@ -3053,18 +3154,38 @@ def setup_detected_hubs() -> HeadlessHubSetupResult:
     before the first root-owned rule is published. Duplicate physical devices
     reporting one serial, incomplete pairs, silence, conflicting signatures,
     and duplicate fresh roles stay unassigned for the interactive setup flow.
+
+    ``probe_pinned_single=False`` is the hosted retry of a dual hub whose
+    motors stayed silent (arms unpowered, E-Stop) while Jelly is in use: an
+    adapter already pinned as the wheel or chest bus is then neither probed
+    nor reset, and keeps its role exactly as a silent pinned adapter does.
+    Unpinned single-channel adapters are still probed without recovery.
+    ``before_single_bus_reset`` runs just before the robot profile's rules and
+    bring-up are rewritten, the one step that still cycles the Jelly buses,
+    so the caller can release its links first. Raising from it aborts the
+    pass before anything is written.
     """
     with _global_setup_lock():
-        return _setup_detected_hubs_locked()
+        return _setup_detected_hubs_locked(
+            probe_pinned_single=probe_pinned_single,
+            before_single_bus_reset=before_single_bus_reset,
+        )
 
 
-def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
+def _setup_detected_hubs_locked(
+    *,
+    probe_pinned_single: bool = True,
+    before_single_bus_reset: Callable[[], None] | None = None,
+) -> HeadlessHubSetupResult:
     """Implementation of :func:`setup_detected_hubs` with the global lock held."""
     before_driver = _attached_supported_usb_devices()
     for _identity, serial in before_driver:
         _validated_usb_serial(serial)
 
     driver.ensure_driver()
+    # Before any probe can USB-reset the arm hub: an outdated reset script
+    # would cycle the Jelly buses along with it.
+    _refresh_generated_can_scripts()
     for serial in sorted({serial for _identity, serial in before_driver}):
         _wait_for_dual_channel_serial(serial)
 
@@ -3188,8 +3309,13 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
     # pass, so unrelated hardware is never flapped merely for being attached.
     observed_single: dict[str, SingleBusIdentity | None] = {}
     for serial in sorted(eligible_single):
-        print(f"  {serial}: probing wheel drive / Jelly lift controller...")
         known = serial in {configured_wheels, configured_chest}
+        if known and not probe_pinned_single and serial not in candidate_serials:
+            # Left unobserved, the pin resolves exactly like a silent one: it
+            # keeps its role and nothing is rewritten for it.
+            print(f"  {serial}: Jelly bus already set up; not probed.")
+            continue
+        print(f"  {serial}: probing wheel drive / Jelly lift controller...")
         observed_single[serial] = (
             _identify_adapter(serial)
             if known
@@ -3287,6 +3413,9 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
         or single_roles_changed
         or repair_single_names
     ):
+        if before_single_bus_reset is not None:
+            # The robot profile's bring-up cycles the wheel and chest buses.
+            before_single_bus_reset()
         if desired_axol or desired_wheels or desired_chest:
             _apply_setup(desired_axol, desired_wheels, desired_chest)
         else:

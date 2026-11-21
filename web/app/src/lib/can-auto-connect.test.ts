@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import {
   chooseDetectedHardwareProfile,
   hardwarePresenceSignature,
+  jellyDiscoveryBlocksAutoConnect,
   robotLinkReleasable,
   shouldStartCanDiscovery,
 } from "./can-auto-connect"
@@ -108,5 +109,33 @@ describe("shouldStartCanDiscovery", () => {
     expect(shouldStartCanDiscovery(needed, true, true, false)).toBe(false)
     expect(shouldStartCanDiscovery({ ...needed, status: "ready" }, true, true, true)).toBe(false)
     expect(shouldStartCanDiscovery(null, true, true, true)).toBe(false)
+  })
+})
+
+describe("jellyDiscoveryBlocksAutoConnect", () => {
+  const unidentified = { status: "unidentified" as const, candidateCount: 1, generation: 2 }
+  const wheels = { present: true, up: true, channel: "can_alm_axol_b" }
+
+  it("connects a pinned Jelly while a silent arm hub keeps discovery unidentified", () => {
+    expect(
+      jellyDiscoveryBlocksAutoConnect(unidentified, { ...wheels, discoveryBlocked: false })
+    ).toBe(false)
+  })
+
+  it("waits when the host holds the Jelly bus", () => {
+    expect(
+      jellyDiscoveryBlocksAutoConnect(
+        { status: "ready", candidateCount: 0, generation: 3 },
+        { ...wheels, discoveryBlocked: true }
+      )
+    ).toBe(true)
+  })
+
+  it("falls back to the shared rule on hosts without the field", () => {
+    expect(jellyDiscoveryBlocksAutoConnect(unidentified, wheels)).toBe(true)
+    expect(
+      jellyDiscoveryBlocksAutoConnect({ status: "ready", candidateCount: 0, generation: 3 }, wheels)
+    ).toBe(false)
+    expect(jellyDiscoveryBlocksAutoConnect(null, undefined)).toBe(false)
   })
 })

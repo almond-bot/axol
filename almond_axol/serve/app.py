@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import math
 import os
@@ -1043,6 +1044,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     can_discovery = _CanDiscoveryCache()
     can_discovery_launch = asyncio.Lock()
     can_discovery_task: asyncio.Task[None] | None = None
+    # Whether the current (or last launched) discovery pass may probe, reset
+    # or rename Jelly's wheel/chest buses. A retry of a silent arm hub with
+    # the Jelly adapters already pinned leaves them alone, so Jelly stays
+    # connected through it (see _jelly_discovery_blocked).
+    can_discovery_touches_jelly = True
 
     def _diagnostic_session_active() -> bool:
         return bool(diagnostic_cleanup_pending or camera_cleanup_pending) or any(
@@ -1106,6 +1112,28 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             can_discovery.validated_identity = tuple(attached.validation_identity)
         can_discovery.observe(attached, running=running)
 
+    def _jelly_discovery_blocked(attached: Any | None) -> bool:
+        """Whether CAN discovery must hold Jelly's wheel/lift links closed.
+
+        Discovery blocks managed interfaces because it may probe, reset or
+        rename them. A pinned wheel/chest adapter is only at stake while a
+        pass that touches it is running, while a fresh hardware epoch waits
+        for its first full pass, after a failed pass, or while a single-
+        channel adapter is itself unresolved. A dual hub whose motors stay
+        silent (Axol unpowered, E-Stop) never holds Jelly back: its retries
+        leave the pinned Jelly buses alone.
+        """
+        status = can_discovery.status
+        if status == "running":
+            return can_discovery_touches_jelly
+        if status in {"needed", "error"}:
+            return True
+        if status == "unidentified":
+            return attached is None or bool(
+                getattr(attached, "jelly_bus_unresolved", True)
+            )
+        return False
+
     async def _can_inventory(*, observe_discovery: bool = True) -> dict[str, Any]:
         """Build one authoritative interface/profile/discovery snapshot."""
         interfaces, attached = await asyncio.gather(
@@ -1141,11 +1169,15 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             == ("mantis", mantis_channels[0], mantis_channels[1])
         )
         devices: dict[str, Any] = {}
+        jelly_blocked = _jelly_discovery_blocked(attached)
         for device in JELLY_DEVICES:
             presence = device_presence(device)
             presence["automaticConnectSuppressed"] = (
                 manually_disconnected_jelly.get(device) == presence["channel"]
             )
+            # The panel's automatic Jelly connect waits on this, not on the
+            # overall discovery status, which a silent arm hub keeps failed.
+            presence["discoveryBlocked"] = jelly_blocked
             devices[device] = presence
         return {
             "serverInstanceId": server_instance_id,
@@ -1160,8 +1192,31 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             "discovery": can_discovery.payload(),
         }
 
-    async def _run_can_discovery(initial_state: Any) -> None:
-        """Own the launch reservation until disconnect, setup, and rescan finish."""
+    async def _run_can_discovery(initial_state: Any, *, hub_only: bool = False) -> None:
+        """Own the launch reservation until disconnect, setup, and rescan finish.
+
+        ``hub_only`` retries a silent dual hub without touching the pinned
+        Jelly buses: the Jelly links and the safety board stay open unless
+        the pass ends up rewriting the robot profile, whose bring-up cycles
+        those buses (setup then releases them first).
+        """
+        jelly_released = False
+
+        def release_jelly() -> None:
+            # Close the Jelly links and pause the safety board, which rides
+            # the lift bus; it reopens on its own once discovery has finished
+            # renaming the interfaces. A pause that fails partway has already
+            # set the flag, so the caller resumes it either way.
+            nonlocal jelly_released, can_discovery_touches_jelly
+            can_discovery_touches_jelly = True
+            jelly_state = jelly.disconnect_all()
+            if any(
+                entry.get("state") != "disconnected" for entry in jelly_state.values()
+            ):
+                raise RuntimeError("Jelly link did not prove it released CAN")
+            jelly_released = True
+            safety.pause()
+
         try:
             disconnected = await asyncio.to_thread(robot.disconnect)
             confirmed = await asyncio.to_thread(robot.status)
@@ -1172,24 +1227,27 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 or confirmed.get("connected") is not False
             ):
                 raise RuntimeError("robot link did not prove it released CAN")
-            # Discovery probes and may rename the wheel/chest interfaces too,
-            # so the Jelly links must not hold them open either.
-            jelly_state = await asyncio.to_thread(jelly.disconnect_all)
-            if any(
-                entry.get("state") != "disconnected" for entry in jelly_state.values()
-            ):
-                raise RuntimeError("Jelly link did not prove it released CAN")
 
             from ..cli.can.setup import setup_detected_hubs
 
-            # The safety board rides the lift bus; it reopens on its own once
-            # discovery has finished renaming the interfaces. A pause that
-            # fails partway has already set the flag, so resume either way.
             try:
-                await asyncio.to_thread(safety.pause)
-                result = await asyncio.to_thread(setup_detected_hubs)
+                if hub_only:
+                    result = await asyncio.to_thread(
+                        functools.partial(
+                            setup_detected_hubs,
+                            probe_pinned_single=False,
+                            before_single_bus_reset=release_jelly,
+                        )
+                    )
+                else:
+                    # Discovery probes and may rename the wheel/chest
+                    # interfaces too, so the Jelly links must not hold them
+                    # open either.
+                    await asyncio.to_thread(release_jelly)
+                    result = await asyncio.to_thread(setup_detected_hubs)
             finally:
-                safety.resume()
+                if jelly_released:
+                    safety.resume()
             refreshed = await asyncio.to_thread(_attached_hub_state)
             can_discovery.finish(
                 refreshed,
@@ -1218,7 +1276,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         *, force: bool = False
     ) -> asyncio.Task[None] | JSONResponse:
         """Start one cancellation-safe discovery task or join the current one."""
-        nonlocal can_discovery_task
+        nonlocal can_discovery_task, can_discovery_touches_jelly
         async with can_discovery_launch:
             if _discovery_running():
                 assert can_discovery_task is not None
@@ -1243,6 +1301,15 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 session_launch_reservation.release()
                 raise
             can_discovery.observe(initial_state)
+            # A forced retry of a pass that left only a dual hub unresolved
+            # (its motors silent) leaves the pinned Jelly buses alone. A fresh
+            # hardware epoch ("needed") and a failed pass always get the full
+            # pass, which re-probes those buses too.
+            hub_only = (
+                force
+                and can_discovery.status in {"partial", "unidentified"}
+                and not getattr(initial_state, "jelly_bus_unresolved", True)
+            )
             if force and can_discovery.status in {
                 "partial",
                 "unidentified",
@@ -1281,9 +1348,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 session_launch_reservation.release()
                 inventory = await _can_inventory()
                 return JSONResponse(inventory)
+            can_discovery_touches_jelly = not hub_only
             can_discovery.observe(initial_state, running=True)
             can_discovery_task = asyncio.create_task(
-                _run_can_discovery(initial_state),
+                _run_can_discovery(initial_state, hub_only=hub_only),
                 name="can-hardware-discovery",
             )
             return can_discovery_task
@@ -1318,7 +1386,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             if channel is not None
         )
 
-    async def _discover_before_manual_connect() -> None:
+    async def _discover_before_manual_connect(*, jelly_device: bool = False) -> None:
         """Run the CAN discovery a manual Connect would otherwise be refused on.
 
         A root serve revalidates every configured hub once per process, so
@@ -1328,14 +1396,19 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         nothing USB-visible -- so the operator's Connect is the retry: launch
         (or join) a forced pass and let the connect's own checks judge the
         result. Busy and rate-limit refusals fall through to those checks too.
+        A Jelly Connect (``jelly_device``) skips the pass when only a silent
+        dual hub is unresolved: probing the arms again cannot help the base.
         """
         if os.geteuid() != 0:
             return
+        attached = None
         if not _discovery_running():
             async with session_launch_reservation:
                 attached = await asyncio.to_thread(_attached_hub_state)
                 _observe_can_state(attached, running=_discovery_running())
         if can_discovery.status not in _CAN_DISCOVERY_BLOCKING:
+            return
+        if jelly_device and not _jelly_discovery_blocked(attached):
             return
         task = await _launch_or_join_can_discovery(force=True)
         if not isinstance(task, JSONResponse):
@@ -1832,7 +1905,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         if req is None or not req.automatic:
             # A fresh base/lift adapter has no pinned interface until discovery
             # names it, so a manual Connect runs that pass first.
-            await _discover_before_manual_connect()
+            await _discover_before_manual_connect(jelly_device=True)
         async with session_launch_reservation:
             if runner.is_running() or _diagnostic_session_active():
                 return JSONResponse(
@@ -1843,12 +1916,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     status_code=409,
                 )
             automatic = req is not None and req.automatic
-            if automatic and can_discovery.status in {
-                "needed",
-                "running",
-                "unidentified",
-                "error",
-            }:
+            attached = None
+            if automatic:
+                # Judge the live USB state, as the robot link does, rather
+                # than whatever the browser last polled.
+                attached = await asyncio.to_thread(_attached_hub_state)
+                _observe_can_state(attached, running=_discovery_running())
+            if automatic and _jelly_discovery_blocked(attached):
                 return JSONResponse(
                     {
                         "error": "automatic connection is waiting for CAN "

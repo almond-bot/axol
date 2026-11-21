@@ -270,6 +270,19 @@ def _split_nals(data: bytes) -> list[bytes]:
     return [n for n in nals if n]
 
 
+class _AUQueue(queue.Queue):  # type: ignore[type-arg]
+    """A subscriber's AU queue that remembers when the channel dropped an AU.
+
+    Dropping an access unit breaks the GOP for that subscriber: the AUs after
+    it reference a frame it will never receive. ``gap`` tells the consumer to
+    skip ahead to the next IDR instead of sending undecodable frames.
+    """
+
+    def __init__(self, maxsize: int = 0) -> None:
+        super().__init__(maxsize=maxsize)
+        self.gap = False
+
+
 class _AUChannel:
     """Fan-out of one H.264 stream's access units to subscriber queues.
 
@@ -283,13 +296,63 @@ class _AUChannel:
         self._subscribers: list[queue.Queue[list[bytes]]] = []
         self._lock = threading.Lock()
         self.first_au = threading.Event()
+        # The NVENC element feeding this channel, bound once the pipeline is
+        # built, so the WebRTC relay can lower its bitrate on a slow link
+        # (``bitrate`` is the one rate property nvv4l2h264enc accepts while
+        # PLAYING). Its configured bitrate is the default and the ceiling.
+        self._encoder: Any = None
+        self._base_bitrate = 0
+        self._bitrate = 0
 
     @property
     def alive(self) -> bool:
         return bool(self._alive())
 
+    def bind_encoder(self, element: Any) -> None:
+        """Attach the stream encoder whose bitrate ``set_bitrate_scale`` drives."""
+        if element is None:
+            return
+        try:
+            base = int(element.get_property("bitrate"))
+        except Exception:  # noqa: BLE001 - leave the stream at its fixed rate
+            return
+        if base <= 0:
+            return
+        self._encoder = element
+        self._base_bitrate = base
+        self._bitrate = base
+
+    @property
+    def bitrate_ceiling(self) -> int:
+        """The encoder's configured bitrate (bits/s); 0 when none is bound."""
+        return self._base_bitrate
+
+    @property
+    def bitrate(self) -> int:
+        """The bitrate currently asked of the encoder (bits/s)."""
+        return self._bitrate
+
+    def set_bitrate_scale(self, scale: float) -> int:
+        """Run the encoder at ``scale`` x its configured bitrate (capped at 1).
+
+        Returns the bitrate now in effect (0 when no encoder is bound). Changes
+        under 2% are skipped so a steady controller doesn't poke NVENC.
+        """
+        if self._encoder is None:
+            return 0
+        target = int(self._base_bitrate * min(1.0, max(0.0, scale)))
+        if abs(target - self._bitrate) < 0.02 * self._base_bitrate:
+            return self._bitrate
+        try:
+            self._encoder.set_property("bitrate", target)
+        except Exception as exc:  # noqa: BLE001 - keep streaming at the old rate
+            _logger.debug("could not set stream encoder bitrate: %s", exc)
+            return self._bitrate
+        self._bitrate = target
+        return target
+
     def subscribe(self) -> queue.Queue[list[bytes]]:
-        q: queue.Queue[list[bytes]] = queue.Queue(maxsize=_SUBSCRIBER_QUEUE_DEPTH)
+        q: queue.Queue[list[bytes]] = _AUQueue(maxsize=_SUBSCRIBER_QUEUE_DEPTH)
         with self._lock:
             self._subscribers.append(q)
         return q
@@ -316,6 +379,10 @@ class _AUChannel:
                         q.get_nowait()
                     except queue.Empty:
                         pass
+                    # The consumer will see a gap in the GOP: it must not
+                    # decode on until the next IDR (see PrecodedVideoTrack).
+                    if isinstance(q, _AUQueue):
+                        q.gap = True
 
 
 class _RawBuffer:
@@ -420,6 +487,20 @@ class _GstStreamConsumer:
     def unsubscribe(self, q: queue.Queue[list[bytes]]) -> None:
         if self._enc is not None:
             self._enc.unsubscribe(q)
+
+    @property
+    def stream_bitrate_ceiling(self) -> int:
+        """The headset stream's configured bitrate (bits/s); 0 if not adjustable."""
+        return self._enc.bitrate_ceiling if self._enc is not None else 0
+
+    @property
+    def stream_bitrate(self) -> int:
+        """The headset stream's current bitrate (bits/s)."""
+        return self._enc.bitrate if self._enc is not None else 0
+
+    def set_stream_bitrate_scale(self, scale: float) -> int:
+        """Encode the headset stream at ``scale`` x its configured bitrate."""
+        return self._enc.set_bitrate_scale(scale) if self._enc is not None else 0
 
     # -- raw (collect-data / inference) -------------------------------------
     def read_at_or_after(
@@ -1337,6 +1418,14 @@ class _GstPipelineBase:
             raise RuntimeError("gst pipeline PTS/perf_counter mapping is unavailable")
         return pts / 1e9 + self._pts_perf_offset_s
 
+    def _bind_stream_encoder(self, channel: _AUChannel, encoder_name: str) -> None:
+        """Let the relay rescale ``encoder_name``'s bitrate through ``channel``.
+
+        Only headset stream encoders (``venc*``) are bound; the dataset
+        encoders (``dsenc*``) keep their recording rate.
+        """
+        channel.bind_encoder(self._pipeline.get_by_name(encoder_name))
+
     def _start_pull(self, name: str, sink_name: str, handler: Any) -> None:
         sink = self._pipeline.get_by_name(sink_name)
         thread = threading.Thread(
@@ -1743,6 +1832,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         self._launch(self._pipeline_str())
         self._attach_dataset_queue_diagnostics(self._raw_gates())
         if self._enc is not None:
+            self._bind_stream_encoder(self._enc, "venc")
             self._start_pull(
                 f"zedgst-{self.serial}-enc",
                 "enc",
@@ -2189,6 +2279,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
             if side not in self._sides:
                 continue
             if enc is not None:
+                self._bind_stream_encoder(enc, f"venc_{suffix}")
                 self._start_pull(
                     f"zedgst-{self.serial}-enc{suffix}",
                     f"enc_{suffix}",
@@ -2204,6 +2295,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
                     self._make_raw_handler(sink, self.raw_width, self.raw_height),
                 )
         if self._sbs_enc is not None:
+            self._bind_stream_encoder(self._sbs_enc, "venc_s")
             self._start_pull(
                 f"zedgst-{self.serial}-encs",
                 "enc_s",
