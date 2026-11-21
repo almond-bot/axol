@@ -20,6 +20,6 @@ axol lidar.setup --mount 0.2 0 0 0 0 0 --measure-mount
 | `--no-network` | Detect the lidar and save its address without changing the network. |
 | `--force` | Set up the port even if it carries this computer's internet connection. |
 
-The command asks for your password. It gives the port one address and a route to the lidar alone, so the lidar's `192.168.1.x` address never clashes with your network. The setting is saved as the `axol-lidar` network profile and comes back after a restart.
+The command asks for your password. It gives the port one address and a route to the lidar alone, so the lidar's `192.168.1.x` address never clashes with your network. The port still gets an address from a router, so you can plug a network cable into it when the lidar isn't connected. The setting is saved as the `axol-lidar` network profile and comes back after a restart.
 
 At the end it prints the lidar's status and checks its data rate. See [Lidar](/hardware-setup/lidar) for wiring and mounting.

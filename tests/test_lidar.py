@@ -383,8 +383,18 @@ class NetworkTest(unittest.TestCase):
         props = dict(zip(args[::2], args[1::2], strict=True))
         self.assertEqual(props["ipv4.addresses"], "192.168.1.5/32")
         self.assertEqual(props["ipv4.routes"], "192.168.1.199/32")
-        self.assertEqual(props["ipv4.never-default"], "yes")
         self.assertEqual(props["connection.interface-name"], "end0")
+
+    def test_profile_keeps_dhcp_for_a_router_on_the_port(self) -> None:
+        # The profile owns the port for any cable, so a router plugged in
+        # there must still give a lease, a default route and DNS.
+        args = net.nmcli_profile_args("end0", "192.168.1.5", "192.168.1.199")
+        props = dict(zip(args[::2], args[1::2], strict=True))
+        self.assertEqual(props["ipv4.method"], "auto")
+        self.assertEqual(props["ipv4.dhcp-timeout"], "infinity")
+        self.assertEqual(props["ipv4.may-fail"], "yes")
+        self.assertEqual(props["ipv4.never-default"], "no")
+        self.assertEqual(props["ipv4.ignore-auto-dns"], "no")
 
     def test_parse_sniffed_frames(self) -> None:
         mac = bytes.fromhex("aabbccddeeff")

@@ -8,6 +8,14 @@ for the whole subnet. Instead, the profile written here gives the port one
 ``/32`` address and one ``/32`` route to the lidar: the robot reaches the lidar
 over the cable and everything else on its network as before.
 
+The profile is the only one NetworkManager has for that port, so it applies to
+any cable plugged in there, not only the lidar's. It therefore also runs DHCP
+and never gives up on it (``ipv4.dhcp-timeout infinity``): with the lidar alone
+the static address comes up at once and DHCP keeps asking in the background,
+and on a router the port gets a lease, a default route and DNS. Without that,
+a robot whose Wi-Fi isn't in range is unreachable over Ethernet (no lease, no
+default route, so no Tailscale either).
+
 Finding a lidar on a port with no IPv4 address can't use UDP (the kernel
 drops the replies), so :func:`sniff_lidar` reads raw Ethernet frames, which
 needs root. The CLI runs it through ``sudo`` (``python -m
@@ -208,16 +216,23 @@ def nmcli_profile_args(iface: str, host_ip: str, lidar_ip: str) -> list[str]:
         "yes",
         "connection.autoconnect-priority",
         "100",
+        # DHCP alongside the static address, so a router on this port works
+        # too. Explicit values, so re-running setup also fixes an older
+        # static-only profile.
         "ipv4.method",
-        "manual",
+        "auto",
         "ipv4.addresses",
         f"{host_ip}/32",
         "ipv4.routes",
         f"{lidar_ip}/32",
+        "ipv4.dhcp-timeout",
+        "infinity",
+        "ipv4.may-fail",
+        "yes",
         "ipv4.never-default",
-        "yes",
+        "no",
         "ipv4.ignore-auto-dns",
-        "yes",
+        "no",
         "ipv6.method",
         "link-local",
     ]

@@ -7,7 +7,9 @@ command.
 
 The port gets one ``/32`` address and a ``/32`` route to the lidar, so the
 lidar's subnet (``192.168.1.x`` from the factory) never clashes with the
-robot's own network. Needs ``sudo`` for the network changes.
+robot's own network. The port also keeps DHCP on, so a router plugged into it
+still gives the robot an address and internet. Needs ``sudo`` for the network
+changes.
 
 Usage:
     axol lidar.setup
