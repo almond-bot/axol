@@ -29,6 +29,7 @@
               "hardware-setup/ox-cart",
               "hardware-setup/jelly",
               "hardware-setup/cameras",
+              "hardware-setup/lidar",
               "hardware-setup/thor"
             ]
           },
@@ -84,7 +85,8 @@
             "pages": [
               "operations/dagger-config"
             ]
-          }
+          },
+          "guides/navigation"
         ]
       },
       {
@@ -132,6 +134,7 @@
                   "cli/gravity-comp",
                   "cli/waypoints",
                   "cli/jog",
+                  "cli/sensors",
                   "cli/collect-data",
                   "cli/collect-dagger",
                   "cli/replay-dataset",
@@ -200,6 +203,23 @@
                 ]
               },
               {
+                "group": "Lidar",
+                "pages": [
+                  "cli/lidar-setup",
+                  "cli/lidar-info",
+                  "cli/lidar-view",
+                  "cli/lidar-record"
+                ]
+              },
+              {
+                "group": "Navigation",
+                "pages": [
+                  "cli/nav-map",
+                  "cli/nav-run",
+                  "cli/nav-waypoint"
+                ]
+              },
+              {
                 "group": "Mantis",
                 "pages": [
                   "cli/mantis-update"
@@ -252,7 +272,9 @@
               "api/motor",
               "api/lerobot",
               "api/policy",
-              "api/policy-plan"
+              "api/policy-plan",
+              "api/lidar",
+              "api/nav"
             ]
           }
         ]

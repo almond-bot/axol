@@ -207,6 +207,8 @@ const SIM_ROBOT_KEY = "axolSimRobot"
 
 // Jog's 3D view and controls, loaded only when Jog is open.
 const JogWorkspace = lazy(() => import("@/components/jog/jog-workspace"))
+// The Sensors page's map, scan and cameras, loaded only when it is open.
+const SensorsWorkspace = lazy(() => import("@/components/sensors/sensors-workspace"))
 
 /** How long to wait before asking a host that failed to send its settings again. */
 const SETTINGS_RETRY_MS = 3000
@@ -1335,6 +1337,12 @@ export default function ControlPanel() {
     id ? (commands.find((c) => c.id === id)?.label ?? id) : null
   const runningLabel = commandLabel(runningOp)
   const selectedLive = isLive && runningOp === opId
+  // Whether the running operation streams the robot's cameras (the Sensors
+  // page shows them, whichever operation it is).
+  const runningStreamsCameras =
+    !isStopping &&
+    Boolean(runningOp && operations.find((o) => o.id === runningOp)?.streamsVideo) &&
+    String(effectiveStatus?.args?.sim) !== "true"
   const selectedStopping = isStopping && runningOp === opId
 
   // Whether the host is currently unsafe to restart / power off / update.
@@ -2358,6 +2366,13 @@ export default function ControlPanel() {
     currentEntry.summary && currentEntry.summary !== meta.description
       ? { ...meta, description: currentEntry.summary }
       : meta
+  // The robot the host drives, for the 3D views.
+  const hostRobot = settingsSnap
+    ? {
+        model: settingsSnap.robotModel ?? "classic",
+        gripper: parseGripper(settingsSnap.values["axol.gripper"]),
+      }
+    : null
   const runningEntry = runningOp
     ? catalogEntry(
         runningOp,
@@ -2550,7 +2565,7 @@ export default function ControlPanel() {
       <AppShell
         title={page[view].title}
         back={routeOp ? "/control/operations" : undefined}
-        wide={routeOp === "jog"}
+        wide={routeOp === "jog" || routeOp === "sensors"}
         description={page[view].description}
         actions={runningChip}
         notices={view === "request-data" || view === "request-teleoperator" ? undefined : notices}
@@ -2715,6 +2730,7 @@ export default function ControlPanel() {
               onStart={handleStart}
               onStop={handleStop}
               onEpisode={handleEpisode}
+              hostRobot={hostRobot}
               workspace={
                 opId === "jog" ? (
                   <Suspense
@@ -2732,15 +2748,22 @@ export default function ControlPanel() {
                           : isSimRun(meta, settings)
                       }
                       simRobot={simRobot}
-                      hostRobot={
-                        settingsSnap
-                          ? {
-                              model: settingsSnap.robotModel ?? "classic",
-                              gripper: parseGripper(settingsSnap.values["axol.gripper"]),
-                            }
-                          : null
-                      }
+                      hostRobot={hostRobot}
                       video={{ host: viewerHost, vrPort: hostInfo?.vrPort ?? 8000 }}
+                    />
+                  </Suspense>
+                ) : opId === "sensors" ? (
+                  <Suspense
+                    fallback={
+                      <div className="flex items-center justify-center gap-2 py-16 text-sm text-white/45">
+                        <Loader2 className="size-4 animate-spin" /> Loading Sensors…
+                      </div>
+                    }
+                  >
+                    <SensorsWorkspace
+                      robot={hostRobot}
+                      video={{ host: viewerHost, vrPort: hostInfo?.vrPort ?? 8000 }}
+                      cameras={runningStreamsCameras}
                     />
                   </Suspense>
                 ) : undefined

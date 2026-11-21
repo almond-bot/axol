@@ -1,0 +1,22 @@
+---
+title: "nav.map"
+description: "Build a map by driving the robot around."
+---
+
+Builds a map while you drive the robot through a space. Press Ctrl-C, or **Save map** in the map view, to save it. See [Mapping and Navigation](/guides/navigation#make-a-map).
+
+```bash
+axol nav.map office
+axol nav.map office --from drive.npz
+axol nav.map demo --sim
+```
+
+| Option | What it does |
+|---|---|
+| `--from FILE` | Build the map from a [`lidar.record`](/cli/lidar-record) file. |
+| `--overwrite` | Replace a map with the same name. |
+| `--no-view` | Don't start the map view. |
+| `--port` | Map view port. The default is 8010. |
+| `--sim` | Map a simulated office with a simulated robot. |
+
+The map is saved in `~/.almond/maps/NAME/`. Its origin is where the robot was when mapping started.

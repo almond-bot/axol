@@ -1,4 +1,13 @@
-import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from "react"
+import {
+  lazy,
+  type ReactNode,
+  type RefObject,
+  Suspense,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import {
   AlertTriangle,
   ChevronRight,
@@ -52,10 +61,15 @@ import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { cn, sentenceCase } from "@/lib/utils"
 import { useVrSocket } from "@/lib/vr-socket"
+import { useLidarConfigured } from "@/lib/lidar-stream"
+import type { AxolModel, GripperType } from "@/lib/supervisor"
 import { SimRobotPicker, type SimRobot } from "@/components/sim-robot-picker"
 import { ElapsedTime, OperationIcon, StartupBar } from "@/components/operation-launcher"
 import { useStartupView } from "@/lib/operation-progress"
 import type { CatalogEntry } from "@/lib/operation-catalog"
+
+// three.js is heavy: load the lidar view only when a run shows it.
+const LidarView = lazy(() => import("@/components/lidar/lidar-view"))
 
 const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse"])
 
@@ -109,6 +123,7 @@ export function OperationPanel({
   onStop,
   onEpisode,
   workspace,
+  hostRobot = null,
 }: {
   /** How the app presents the operation: its icon and name. */
   entry: CatalogEntry
@@ -162,6 +177,8 @@ export function OperationPanel({
   /** The operation's own screen (Jog's 3D view and controls), shown
    *  below the run details. */
   workspace?: ReactNode
+  /** The host's robot model, drawn in the lidar view. */
+  hostRobot?: { model: AxolModel; gripper: GripperType } | null
 }) {
   // Per-run inputs: every required field plus the op's curated run-identity
   // fields (repo id, task, policy path, episode, …) — required ones first.
@@ -584,6 +601,8 @@ export function OperationPanel({
               onEpisode={onEpisode}
               host={host}
               vrPort={vrPort}
+              sim={isSim}
+              hostRobot={hostRobot}
             />
           )}
 
@@ -925,6 +944,8 @@ function OperatorDeck({
   onEpisode,
   host,
   vrPort,
+  sim,
+  hostRobot,
 }: {
   label: string
   episodeControl: boolean
@@ -934,6 +955,8 @@ function OperatorDeck({
   onEpisode: (command: string) => void
   host: string
   vrPort: number
+  sim: boolean
+  hostRobot: { model: AxolModel; gripper: GripperType } | null
 }) {
   const [fullscreen, setFullscreen] = useState(false)
   // Relayed headset HUD state (armed confirm popup / record countdown), from
@@ -944,6 +967,8 @@ function OperatorDeck({
   const [vrSocket, setVrSocket] = useState<WebSocket | null>(null)
   // Without the feed card (sim, arms-off) the settings card connects itself.
   const ownSocket = useVrSocket(host, vrPort, showSettings && !showFeeds)
+  // A sim run has its own viewer; the lidar shows the real robot's space.
+  const showLidar = useLidarConfigured() === true && !sim
 
   function toggleFullscreen() {
     const next = !fullscreen
@@ -986,6 +1011,11 @@ function OperatorDeck({
           onHud={setHud}
           onSocket={setVrSocket}
         />
+      )}
+      {showLidar && !fullscreen && (
+        <Suspense fallback={null}>
+          <LidarView robot={hostRobot} socket={showFeeds ? vrSocket : ownSocket} />
+        </Suspense>
       )}
       {showSettings && !fullscreen && <SessionSettings socket={showFeeds ? vrSocket : ownSocket} />}
       {hud?.confirm && <ConfirmPopup action={hud.confirm} policy={policy} />}

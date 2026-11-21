@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import os
@@ -64,6 +65,7 @@ from .commands import (
     safety_flags,
 )
 from .jelly_link import JELLY_DEVICES, JellyLink, device_presence
+from .lidar_link import DEFAULT_POINTS, LidarHub, lidar_configured
 from .manager import Session, SessionManager
 from .robot_link import STATE_ERROR, RobotLink, scoped_motor_faults
 from .runner import OperationRunner, prove_motors_torque_free
@@ -935,11 +937,18 @@ def _usb_status_dict(status: adb.AdbStatus) -> dict[str, Any]:
     }
 
 
-async def _wait_for_disconnect(ws: WebSocket) -> None:
-    """Return once the client's close frame arrives."""
+async def _wait_for_disconnect(
+    ws: WebSocket, on_text: Callable[[str], None] | None = None
+) -> None:
+    """Return once the client's close frame arrives.
+
+    Text messages before it go to ``on_text`` when given.
+    """
     try:
-        while (await ws.receive())["type"] != "websocket.disconnect":
-            pass
+        while (message := await ws.receive())["type"] != "websocket.disconnect":
+            text = message.get("text")
+            if on_text is not None and text is not None:
+                on_text(text)
     except (WebSocketDisconnect, RuntimeError):
         # Starlette reports the close as a disconnect message on a live socket,
         # but raises once the connection has already gone: WebSocketDisconnect
@@ -949,7 +958,9 @@ async def _wait_for_disconnect(ws: WebSocket) -> None:
 
 
 async def _stream_until_disconnect(
-    ws: WebSocket, queue: asyncio.Queue[Any]
+    ws: WebSocket,
+    queue: asyncio.Queue[Any],
+    on_text: Callable[[str], None] | None = None,
 ) -> AsyncIterator[Any]:
     """Yield queued messages until the client disconnects.
 
@@ -958,7 +969,7 @@ async def _stream_until_disconnect(
     on SIGTERM -- is never observed, and an idle stream holds its handler task
     (and the server shutdown) open indefinitely.
     """
-    disconnect = asyncio.ensure_future(_wait_for_disconnect(ws))
+    disconnect = asyncio.ensure_future(_wait_for_disconnect(ws, on_text))
     try:
         while True:
             pending = asyncio.ensure_future(queue.get())
@@ -999,6 +1010,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     manager = SessionManager()
     hub = TelemetryHub()
+    lidar_hub = LidarHub()
     settings = SettingsStore()
     # The link opens the interfaces configured in the shared settings (the
     # Axol hub's persistent names unless the operator picked others).
@@ -2061,6 +2073,53 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             pass
         finally:
             hub.unsubscribe(queue)
+
+    # -- lidar (live scans for the 3D views) ---------------------------------
+
+    @app.get("/api/lidar/status")
+    async def lidar_status() -> dict[str, Any]:
+        """Whether a lidar is set up, so the panel knows to show its view."""
+        configured = await asyncio.to_thread(lidar_configured)
+        return {"configured": configured}
+
+    @app.get("/api/lidar/maps")
+    async def lidar_maps() -> dict[str, Any]:
+        """Saved maps (``axol nav.map``) the Sensors page can show."""
+        from ..nav.mapping import list_maps
+
+        return {"maps": await asyncio.to_thread(list_maps)}
+
+    @app.websocket("/api/lidar/ws")
+    async def lidar_ws(
+        ws: WebSocket, points: int = DEFAULT_POINTS, map: bool = False
+    ) -> None:
+        """Live lidar frames in the base frame (see :mod:`.lidar_link`).
+
+        ``points`` caps the points per frame (about 10 frames a second).
+        ``map`` adds the live map and the robot's pose on it.
+        """
+        await ws.accept()
+        sub = lidar_hub.subscribe(points, map=map)
+
+        def on_text(text: str) -> None:
+            try:
+                lidar_hub.command(json.loads(text))
+            except ValueError:
+                pass
+
+        try:
+            async with contextlib.aclosing(
+                _stream_until_disconnect(ws, sub.queue, on_text if map else None)
+            ) as stream:
+                async for message in stream:
+                    if isinstance(message, bytes):
+                        await ws.send_bytes(message)
+                    else:
+                        await ws.send_json(message)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            lidar_hub.unsubscribe(sub)
 
     # -- diagnostics runs (script launches with telemetry capture) -----------
 
@@ -3772,6 +3831,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         await asyncio.to_thread(robot.shutdown)
         await asyncio.to_thread(jelly.shutdown)
         await asyncio.to_thread(safety.shutdown)
+        await asyncio.to_thread(lidar_hub.shutdown)
 
     if static_dir is not None:
         _mount_spa(app, static_dir)

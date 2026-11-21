@@ -4,7 +4,16 @@
  * details as every other operation, and starts and stops the run.
  */
 
-import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from "react"
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react"
 import {
   ArrowDown,
   ArrowUp,
@@ -26,6 +35,15 @@ import { Button } from "@/components/ui/button"
 import { Card, CardHeader, CardTitle } from "@/components/ui/card"
 import { Select, SelectOption } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
+import { Switch } from "@/components/ui/switch"
+import { LidarControls } from "@/components/lidar/lidar-controls"
+import { useLidarConfigured, useLidarStream } from "@/lib/lidar-stream"
+import {
+  lidarStatusLine,
+  loadLidarSettings,
+  saveLidarSettings,
+  type LidarSettings,
+} from "@/lib/lidar"
 import { CameraFeeds } from "@/components/camera-feeds"
 import type { SimRobot } from "@/components/sim-robot-picker"
 import { useToast } from "@/components/ui/toast"
@@ -472,6 +490,22 @@ export default function JogWorkspace({
         : simRobot.gripper
       : (hostRobot?.gripper ?? "parallel")
   const ready = running && Boolean(state?.ready)
+
+  // The live lidar scan around the base, on a real robot that has one.
+  const lidarConfigured = useLidarConfigured()
+  const lidarAvailable = viewMode === "hardware" && lidarConfigured === true
+  const [lidarOn, setLidarOn] = useState(true)
+  const [lidarSettings, setLidarSettings] = useState<LidarSettings>(loadLidarSettings)
+  const { cloud: lidarCloud, status: lidarStatus } = useLidarStream(lidarAvailable && lidarOn)
+  const lidarMount = lidarStatus.mount
+  const jogLidar = useMemo(
+    () =>
+      lidarAvailable && lidarOn
+        ? { cloud: lidarCloud, settings: lidarSettings, mount: lidarMount }
+        : null,
+    [lidarAvailable, lidarOn, lidarCloud, lidarSettings, lidarMount]
+  )
+  const lidarLine = lidarStatusLine(lidarStatus)
   const executing = state?.execution ?? null
   // Edits and plans belong to one session and one arm pose: starting a new
   // session or finishing a move puts the targets back on the grippers.
@@ -739,6 +773,7 @@ export default function JogWorkspace({
                   target={canMoveArm || plan ? target : null}
                   onTargetChange={changeTarget}
                   onSelectArm={selectArm}
+                  lidar={jogLidar}
                 />
               </Suspense>
               {running && !ready && (
@@ -800,6 +835,35 @@ export default function JogWorkspace({
                 </span>
               )}
             </div>
+            {lidarAvailable && (
+              <div className="flex flex-col gap-3 border-t border-white/10 px-4 py-3">
+                <div className="flex items-center gap-3 text-xs text-white/55">
+                  <Switch checked={lidarOn} onChange={setLidarOn} aria-label="Show lidar" />
+                  <span>Show lidar</span>
+                  {lidarOn && (
+                    <span
+                      className={cn(
+                        "ml-auto text-right",
+                        lidarLine.tone === "bad"
+                          ? "text-amber-300"
+                          : "font-mono text-[0.65rem] text-white/40"
+                      )}
+                    >
+                      {lidarLine.text}
+                    </span>
+                  )}
+                </div>
+                {lidarOn && (
+                  <LidarControls
+                    settings={lidarSettings}
+                    onChange={(next) => {
+                      setLidarSettings(next)
+                      saveLidarSettings(next)
+                    }}
+                  />
+                )}
+              </div>
+            )}
           </Card>
 
           {running && sessionMode === "hardware" && video && (

@@ -1,0 +1,104 @@
+---
+title: "Lidar"
+description: "Connect a Livox Mid-360 lidar to the Compute Kit so Axol on Jelly can map and navigate."
+---
+
+A lidar lets Axol on Jelly build a map of its space and drive itself to saved waypoints. Axol supports the **Livox Mid-360** (also sold as the Mid-360S). It connects to the Compute Kit over Ethernet and needs its own power.
+
+After setup, follow [Mapping and Navigation](/guides/navigation) to make a map and drive to waypoints.
+
+## What you need
+
+- A Livox Mid-360 with its M12 cable. The cable ends in an RJ45 plug, power leads and sync leads.
+- A free Ethernet port on the Compute Kit.
+- A 12 V DC supply rated for at least 15 W.
+- A metal plate to mount the lidar on, and four M3 screws.
+
+## Power
+
+The lidar takes 9 to 27 V. It draws about 6.5 W, and up to 14 W for a few minutes when it starts cold and warms itself up.
+
+<Warning>
+  Don't power the lidar from Axol's 24 V line or straight from Jelly's battery. Both can rise above the lidar's 27 V limit: the arms push current back into the line when they slow down, and Jelly's battery reaches 29 V while it charges.
+</Warning>
+
+| Setup | Power the lidar from |
+|---|---|
+| Axol on Jelly | A 12 V DC-DC converter on Jelly's battery, rated for at least 15 W and for 30 V input |
+| Owl Mount, Ox Cart or Standalone | A 12 V wall adapter, rated for at least 15 W |
+
+Connect the red power lead to +12 V and the black lead to ground. Leave the sync leads unconnected.
+
+## Mount
+
+- Mount the lidar on a metal plate. It has no fan and cools through its base.
+- Leave at least 10 mm of space around it.
+- Mount it level and high enough to see over Jelly and the arms. It sees from 7° below level to 52° above, all the way around.
+- Write down where it sits: how far forward of the centre of Jelly and how far to the left.
+
+The lidar can't see the floor close to Jelly. Mounted 1 m above the floor, its view reaches the floor about 8 m away. Low objects near the base are hard for it to see.
+
+## Connect it
+
+<Steps>
+  <Step title="Plug in the Ethernet cable">
+    Plug the lidar's RJ45 plug into a free Ethernet port on the Compute Kit. If that port is the robot's only network connection, connect the robot to Wi-Fi first.
+  </Step>
+  <Step title="Power it on">
+    Switch on the lidar's power. It takes about 10 seconds to start, longer when it is cold.
+  </Step>
+  <Step title="Run the setup">
+    On the Compute Kit, run:
+
+    ```bash
+    axol lidar.setup --mount 0.2 0 0 0 0 0 --measure-mount
+    ```
+
+    Replace `0.2 0` with how far forward and to the left of Jelly's centre the lidar sits, in metres. `--measure-mount` measures the lidar's height and tilt, so keep the robot still on a level floor.
+  </Step>
+  <Step title="Check it">
+    ```bash
+    axol lidar.info
+    axol lidar.view
+    ```
+
+    `lidar.info` should report about 200k points/s, 10 frames/s and IMU 200 Hz. `lidar.view` shows the live point cloud at `http://<robot>:8010`. The floor should sit on the grid.
+  </Step>
+  <Step title="Check which way it faces">
+    In `lidar.view`, stand a step in front of the robot. You should appear along the red axis. If you appear somewhere else, measure the angle from where you appear to the red axis, counter-clockwise seen from above. Run the setup again with that angle as the last `--mount` value:
+
+    ```bash
+    axol lidar.setup --mount 0.2 0 0 0 0 90 --measure-mount
+    ```
+  </Step>
+</Steps>
+
+## See the scan in the control panel
+
+Once the lidar is set up, the control panel shows its live scan around the robot:
+
+- **Teleop and data collection**: a **Lidar** view under the camera feeds, with the robot model at its live pose.
+- **Jog**: the scan around the robot in the 3D view. Turn it off with **Show lidar**.
+- **Sensors**: a live 3D map with the robot on it. See [Sensors](/guides/control-panel#sensors).
+
+Drag to orbit, scroll to zoom, and press the reset button to go back to the starting view.
+
+| Control | What it does |
+|---|---|
+| **History** | How many seconds of scans to show at once. More fills in the scene. Less keeps up better while the robot moves. |
+| **Point size** | The size of each point. |
+| **Hide above** | Hides points above this height, so you can see under a ceiling. |
+| **Color by** | Colors points by their height or by how much light they reflect. |
+
+The control panel, `lidar.view` and the `nav` commands can all read the lidar at the same time.
+
+`lidar.setup` asks for your password, because it changes the network settings. It gives the lidar's port its own address, so the lidar can't clash with your network. See [`lidar.setup`](/cli/lidar-setup) for details.
+
+## Troubleshooting
+
+| Problem | What to do |
+|---|---|
+| `Lidar not found` | Check the lidar's power and its Ethernet cable. Wait for it to finish starting, then run `axol lidar.setup` again. |
+| `carries this computer's internet connection` | The lidar is in the port the robot uses for its network. Move the lidar to another port, or connect the robot to Wi-Fi. |
+| Fewer than 200k points/s | Check the cable. Run `axol lidar.info` and look at **Faults**. |
+| The floor in `lidar.view` is tilted or off the grid | Run `axol lidar.setup --measure-mount` again with the robot still on a level floor. |

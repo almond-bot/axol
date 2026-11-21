@@ -1,0 +1,19 @@
+---
+title: "lidar.record"
+description: "Record the lidar to a file to build a map later."
+---
+
+Records the lidar's points and IMU samples to a file until Ctrl-C, or for `--seconds`.
+
+```bash
+axol lidar.record drive.npz
+axol lidar.record drive.npz --seconds 60
+```
+
+Build a map from the recording with [`nav.map`](/cli/nav-map):
+
+```bash
+axol nav.map office --from drive.npz
+```
+
+A minute of recording takes about 130 MB.

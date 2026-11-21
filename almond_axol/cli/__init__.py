@@ -31,10 +31,17 @@ from .can import setup as can_setup
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
 from .jetson import setup as jetson_setup
+from .lidar import info as lidar_info
+from .lidar import record as lidar_record
+from .lidar import setup as lidar_setup
+from .lidar import view as lidar_view
 from .lift import goto as lift_goto
 from .lift import home as lift_home
 from .lift import update as lift_update
 from .motion import add_parser as motion_add_parser
+from .nav import map as nav_map
+from .nav import run as nav_run
+from .nav import waypoint as nav_waypoint
 from .motor import burn_in as motor_burn_in
 from .motor import dump_config as motor_dump_config
 from .motor import flash as motor_flash
@@ -101,6 +108,7 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
         "Teach waypoints by hand, then replay them as straight-line moves.",
     ),
     "jog": ("jog", "Jog the arms, lift and base from the control panel."),
+    "sensors": ("sensors", "Stream the cameras to the control panel's Sensors page."),
     "collect-data": ("collect_data", "Record teleoperation episodes."),
     "collect-dagger": (
         "collect_dagger",
@@ -164,6 +172,13 @@ def build_parser() -> argparse.ArgumentParser:
     lift_home.add_parser(subparsers)
     lift_goto.add_parser(subparsers)
     lift_update.add_parser(subparsers)
+    lidar_setup.add_parser(subparsers)
+    lidar_info.add_parser(subparsers)
+    lidar_view.add_parser(subparsers)
+    lidar_record.add_parser(subparsers)
+    nav_map.add_parser(subparsers)
+    nav_run.add_parser(subparsers)
+    nav_waypoint.add_parser(subparsers)
     safety_cmd.add_parser(subparsers)
     safety_update_cmd.add_parser(subparsers)
     mantis_update.add_parser(subparsers)

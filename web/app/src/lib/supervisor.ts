@@ -40,6 +40,8 @@ export interface CommandSpec {
   category: string
   simCapable: boolean
   requiresHardware: boolean
+  /** Needs the motors' CAN bus (false for a camera-only operation). Older hosts omit it. */
+  usesCanBus?: boolean
   available: boolean
   error: string | null
   schema: SchemaNode[]
@@ -2247,9 +2249,10 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     fields: s.perRunFields ?? [],
     suggestedFields: s.suggestedFields ?? [],
     strictFields: s.strictFields ?? [],
-    // Every in-process operation drives the arms; only a sim run doesn't, and
-    // that's decided per run from simFlag.
-    requiresRobot: true,
+    // Every in-process operation drives the arms, except one that leaves the
+    // motors' bus alone (Sensors streams only the cameras). A sim run doesn't
+    // either, and that's decided per run from simFlag.
+    requiresRobot: s.usesCanBus !== false,
     requiresCameras: Boolean(s.requiresCameras),
     simCapable: s.simCapable,
     simFlag: s.simFlag ?? null,

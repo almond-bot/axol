@@ -1,0 +1,14 @@
+---
+title: "lidar.info"
+description: "Show the lidar's status and measure its data rate."
+---
+
+Prints the lidar's model, serial number, firmware, address, temperature and faults, then measures its data rate for two seconds.
+
+```bash
+axol lidar.info
+axol lidar.info --json
+axol lidar.info --seconds 5
+```
+
+A healthy Mid-360 reports about 200k points/s, 10 frames/s and IMU 200 Hz. Run [`lidar.setup`](/cli/lidar-setup) first.

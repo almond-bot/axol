@@ -1,0 +1,26 @@
+---
+title: "nav.run and nav.goto"
+description: "Localize the robot on a map and drive it to waypoints."
+---
+
+`nav.run` finds the robot on a map and opens the map view at `http://<robot>:8010`, where you drive to waypoints and save new ones. `nav.goto` drives to the waypoints you name, in order, and exits when it arrives. See [Mapping and Navigation](/guides/navigation#drive-to-waypoints).
+
+```bash
+axol nav.run office
+axol nav.goto office bench
+axol nav.goto office bench dock --loop
+axol nav.run office --no-drive
+```
+
+| Option | What it does |
+|---|---|
+| `--speed` | Top speed in m/s. The default is 0.3 and the most is 0.7. |
+| `--no-drive` | Find the robot and show the map, but never drive. |
+| `--start X Y HEADING` | Where the robot is on the map, in metres and degrees, if it can't find itself. |
+| `--loop` | `nav.goto` only: keep visiting the waypoints until Ctrl-C. |
+| `--view` | `nav.goto` only: also start the map view. |
+| `--no-view` | `nav.run` only: don't start the map view. |
+| `--port` | Map view port. The default is 8010. |
+| `--sim` | Use a simulated robot in a simulated office. |
+
+The robot drives only when Jelly is connected to this computer and no other program uses it. Stop teleoperation first. Keep the E-Stop within reach.

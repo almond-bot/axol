@@ -306,6 +306,7 @@ While the operation starts, its screen shows what it is doing and how far along 
 | **Gravity compensation** | Axol | Hold the arms weightless so you can move them by hand. |
 | **Waypoints** | Axol or sim | Teach a path by hand and replay it. See [Waypoints](#waypoints). |
 | **Jog** | Axol, Jelly, or sim | Move a gripper to a pose you drag in 3D, jog it with buttons, and drive the lift and Jelly. See [Jog](#jog). |
+| **Sensors** | A lidar or cameras | See the lidar's live 3D map with the robot on it, and the camera feeds. Nothing moves. See [Sensors](#sensors). |
 | **Collect data** | Axol or Mantis, and cameras | Record episodes into a LeRobot dataset. Pick an existing dataset under **repo id** to add to it. See [Data collection](/operations/data-collection#run-it). |
 | **Replay dataset** | Axol | Play a recorded episode on the arms, then return to rest. Turn on **loop** to repeat until **Stop**, and **interpolate** to smooth playback. |
 | **Run policy** | Axol and cameras | Run a LeRobot policy on the robot or on an [inference server](/cli/inference-server). Choose policy type `custom` to run [your own model](/operations/custom-policy), which needs no checkpoint path. |
@@ -359,6 +360,28 @@ The controls are in tabs:
 To use a game controller, plug it in, click the page and press any button on it. If the page says the controller isn't supported, move the switch on the back of a Logitech controller to the other letter (D on a Mac). Everything stops when you let go or leave the page.
 
 Press **Stop** to end the run. The arms move to the rest pose before the motors turn off. See [`jog`](/cli/jog) for the speed settings.
+
+### Sensors
+
+Use **Sensors** to see what the robot senses. Open **Sensors** under **Drive** on the **Operations** page. It needs no headset, and it never moves the robot.
+
+With a [lidar](/hardware-setup/lidar), the page shows a 3D map with the robot model on it, the live scan, and an orange line where the robot has been. These show as soon as you open the page.
+
+- **Live map** builds a map from where the robot is now, and grows it as you drive. Drive the robot with Jog or teleoperation in another tab. **Reset map** clears it and starts again from where the robot is.
+- **Saved** maps are the ones made with [`nav.map`](/guides/navigation#make-a-map). The page finds the robot on the map, which takes a few seconds. If it can't, drive back to an area the map covers, or press **Find robot** to search again.
+
+The map you pick shows for everyone with the page open. The live map is not saved. Use `nav.map` to make a map you can navigate with.
+
+| Control | What it does |
+|---|---|
+| **Show map** | Shows the map. Turn it off to see only the live scan. |
+| **Follow robot** | Keeps the view on the robot as it moves. |
+| **View from above** | Looks straight down on the robot. |
+| **Reset view** | Goes back to the view behind the robot. |
+
+The **History**, **Point size**, **Hide above** and **Color by** controls are the same as the [lidar view's](/hardware-setup/lidar#see-the-scan-in-the-control-panel). **Hide above** also hides the map's ceiling.
+
+Press **Start** to stream the cameras. The camera feeds show under the map. While teleoperation, Jog or data collection runs, the page shows that operation's camera feeds, so you can watch the map while you drive. During teleoperation, the robot model also moves its arms and lift with the real ones.
 
 ### Before you start
 
