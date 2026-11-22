@@ -1254,6 +1254,16 @@ class AxolVRTeleop(Teleoperator):
         """
         return self._core.last_pose_host_ts
 
+    def latest_vr_frame(self) -> VRFrame | None:
+        """The newest frame the headset (or tracker bridge) sent, or ``None``.
+
+        Raw operator input as received: controller poses in the headset's
+        tracking space, grips, buttons and sticks. MCAP recording stores it
+        as the episode's teleop input.
+        """
+        server = self._vr_server
+        return server.get_frame() if server is not None else None
+
     def tcp_poses(self) -> dict | None:
         """Latest base-frame TCP target per side (absolute/Mantis mode only).
 

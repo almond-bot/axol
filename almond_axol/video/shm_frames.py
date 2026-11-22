@@ -660,23 +660,48 @@ class GstShmFrameReader:
     close = disconnect
 
 
-def _au_has_nal_type(au: bytes, wanted: range | tuple[int, ...]) -> bool:
+def _nal_type(header: int, codec: str) -> int:
+    """NAL unit type from the first header byte (H.264: 5 bits, H.265: 6)."""
+    return (header >> 1) & 0x3F if codec == "h265" else header & 0x1F
+
+
+def _au_has_nal_type(
+    au: bytes, wanted: range | tuple[int, ...], codec: str = "h264"
+) -> bool:
     """Return whether an Annex-B access unit contains a requested NAL type."""
     i, n = 0, len(au)
     while i + 3 < n:
         if au[i] == 0 and au[i + 1] == 0:
             if au[i + 2] == 1:
-                if (au[i + 3] & 0x1F) in wanted:
+                if _nal_type(au[i + 3], codec) in wanted:
                     return True
                 i += 4
                 continue
             if au[i + 2] == 0 and i + 4 < n and au[i + 3] == 1:
-                if (au[i + 4] & 0x1F) in wanted:
+                if _nal_type(au[i + 4], codec) in wanted:
                     return True
                 i += 5
                 continue
         i += 1
     return False
+
+
+# Coded-picture (VCL) and keyframe NAL types per codec. H.265's keyframes are
+# its IRAP pictures (BLA, IDR, CRA): with every dataset frame intra-coded and
+# no leading pictures, each one decodes on its own.
+_VCL_NAL_TYPES = {"h264": range(1, 6), "h265": range(0, 32)}
+_KEY_NAL_TYPES = {"h264": (5,), "h265": range(16, 22)}
+ENCODED_CODECS = tuple(_VCL_NAL_TYPES)
+
+
+def au_has_coded_slice(au: bytes, codec: str = "h264") -> bool:
+    """True if the access unit holds a coded picture in ``codec``."""
+    return _au_has_nal_type(au, _VCL_NAL_TYPES[codec], codec)
+
+
+def au_is_keyframe(au: bytes, codec: str = "h264") -> bool:
+    """True if the access unit decodes without any earlier picture."""
+    return _au_has_nal_type(au, _KEY_NAL_TYPES[codec], codec)
 
 
 def _au_has_coded_slice(au: bytes) -> bool:
@@ -742,9 +767,15 @@ class EncodedAuReader:
         *,
         pts_perf_offset_s: float,
         capture_fps: int | None = None,
+        codec: str = "h264",
     ) -> None:
         from .gst_zed import _DATASET_GOP_FRAMES, _require_gst
 
+        if codec not in ENCODED_CODECS:
+            raise ValueError(
+                f"encoded dataset codec must be one of {ENCODED_CODECS}, got {codec!r}"
+            )
+        self.codec = codec
         self._gst, _ = _require_gst()
         self.width = width
         self.height = height
@@ -803,12 +834,12 @@ class EncodedAuReader:
         # drop=false: never discard an exposure silently; the pull thread keeps
         # the appsink drained so it rarely back-pressures shmsrc.
         caps = (
-            f"video/x-h264,stream-format=byte-stream,alignment=au,"
+            f"video/x-{codec},stream-format=byte-stream,alignment=au,"
             f"width={width},height={height},framerate={fps}/1"
         )
         self._pipeline = self._gst.parse_launch(
             f"shmsrc socket-path={socket_path} is-live=true do-timestamp=false "
-            f"! gdpdepay ! {caps} ! h264parse "
+            f"! gdpdepay ! {caps} ! {codec}parse "
             "! appsink name=au emit-signals=false max-buffers=60 drop=false sync=false"
         )
 
@@ -999,9 +1030,9 @@ class EncodedAuReader:
             # Drop non-VCL boundary AUs (no coded picture, e.g. the trailing AU
             # emitted when the valve closes): muxing one would make the video one
             # frame short of the dataset rows. See _au_has_coded_slice.
-            if not _au_has_coded_slice(au):
+            if not au_has_coded_slice(au, self.codec):
                 continue
-            is_idr = _au_is_idr(au)
+            is_idr = au_is_keyframe(au, self.codec)
             if self.frames_are_independent and not is_idr:
                 self._fail(
                     f"encoded AU on {self._name} is predictive but the dataset "
@@ -1134,6 +1165,29 @@ class EncodedAuReader:
                 self._cond.wait(remaining)
             return self._queue.popleft()
 
+    def drain_aus(self) -> list[tuple[bytes, float, float]]:
+        """Pop every queued access unit, oldest first, without waiting.
+
+        Same tuples and errors as :meth:`read_next_au`, except that an empty
+        queue returns ``[]`` instead of timing out.
+        """
+        with self._cond:
+            if not self._queue:
+                if self._error is not None:
+                    raise RuntimeError(self._error)
+                if self._stop.is_set():
+                    raise RuntimeError(f"encoded-AU reader {self._name} is closed")
+                return []
+            out = list(self._queue)
+            self._queue.clear()
+            return out
+
+    def wait_for_au(self, timeout_s: float) -> None:
+        """Block until an access unit is queued, an error occurs, or timeout."""
+        with self._cond:
+            if not self._queue and self._error is None and not self._stop.is_set():
+                self._cond.wait(timeout_s)
+
     def disconnect(self) -> None:
         self._stop.set()
         with self._cond:
@@ -1157,11 +1211,18 @@ class SnapshotWriter:
     512-slot history spans >4 seconds at the 120 Hz control rate.
     """
 
-    def __init__(self, obs_keys: list[str], action_keys: list[str]) -> None:
+    def __init__(
+        self,
+        obs_keys: list[str],
+        action_keys: list[str],
+        capacity: int = _SNAP_RING_CAPACITY,
+    ) -> None:
         self._obs_keys = list(obs_keys)
         self._action_keys = list(action_keys)
         self._width = 2 + len(self._obs_keys) + len(self._action_keys)
-        self._capacity = _SNAP_RING_CAPACITY
+        if capacity <= 0:
+            raise ValueError("snapshot ring capacity must be positive")
+        self._capacity = int(capacity)
         self._shm = shared_memory.SharedMemory(
             create=True, size=_snapshot_block_size(self._width, self._capacity)
         )
@@ -1198,6 +1259,27 @@ class SnapshotWriter:
         """
         self._write_slot(joint_obs, action, ts, intervention)
         return True
+
+    def write_values(self, ts: float, values: "NDArray[Any] | list[float]") -> None:
+        """Commit one record from values already in key order (obs, then action).
+
+        The fast path for a high-rate writer that keeps its values in an
+        array: no per-key dictionary lookups.
+        """
+        generation = self._next_generation
+        slot = (generation - 1) % self._capacity
+        seq = int(self._slot_meta["seq"][slot])
+        if seq & 1:
+            seq += 1
+        self._slot_meta["seq"][slot] = seq + 1
+        d = self._data[slot]
+        d[0] = ts
+        d[1:-1] = values
+        d[-1] = 0.0
+        self._slot_meta["generation"][slot] = generation
+        self._slot_meta["seq"][slot] = seq + 2
+        self._header["published"][0] = generation
+        self._next_generation += 1
 
     def _write_slot(
         self, joint_obs: dict, action: dict, ts: float, intervention: bool
@@ -1339,6 +1421,43 @@ class SnapshotReader:
     def _copy_data(self) -> "NDArray[Any]":
         """Bulk-copy the data plane (split out so tests can race a write in)."""
         return self._data.copy()
+
+    def published(self) -> int:
+        """The newest committed generation (0 before the first write)."""
+        return int(self._header["published"][0])
+
+    def read_rows_since(self, after: int) -> "tuple[NDArray[Any], int, int]":
+        """Every committed record newer than generation ``after``, oldest first.
+
+        Returns ``(rows, newest, lost)``: ``rows`` is ``(n, width)`` with each
+        record as written (``[ts, *values, intervention]``), ``newest`` the
+        generation to pass as ``after`` next time, and ``lost`` how many
+        records the writer overwrote before this reader got to them. A raced
+        copy (see :meth:`_copy_ring`) returns no rows and leaves ``after``
+        where it was, so the caller simply tries again.
+
+        Only the new records' slots are copied, with the same optimistic
+        check as :meth:`_copy_ring`, so frequent polling stays cheap.
+        """
+        empty = np.empty((0, self._width))
+        for _ in range(_SNAP_READ_ATTEMPTS):
+            newest = int(self._header["published"][0])
+            if newest <= after:
+                return empty, max(newest, after), 0
+            oldest = max(1, newest - self._capacity + 1)
+            start = max(after + 1, oldest)
+            generations = np.arange(start, newest + 1, dtype=np.uint64)
+            slots = ((generations - 1) % self._capacity).astype(np.int64)
+            meta = self._slot_meta[slots].copy()
+            data = self._data[slots].copy()
+            live = self._slot_meta[slots]
+            if not np.array_equal(meta.view(np.uint64), live.view(np.uint64)):
+                continue
+            ok = ((meta["seq"] & 1) == 0) & (meta["seq"] != 0)
+            ok &= meta["generation"] == generations
+            lost = int(start - (after + 1)) + int(np.count_nonzero(~ok))
+            return data[ok], newest, lost
+        return empty, after, 0
 
     def read_latest(self) -> tuple[dict, dict, float, bool] | None:
         """Return the newest committed snapshot, preserving the original API."""

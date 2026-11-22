@@ -1437,6 +1437,28 @@ class AxolArm:
         return arr + self._joint_offsets.astype(np.float32)
 
     @property
+    def velocities(self) -> np.ndarray:
+        """Latest cached joint velocities. Requires start_telemetry().
+
+        Returns shape (8,) array in Joint enum order: arm joints in rad/s, the
+        gripper in normalized opening per second (the rate of
+        :attr:`positions`' gripper entry). A motor that has not reported a
+        velocity yet reads NaN; on the gripperless SKU the gripper element is
+        0.0. These are the motors' own (filtered) estimates.
+        """
+        values = self._pad_absent(
+            [
+                np.nan if m._velocity is None else float(m._velocity)
+                for m in self.motors.values()
+            ]
+        )
+        if self._has_gripper:
+            span = self._gripper_open - self._gripper_close
+            gripper_i = self._gripper_i
+            values[gripper_i] = values[gripper_i] / span if span else np.nan
+        return np.array(values, dtype=np.float32)
+
+    @property
     def torques(self) -> np.ndarray:
         """Latest cached joint torques (Nm / A). Requires start_telemetry().
 

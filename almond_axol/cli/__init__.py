@@ -20,6 +20,7 @@ from . import (
     tracker_lighthouse_calibrate,
     tracker_pair,
 )
+from . import mcap_check as mcap_check_cmd
 from . import migrate_dataset as migrate_dataset_cmd
 from . import provision as provision_cmd
 from . import safety as safety_cmd
@@ -197,6 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
     tune_filter.add_parser(subparsers)
     motion_add_parser(subparsers)
     migrate_dataset_cmd.add_parser(subparsers)
+    mcap_check_cmd.add_parser(subparsers)
     serve_cmd.add_parser(subparsers)
 
     # Register the draccus + diagnostics commands as bare subparsers purely so

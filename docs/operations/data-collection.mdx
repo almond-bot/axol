@@ -275,6 +275,10 @@ Each frame then has an `observation.jelly` column next to `observation.state`:
 
 The session won't start unless Jelly's wheels and lift are both on and reporting. If the lift has never been homed, run **Home the lift** first. Keep the setting the same for every session that adds to one dataset.
 
+## Record MCAP instead
+
+To save each episode as an MCAP file with H.265 video, joint states, calibration and transforms, set **Recording format** to `mcap` in the **Recording** settings. See [MCAP Recording](/operations/mcap).
+
 ## Upload to the HuggingFace Hub
 
 Turn on **Push to HuggingFace Hub** to upload the dataset when the session ends. The upload runs only if the session saved at least one episode. It uploads the whole dataset, including episodes from earlier sessions.

@@ -1081,6 +1081,18 @@ SETTINGS: tuple[SettingCategory, ...] = (
         description="Dataset recording for Collect data and Run policy.",
         settings=(
             SettingDef(
+                key="recording.format",
+                label="Recording format",
+                type="select",
+                options=("lerobot", "mcap"),
+                help=(
+                    "lerobot saves a LeRobot dataset. mcap saves one MCAP file per "
+                    "episode, with H.265 video, joints, calibration and the "
+                    "transform tree. mcap works with Collect data on Axol only."
+                ),
+                targets={"collect-data": ("format",)},
+            ),
+            SettingDef(
                 key="recording.fps",
                 label="Recording fps",
                 type="number",

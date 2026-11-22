@@ -58,7 +58,8 @@
             "group": "Data Collection",
             "root": "operations/data-collection",
             "pages": [
-              "operations/data-collection-config"
+              "operations/data-collection-config",
+              "operations/mcap"
             ]
           },
           {
@@ -138,7 +139,8 @@
                   "cli/run-policy",
                   "cli/inference-server",
                   "cli/policy-check",
-                  "cli/migrate-dataset"
+                  "cli/migrate-dataset",
+                  "cli/mcap-check"
                 ]
               },
               {

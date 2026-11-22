@@ -746,6 +746,7 @@ def _dataset_enc_shmsink(
     h: int,
     dataset_fps: int,
     name: str,
+    codec: str = "h264",
 ) -> str:
     """Encode on the GPU and ship timestamped H.264 AUs over ``shmsink``.
 
@@ -782,20 +783,28 @@ def _dataset_enc_shmsink(
     budget is the all-intra one (``dataset_intra_vbr_bitrate``): every frame is
     an IDR here, so the predictive-GOP budget would leave each frame visibly
     blocky.
+
+    ``codec`` is ``"h264"`` (LeRobot datasets) or ``"h265"`` (MCAP
+    episodes). Both use the same all-intra contract, the same GDP/shm
+    transport and the same valve; only the encoder element, its caps and its
+    bitrate budget differ. Each H.265 frame carries its VPS/SPS/PPS
+    (``insert-sps-pps``), so an MCAP file decodes from any frame.
     """
-    target, peak = dataset_intra_vbr_bitrate(w, h, dataset_fps)
+    if codec not in ("h264", "h265"):
+        raise ValueError(f"dataset codec must be h264 or h265, got {codec!r}")
+    target, peak = dataset_intra_vbr_bitrate(w, h, dataset_fps, codec)
     input_buffers = _dataset_active_input_buffers(dataset_fps)
     converter_buffers = input_buffers + _DATASET_VIC_INFLIGHT_SURFACES
     return (
         f"nvvidconv output-buffers={converter_buffers} ! "
         f"video/x-raw(memory:NVMM),format=I420,width={w},height={h} "
         f"! {_dataset_input_queue(name)} "
-        f"! nvv4l2h264enc name={name} control-rate=0 "
+        f"! nvv4l2{codec}enc name={name} control-rate=0 "
         f"bitrate={target} peak-bitrate={peak} preset-level=1 "
         f"insert-sps-pps=true insert-aud=true "
         f"iframeinterval={_DATASET_GOP_FRAMES} "
         f"idrinterval={_DATASET_GOP_FRAMES} {nvenc_maxperf_prop()} "
-        "! video/x-h264,stream-format=byte-stream,alignment=au "
+        f"! video/x-{codec},stream-format=byte-stream,alignment=au "
         f"! queue name={name}_outq leaky=downstream "
         f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
         "max-size-bytes=0 max-size-time=0 ! gdppay "
@@ -1559,6 +1568,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         raw_dims: tuple[int, int] | None = None,
         dataset_fps: int | None = None,
         policy_fps: int | None = None,
+        dataset_codec: str = "h264",
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _RESOLUTION_ENUM:
@@ -1583,6 +1593,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         self.fps = fps
         self.stream_fps = HEADSET_STREAM_FPS
         self.dataset_fps = fps if dataset_fps is None else int(dataset_fps)
+        self.dataset_codec = dataset_codec
         if self.dataset_fps <= 0 or self.dataset_fps > self.fps:
             raise ValueError(
                 f"dataset fps must be in [1, {self.fps}], got {self.dataset_fps}"
@@ -1656,6 +1667,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
                     self.raw_height,
                     self.dataset_fps,
                     "dsenc",
+                    self.dataset_codec,
                 )
             )
         if self._raw_appsink_wanted():
@@ -1858,6 +1870,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         raw_dims: tuple[int, int] | None = None,
         dataset_fps: int | None = None,
         policy_fps: int | None = None,
+        dataset_codec: str = "h264",
         eyes: str = "both",
         encoded_eyes: "list[str] | tuple[str, ...] | None" = None,
         raw_eyes: "list[str] | tuple[str, ...] | None" = None,
@@ -1928,6 +1941,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         self.fps = fps
         self.stream_fps = HEADSET_STREAM_FPS
         self.dataset_fps = fps if dataset_fps is None else int(dataset_fps)
+        self.dataset_codec = dataset_codec
         if self.dataset_fps <= 0 or self.dataset_fps > self.fps:
             raise ValueError(
                 f"dataset fps must be in [1, {self.fps}], got {self.dataset_fps}"
@@ -2037,6 +2051,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
                     self.raw_height,
                     self.dataset_fps,
                     "dsenc_" + sink_suffix,
+                    self.dataset_codec,
                 )
             )
         if want_raw and self._eye_appsink_wanted(side):

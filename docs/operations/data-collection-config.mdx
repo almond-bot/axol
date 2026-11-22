@@ -25,7 +25,7 @@ The [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.
 | `teleop_config.kinematics_config.*` | `kinematics` |
 | `teleop_config.vr_server_config.*` | `vr_server` |
 | `teleop_config.jelly.*` | `jelly` |
-| `fps`, `root`, `vcodec`, `push_to_hub`, `record_jelly`, `rerun_*` | `recording` |
+| `fps`, `root`, `vcodec`, `push_to_hub`, `record_jelly`, `rerun_*`, `format` | `recording` |
 
 ```bash
 axol collect-data --repo_id myorg/pick --task "pick up the cup" \
@@ -43,6 +43,8 @@ axol collect-data --repo_id myorg/pick --task "pick up the cup" \
 |---|---|---|
 | `--repo_id` | required | Dataset ID, `<user>/<dataset>`. |
 | `--task` | required | Task description stored with every frame. |
+| `--format` | `lerobot` | Episode file format: `lerobot` saves a LeRobot dataset, `mcap` saves one MCAP file per episode. See [MCAP Recording](/operations/mcap). |
+| `--operator` | empty | Who is recording. Saved in each MCAP episode. |
 | `--fps` | `30` | Recording rate. Cameras capture at 60 and drop frames to match. `60` doubles the recording load on a Jetson. |
 | `--teleop_hz` | `120` | Motor command rate (Hz) while teleoperating, independent of `fps`. |
 | `--dataset_resolution` | `SVGA` | Resolution of the recorded video: `SVGA`, `HD1080` or `HD1200`. The headset stream keeps the capture resolution. |

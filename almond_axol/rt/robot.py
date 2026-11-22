@@ -64,6 +64,7 @@ command instead. See the Safety notes in ``rust/axol-rt/src/serve.rs``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import bisect
 import logging
 import math
@@ -330,6 +331,9 @@ class Axol(RobotBase):
         self._state_cond = threading.Condition()
         self._state_sides: set[int] = set()
         self._state_side_ts: dict[int, float] = {}
+        # Callbacks given every complete 240 Hz state sample (see
+        # add_state_listener): the MCAP recorder's joint ring.
+        self._state_listeners: list[Callable[..., None]] = []
 
     @property
     def left(self) -> AxolArm | None:
@@ -888,6 +892,7 @@ class Axol(RobotBase):
                     # will publish once the robot is ready.
                     snapshot = None
                 if snapshot is not None:
+                    fresh = False
                     with self._state_cond:
                         if (
                             not self._state_history
@@ -895,6 +900,9 @@ class Axol(RobotBase):
                         ):
                             self._state_history.append(snapshot)
                             self._state_cond.notify_all()
+                            fresh = True
+                    if fresh and self._state_listeners:
+                        self._notify_state_listeners(snapshot, left, right)
                 self._state_sides.clear()
                 self._state_side_ts.clear()
             if self._rec is not None and self._recording_engaged:
@@ -932,6 +940,40 @@ class Axol(RobotBase):
                     self._record_side_ts.clear()
 
         return feed
+
+    def add_state_listener(self, listener: Callable[..., None]) -> None:
+        """Call ``listener`` with every complete 240 Hz state sample.
+
+        Called as ``listener(perf_ts, positions, velocities, torques)`` on the
+        telemetry thread, where each array is ``(16,)``: the left arm's 8
+        joints then the right arm's, in Joint order and the units of
+        :attr:`AxolArm.positions`, :attr:`AxolArm.velocities` and
+        :attr:`AxolArm.torques`. It must be quick and must not block; an
+        exception is logged once and the listener is dropped.
+        """
+        self._state_listeners.append(listener)
+
+    def remove_state_listener(self, listener: Callable[..., None]) -> None:
+        """Stop calling a listener added with :meth:`add_state_listener`."""
+        with contextlib.suppress(ValueError):
+            self._state_listeners.remove(listener)
+
+    def _notify_state_listeners(
+        self, snapshot: tuple, left: AxolArm, right: AxolArm
+    ) -> None:
+        perf_ts, left_pos, right_pos, left_trq, right_trq = snapshot
+        try:
+            velocities = np.concatenate([left.velocities, right.velocities])
+        except (KeyError, MotorError, RuntimeError, TypeError, ValueError):
+            velocities = np.full(2 * len(left_pos), np.nan, dtype=np.float32)
+        positions = np.concatenate([left_pos, right_pos])
+        torques = np.concatenate([left_trq, right_trq])
+        for listener in list(self._state_listeners):
+            try:
+                listener(perf_ts, positions, velocities, torques)
+            except Exception:  # noqa: BLE001 - never break the telemetry feed
+                _logger.exception("rt: state listener failed; removing it")
+                self.remove_state_listener(listener)
 
     def state_nearest(
         self, target_perf_ts: float, timeout: float = 0.1
