@@ -33,6 +33,7 @@ from .rings import (
     WHEEL_IDS,
     column_index,
     joint_ring_keys,
+    mode_name,
     tick_ring_keys,
 )
 from .scene import BASE_JOINTS, LIFT_JOINT, CameraSource, Scene
@@ -77,10 +78,13 @@ class EpisodeRecording:
         start_perf: float,
         clock_offset_ns: int,
         wheel_signs: dict[int, float] | None = None,
+        topic_names: dict[str, str] | None = None,
     ) -> None:
         self.scene = scene
         self.start_perf = float(start_perf)
-        self.file = EpisodeFile(path, clock_offset_ns=clock_offset_ns)
+        self.file = EpisodeFile(
+            path, clock_offset_ns=clock_offset_ns, topic_names=topic_names
+        )
         self.cameras = scene.cameras
         self.camera_stats = {src: _CameraStats() for src in self.cameras}
         self.joint_samples = 0
@@ -114,6 +118,14 @@ class EpisodeRecording:
         self._lift_written_at: float | None = None
         self._cmd_wheels: tuple[float, ...] | None = None
         self._vr_key: float | None = None
+        self._base_command_id: float | None = None
+        self.imu_samples: dict[str, int] = {}
+        self._imu_last: dict[str, float] = {}
+        # The device each /joint_states name belongs to: an arm or a gripper.
+        self._devices = [
+            name if name.endswith("_gripper") else f"{name.split('_', 1)[0]}_arm"
+            for name in self._joint_names
+        ]
 
         self._write_static()
 
@@ -236,6 +248,31 @@ class EpisodeRecording:
                 stamp,
             )
 
+    # -- IMU ---------------------------------------------------------------
+
+    def add_imu(self, topic: str, frame_id: str, samples: list) -> None:
+        """Camera IMU samples (:class:`~.imu.ImuSample`), each at its own time.
+
+        Samples from before the episode started, or not newer than the last
+        one written, are skipped.
+        """
+        last = self._imu_last.get(topic, self.start_perf)
+        for sample in samples:
+            if sample.perf <= last:
+                continue
+            last = sample.perf
+            stamp = self.stamp(sample.perf)
+            self.file.write(
+                topic,
+                "sensor_msgs/Imu",
+                messages.imu(
+                    stamp, frame_id, sample.angular_velocity, sample.acceleration
+                ),
+                stamp,
+            )
+            self.imu_samples[topic] = self.imu_samples.get(topic, 0) + 1
+        self._imu_last[topic] = last
+
     def frame_count(self) -> int:
         """Frames of the camera with the fewest (0 until every camera has one)."""
         if not self.camera_stats:
@@ -298,17 +335,44 @@ class EpisodeRecording:
 
     def _tick_row(self, row: np.ndarray) -> None:
         ts = float(row[0])
-        stamp = self.stamp(ts)
+        issue_t = self._col(row, "cmd.issue_t")
+        if not math.isfinite(issue_t):
+            issue_t = ts
+        stamp = self.stamp(issue_t)
         commanded = row[self._cmd0 : self._cmd0 + 2 * _N]
         cols = self._joint_cols
         picked = commanded[cols]
         keep = np.isfinite(picked)
         if keep.any():
-            names = [n for n, k in zip(self._joint_names, keep, strict=True) if k]
+            arm_mode = mode_name(self._col(row, "cmd.arm_mode")) or "impedance"
+            names, devices, modes = [], [], []
+            for name, device, kept in zip(
+                self._joint_names, self._devices, keep, strict=True
+            ):
+                if kept:
+                    names.append(name)
+                    devices.append(device)
+                    modes.append(
+                        "position_force" if device.endswith("_gripper") else arm_mode
+                    )
+            command_id = self._col(row, "cmd.id")
             self.file.write(
                 "/joint_command",
                 "sensor_msgs/JointState",
                 messages.joint_state(stamp, names, picked[keep].tolist()),
+                stamp,
+            )
+            self.file.write(
+                "/joint_command/info",
+                "almond_msgs/CommandInfo",
+                messages.command_info(
+                    stamp,
+                    int(command_id) if math.isfinite(command_id) else 0,
+                    stamp,
+                    names,
+                    devices,
+                    modes,
+                ),
                 stamp,
             )
             if np.isfinite(commanded[cols]).all():
@@ -399,6 +463,35 @@ class EpisodeRecording:
                     stamp,
                 )
 
+        command_id = self._col(row, "jelly.cmd_id")
+        if math.isfinite(command_id) and command_id != self._base_command_id:
+            self._base_command_id = command_id
+            issued = self._col(row, "jelly.cmd_t")
+            stamp = self.stamp(issued if math.isfinite(issued) else tick_ts)
+            parked = self._col(row, "jelly.parked")
+            lift_direction = self._col(row, "jelly.cmd_lift")
+            self.file.write(
+                "/base/command",
+                "almond_msgs/BaseCommand",
+                messages.base_command(
+                    stamp,
+                    int(command_id),
+                    stamp,
+                    "jelly",
+                    "position_hold" if parked == 1.0 else "velocity",
+                    *(
+                        v if math.isfinite(v) else 0.0
+                        for v in (
+                            self._col(row, "jelly.cmd_vx"),
+                            self._col(row, "jelly.cmd_vy"),
+                            self._col(row, "jelly.cmd_wz"),
+                        )
+                    ),
+                    int(lift_direction) if math.isfinite(lift_direction) else 0,
+                ),
+                stamp,
+            )
+
         if self.odometry is not None:
             command = tuple(self._col(row, f"jelly.cmd{i}") for i in WHEEL_IDS)
             if all(math.isfinite(c) for c in command) and command != self._cmd_wheels:
@@ -474,7 +567,9 @@ class EpisodeRecording:
             )
             out.update(
                 {
-                    f"{prefix}.topic": f"{camera.topic}/video",
+                    f"{prefix}.topic": self.file.topic_names.get(
+                        f"{camera.topic}/video", f"{camera.topic}/video"
+                    ),
                     f"{prefix}.frame_id": camera.frame_id,
                     f"{prefix}.serial": camera.serial,
                     f"{prefix}.width": camera.width,

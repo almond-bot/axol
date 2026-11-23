@@ -389,6 +389,19 @@ def _open_gst_camera_raw(
     # episodes (``dataset_codec`` in the spec). Only the shm transport encodes
     # in the relay; the pyshm fallback ships raw frames.
     dataset_codec = str(spec.get("dataset_codec") or "h264")
+    # MCAP recording asks a stereo camera to send its IMU samples to this
+    # socket; only a zedsrc built with Axol's IMU patch can.
+    imu_socket = spec.get("imu_socket") if stereo else None
+    if imu_socket:
+        from .gst_zed import zedsrc_exports_imu
+
+        if not zedsrc_exports_imu():
+            _logger.warning(
+                "video relay: %s's ZED plugin can't send IMU samples; run "
+                "`axol gst.build-zed` to update it",
+                name,
+            )
+            imu_socket = None
     # The control-process ring's rate (``policy_fps``; 0/absent = capture rate).
     # Only the combined transport has a ring that is the policy's alone; on the
     # plain pyshm fallback the ring is also the recorder's input and stays at
@@ -443,6 +456,7 @@ def _open_gst_camera_raw(
                     dataset_fps=dataset_fps,
                     policy_fps=policy_fps,
                     dataset_codec=dataset_codec,
+                    imu_socket=imu_socket,
                     encoded_eyes=enc_sides,
                     raw_eyes=raw_sides,
                     encoded_sbs=sbs,
@@ -470,6 +484,8 @@ def _open_gst_camera_raw(
                         serial=serial,
                         resolution=resolution,
                         stereo=True,
+                        imu_socket=imu_socket,
+                        imu_requested=bool(spec.get("imu_socket")),
                     )
                     for side, src in raw_plan
                 }

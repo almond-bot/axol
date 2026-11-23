@@ -47,6 +47,7 @@ gate use; without them callers fall back to the SDK ``ZedCamera``.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
@@ -210,6 +211,24 @@ def zed_stereo_gst_available(*, require_sensor_timestamps: bool = False) -> bool
 
 # Elements whose stale-plugin warning has already been logged in this process.
 _stale_plugin_warned: set[str] = set()
+
+
+@functools.cache
+def zedsrc_exports_imu() -> bool:
+    """Whether the installed ``zedsrc`` can send its IMU samples to a socket.
+
+    That is Axol's ``imu-socket`` property (``zed-gstreamer-imu-socket.patch``).
+    A plugin built before the patch lacks it, and ``parse_launch`` would reject
+    the whole pipeline over the unknown property, so callers ask first.
+    """
+    if not _element_available("zedsrc"):
+        return False
+    try:
+        Gst, _ = _require_gst()
+        element = Gst.ElementFactory.make("zedsrc", None)
+    except Exception:  # noqa: BLE001 - no usable plugin
+        return False
+    return element is not None and element.find_property("imu-socket") is not None
 
 
 def _element_available(element: str) -> bool:
@@ -1875,6 +1894,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         encoded_eyes: "list[str] | tuple[str, ...] | None" = None,
         raw_eyes: "list[str] | tuple[str, ...] | None" = None,
         encoded_sbs: bool = False,
+        imu_socket: str | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _STEREO_RESOLUTION_ENUM:
@@ -1915,6 +1935,9 @@ class ZedGstStereoCamera(_GstPipelineBase):
         # The SBS branch replaces the per-eye encodes (one packed stream instead
         # of two): with ``encoded_sbs`` no per-eye encoded side is built.
         self._encoded_sbs = encoded_sbs
+        # Unix datagram socket the camera sends every IMU sample to (MCAP
+        # recording); needs zedsrc_exports_imu(). None leaves it off.
+        self._imu_socket = imu_socket
         self._encoded_sides = (
             ()
             if encoded_sbs
@@ -2171,7 +2194,8 @@ class ZedGstStereoCamera(_GstPipelineBase):
             f"camera-resolution={_STEREO_RESOLUTION_ENUM[self.resolution]} "
             f"camera-fps={self.fps} stream-type=7 depth-mode=0 "
             "do-timestamp=false "
-            "! video/x-raw(memory:NVMM),format=NV12 ! tee name=split"
+            + (f"imu-socket={self._imu_socket} " if self._imu_socket else "")
+            + "! video/x-raw(memory:NVMM),format=NV12 ! tee name=split"
         )
         parts = [f"split. ! {self._eye_branch(side, side[0])}" for side in self._sides]
         if self._encoded_sbs:

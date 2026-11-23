@@ -29,6 +29,7 @@ from almond_axol.recording.mcap.rings import (
     JOINT_RING_CAPACITY,
     TICK_RING_CAPACITY,
     joint_ring_keys,
+    mode_name,
     pack_tick,
     tick_ring_keys,
 )
@@ -255,6 +256,27 @@ class MessagesTest(unittest.TestCase):
                 s,
             )
             f.write("/rd", "std_msgs/String", messages.string_message("<robot/>"), s)
+            f.write(
+                "/cmd",
+                "almond_msgs/CommandInfo",
+                messages.command_info(
+                    s,
+                    2**40 + 7,
+                    s - 1,
+                    ["left_s1_0", "left_gripper"],
+                    ["left_arm", "left_gripper"],
+                    ["impedance", "position_force"],
+                ),
+                s,
+            )
+            f.write(
+                "/base",
+                "almond_msgs/BaseCommand",
+                messages.base_command(
+                    s, 3, s, "jelly", "velocity", 0.5, -0.25, 1.0, -1
+                ),
+                s,
+            )
             f.finish()
             self.assertFalse(path.with_name(path.name + ".partial").exists())
             decoded = {m.channel.topic: m for m in read_ros2_messages(str(path))}
@@ -274,6 +296,16 @@ class MessagesTest(unittest.TestCase):
         self.assertEqual(decoded["/tw"].ros_msg.twist.linear.y, 2.0)
         self.assertEqual(decoded["/joy"].ros_msg.buttons, [1, 0, 1])
         self.assertEqual(decoded["/rd"].ros_msg.data, "<robot/>")
+        cmd = decoded["/cmd"].ros_msg
+        self.assertEqual(cmd.command_id, 2**40 + 7)
+        self.assertEqual(cmd.issue_timestamp.nanosec, 249_999_999)
+        self.assertEqual(cmd.target_device_id, ["left_arm", "left_gripper"])
+        self.assertEqual(cmd.control_mode, ["impedance", "position_force"])
+        self.assertEqual(cmd.name, ["left_s1_0", "left_gripper"])
+        base = decoded["/base"].ros_msg
+        self.assertEqual((base.command_id, base.target_device_id), (3, "jelly"))
+        self.assertEqual((base.vx, base.vy, base.wz), (0.5, -0.25, 1.0))
+        self.assertEqual(base.lift_direction, -1)
 
     def test_video_payload_alignment_holds_for_every_length(self) -> None:
         # The trailing format string must stay 4-aligned whatever the AU size.
@@ -579,9 +611,19 @@ class RingTest(unittest.TestCase):
             wheel_speeds=[1.0, -1.0, 1.0, -1.0],
             has_wheels=True,
             lift_raised=0.5,
+            parked=True,
+            latest_command=(9, 4.0, 0.5, 0.0, -0.5, 1),
         )
         command = {f"left_{j.value}.pos": 0.1 for j in Joint}
-        row = pack_tick(command, frame, jelly, perf_minus_monotonic=100.0)
+        row = pack_tick(
+            command,
+            frame,
+            jelly,
+            perf_minus_monotonic=100.0,
+            command_id=42,
+            issue_t=12.25,
+            arm_mode="gravity_compensation",
+        )
         self.assertEqual(sorted(row), sorted(tick_ring_keys()))
         self.assertEqual(row["cmd.left_shoulder_1"], 0.1)
         self.assertTrue(math.isnan(row["cmd.right_shoulder_1"]))
@@ -592,9 +634,30 @@ class RingTest(unittest.TestCase):
         self.assertEqual(row["jelly.pos3"], 3.0)
         self.assertEqual(row["jelly.cmd2"], -1.0)
         self.assertEqual(row["jelly.lift"], 0.5)
+        self.assertEqual((row["cmd.id"], row["cmd.issue_t"]), (42.0, 12.25))
+        self.assertEqual(mode_name(row["cmd.arm_mode"]), "gravity_compensation")
+        self.assertEqual(row["jelly.parked"], 1.0)
+        self.assertEqual(row["jelly.cmd_id"], 9.0)
+        self.assertEqual(row["jelly.cmd_t"], 104.0)
+        self.assertEqual(row["jelly.cmd_lift"], 1.0)
 
         empty = pack_tick(None)
+        self.assertEqual(mode_name(empty.pop("cmd.arm_mode")), "impedance")
         self.assertTrue(all(math.isnan(v) for v in empty.values()))
+
+    def test_jelly_numbers_each_command(self) -> None:
+        from almond_axol.robot.jelly import UP, Jelly, JellyConfig
+
+        jelly = Jelly(JellyConfig())
+        self.assertIsNone(jelly.latest_command)
+        jelly.set_command(0.5, 0.0, -0.25, UP)
+        self.assertEqual(jelly.latest_command[0], 1)
+        self.assertEqual(jelly.latest_command[2:], (0.5, 0.0, -0.25, UP))
+        with self.assertRaises(ValueError):
+            jelly.set_command(float("nan"), 0.0, 0.0)
+        # A rejected command still counts, as the stop it became.
+        self.assertEqual(jelly.latest_command[0], 2)
+        self.assertEqual(jelly.latest_command[2:], (0.0, 0.0, 0.0, 0))
 
 
 class NalTest(unittest.TestCase):
@@ -719,6 +782,7 @@ class SessionTest(unittest.TestCase):
                 "robot_model": "mobile",
                 "software_version": "9.9.9",
                 "wheel_signs": dict(WHEEL_SIGNS),
+                "topic_names": getattr(self, "topic_names", {}),
             },
             cameras=self.readers,
             scene=self.scene,
@@ -771,8 +835,22 @@ class SessionTest(unittest.TestCase):
                 wheel_speeds=list(speed),
                 has_wheels=True,
                 lift_raised=1.0,
+                parked=False,
+                # Jelly gets a new command every other tick.
+                latest_command=(100 + i // 2, start + (i // 2) / 60, 0.2, 0.0, 0.0, 0),
             )
-            self.tick_writer.write(pack_tick(command, frame, jelly), {}, t)
+            self.tick_writer.write(
+                pack_tick(
+                    command,
+                    frame,
+                    jelly,
+                    command_id=1000 + i,
+                    issue_t=t + 0.0005,
+                    arm_mode="impedance",
+                ),
+                {},
+                t,
+            )
         for src, reader in self.readers.items():
             for i in range(30):
                 if src == "left_arm" and i == 10:
@@ -835,7 +913,30 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(joints[0].ros_msg.name[:2], ["left_s1_0", "left_s2_0"])
         self.assertIn("right_gripper", joints[0].ros_msg.name)
         self.assertEqual(len(joints[0].ros_msg.velocity), 16)
-        self.assertEqual(len(by_topic["/joint_command"]), 60)
+        commands = by_topic["/joint_command"]
+        infos = [m.ros_msg for m in by_topic["/joint_command/info"]]
+        self.assertEqual(len(commands), 60)
+        self.assertEqual(commands[0].ros_msg.position[0], 0.05)
+        self.assertEqual([c.command_id for c in infos], list(range(1000, 1060)))
+        # Each info message shares its command's stamp: the issue time.
+        self.assertEqual(
+            [m.log_time_ns for m in commands],
+            [m.log_time_ns for m in by_topic["/joint_command/info"]],
+        )
+        first = infos[0]
+        self.assertEqual(
+            commands[0].log_time_ns,
+            first.issue_timestamp.sec * 10**9 + first.issue_timestamp.nanosec,
+        )
+        self.assertEqual(first.name, commands[0].ros_msg.name)
+        self.assertEqual(first.name[7], "left_gripper")
+        self.assertEqual(first.target_device_id[0], "left_arm")
+        self.assertEqual(first.target_device_id[7], "left_gripper")
+        self.assertEqual(first.control_mode[0], "impedance")
+        self.assertEqual(first.control_mode[7], "position_force")
+        base = [m.ros_msg for m in by_topic["/base/command"]]
+        self.assertEqual([b.command_id for b in base], list(range(100, 130)))
+        self.assertEqual((base[0].control_mode, base[0].vx), ("velocity", 0.2))
         self.assertEqual(len(by_topic["/ee_pose/left"]), 120)
         self.assertEqual(len(by_topic["/ee_target/right"]), 60)
         self.assertEqual(by_topic["/ee_pose/left"][0].ros_msg.header.frame_id, "root")
@@ -877,6 +978,7 @@ class SessionTest(unittest.TestCase):
         self.assertNotEqual(metadata["episode"]["end_gesture_time"], "")
         self.assertEqual(metadata["robot"]["serial"], "HUB123")
         self.assertEqual(metadata["robot"]["software_version"], "9.9.9")
+        self.assertEqual(metadata["recording"]["video_codec"], "h265")
         self.assertEqual(metadata["recording"]["wrist_left.frames"], "29")
         self.assertEqual(metadata["recording"]["wrist_left.gaps"], "1")
         self.assertEqual(metadata["recording"]["wrist_left.missing_frames"], "1")
@@ -899,14 +1001,123 @@ class SessionTest(unittest.TestCase):
             "head stereo",
             "/base/odom",
             "/joint_command",
+            "/joint_command/info",
             "/wrist/left/camera_info",
             "episode.operator",
         ):
             self.assertEqual(results[item].status, "PASS", (item, results[item]))
         # 120 samples over half a second is 240 Hz.
         self.assertEqual(results["/joint_states"].status, "PASS")
-        self.assertEqual(results["/wrist/right/camera_info"].status, "FAIL")
-        self.assertEqual(results["calibration.calibration_passed"].status, "WARN")
+        self.assertEqual(results["/wrist/right/camera_info"].status, "WARN")
+        self.assertEqual(results["calibration"].status, "PASS")
+        self.assertFalse([r for r in results.values() if r.status == "FAIL"])
+
+    def _record_and_check(
+        self, keep: set[str], extra: tuple[str, bytes] | None = None
+    ) -> dict:
+        from almond_axol.recording.mcap.check import check
+
+        self.session.start("task")
+        start = time.perf_counter()
+        self._record(start)
+        for src, reader in self.readers.items():
+            if src not in keep:
+                reader.queue.clear()
+        if extra is not None:
+            self.readers[extra[0]].queue.append((extra[1], start + 5.0, 0.0))
+        time.sleep(0.05)
+        self.session.stop_capture()
+        self.session.save(None, {})
+        return {r.item: r for r in check(self.root / "episode_000000.mcap")}
+
+    def test_head_imu_samples_are_recorded_during_the_take(self) -> None:
+        import socket as socketlib
+
+        from almond_axol.recording.mcap.check import check
+        from almond_axol.recording.mcap.imu import PACKET, ImuReceiver
+
+        path = str(Path(self._tmp.name) / "imu.sock")
+        self.session.imus = {
+            "/head/imu": (ImuReceiver(path), "head_camera_left_optical")
+        }
+        sender = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_DGRAM)
+        wall_minus_perf = time.time() - time.perf_counter()
+
+        def send(perf: float) -> None:
+            ts = int((perf + wall_minus_perf) * 1e9)
+            sender.sendto(PACKET.pack(b"AXIM", 1, ts, 0, -9.8, 0, 0, 0, 10, 30), path)
+
+        send(time.perf_counter() - 0.5)  # before the take: not recorded
+        time.sleep(0.05)
+        self.session.start("task")
+        start = time.perf_counter()
+        self._record(start)
+        for i in range(100):  # 0.5 s at 200 Hz
+            send(start + 0.001 + i * 0.005)
+        deadline = time.monotonic() + 3.0
+        while (
+            self.session.episode.imu_samples.get("/head/imu", 0) < 100
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        sender.close()
+        self.session.stop_capture()
+        self.session.save(None, {})
+        episode = self.root / "episode_000000.mcap"
+        imu = [
+            m
+            for m in read_ros2_messages(str(episode))
+            if m.channel.topic == "/head/imu"
+        ]
+        self.assertEqual(len(imu), 100)
+        self.assertAlmostEqual(imu[0].ros_msg.angular_velocity.z, math.radians(10), 6)
+        with episode.open("rb") as f:
+            metadata = {r.name: r.metadata for r in make_reader(f).iter_metadata()}
+        self.assertEqual(metadata["recording"]["head_imu.samples"], "100")
+        results = {r.item: r for r in check(episode)}
+        self.assertEqual(results["/head/imu"].status, "PASS")
+        self.assertIn("200 Hz", results["/head/imu"].detail)
+
+    def test_renamed_topics_are_written_and_checked(self) -> None:
+        self.session.topic_names = {
+            "/head/left/video": "/top-left-camera/image-raw",
+            "/joint_states": "/robot/joints",
+        }
+        results = self._record_and_check(set(self.readers))
+        path = self.root / "episode_000000.mcap"
+        topics = {m.channel.topic for m in read_ros2_messages(str(path))}
+        self.assertIn("/top-left-camera/image-raw", topics)
+        self.assertIn("/robot/joints", topics)
+        self.assertNotIn("/head/left/video", topics)
+        self.assertNotIn("/joint_states", topics)
+        self.assertIn("/head/right/video", topics)
+        with path.open("rb") as f:
+            metadata = {r.name: r.metadata for r in make_reader(f).iter_metadata()}
+        self.assertEqual(
+            metadata["recording"]["topic_names"],
+            "/head/left/video=/top-left-camera/image-raw, /joint_states=/robot/joints",
+        )
+        self.assertEqual(
+            metadata["recording"]["head_left.topic"], "/top-left-camera/image-raw"
+        )
+        # The checker maps the names back and finds nothing wrong.
+        self.assertEqual(results["/head/left/video keyframes"].status, "PASS")
+        self.assertEqual(results["/joint_states"].status, "PASS")
+        self.assertFalse(
+            [r for r in results.values() if r.status == "FAIL"],
+            [r for r in results.values() if r.status == "FAIL"],
+        )
+
+    def test_checker_accepts_any_camera_set(self) -> None:
+        results = self._record_and_check({"left_arm"})
+        self.assertEqual(results["cameras"].detail, "/wrist/left")
+        self.assertFalse([r for r in results.values() if r.status == "FAIL"])
+        self.assertNotIn("head stereo", results)
+
+    def test_checker_fails_a_predictive_frame(self) -> None:
+        trail = b"\x00\x00\x01\x02\x01\xbb"  # an H.265 TRAIL_R picture
+        results = self._record_and_check({"right_arm"}, ("right_arm", trail))
+        self.assertEqual(results["/wrist/right/video keyframes"].status, "FAIL")
 
     def test_samples_before_the_start_are_not_recorded(self) -> None:
         n = len(joint_ring_keys())
@@ -952,6 +1163,60 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(list(self.root.iterdir()), [])
 
 
+class TopicNamesTest(unittest.TestCase):
+    def test_parses_pairs_and_ignores_blank_and_identity(self) -> None:
+        from almond_axol.recording.mcap.topics import parse_topic_names
+
+        self.assertEqual(parse_topic_names(""), {})
+        self.assertEqual(
+            parse_topic_names(
+                " /head/left/video = /top-left-camera/image-raw ,\n"
+                "/joint_states=/robot/joints,, /tf=/tf"
+            ),
+            {
+                "/head/left/video": "/top-left-camera/image-raw",
+                "/joint_states": "/robot/joints",
+            },
+        )
+
+    def test_rejects_malformed_pairs(self) -> None:
+        from almond_axol.recording.mcap.topics import parse_topic_names
+
+        for text in (
+            "/joint_states",
+            "/joint_states=",
+            "joint_states=/a",
+            "/joint_states=/a b",
+            "/joint_states=/a/",
+            "/joint_states=/a,/joint_states=/b",
+        ):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_topic_names(text)
+
+    def test_rejects_unknown_topics_and_clashes(self) -> None:
+        from almond_axol.recording.mcap.topics import (
+            default_topics,
+            topic_names_problem,
+        )
+
+        available = default_topics(["/head/left", "/wrist/left"])
+        self.assertIn("/head/left/camera_info", available)
+        self.assertIsNone(
+            topic_names_problem({"/head/left/video": "/cam/left"}, available)
+        )
+        problem = topic_names_problem({"/head/right/video": "/x"}, available)
+        self.assertIn("no /head/right/video topic", problem or "")
+        problem = topic_names_problem({"/joint_states": "/tf"}, available)
+        self.assertIn("would both be named /tf", problem or "")
+        # Swapping two names is fine.
+        self.assertIsNone(
+            topic_names_problem(
+                {"/ee_pose/left": "/ee_pose/right", "/ee_pose/right": "/ee_pose/left"},
+                available,
+            )
+        )
+
+
 class CollectDataSetupTest(unittest.TestCase):
     def _cfg(self, **overrides):
         from almond_axol.cli.collect_data import CollectDataConfig
@@ -977,6 +1242,17 @@ class CollectDataSetupTest(unittest.TestCase):
             )
             self.assertIn("LeRobot dataset", problem or "")
 
+    def test_refuses_malformed_topic_names_before_hardware(self) -> None:
+        from almond_axol.cli.collect_data import mcap_setup_problem
+
+        with tempfile.TemporaryDirectory() as directory:
+            problem = mcap_setup_problem(
+                self._cfg(mcap_topics="/joint_states"),
+                dataset_root=Path(directory),
+                dataset_resolution="SVGA",
+            )
+        self.assertIn("default=new", problem or "")
+
     def test_refuses_a_capture_smaller_than_the_recording(self) -> None:
         from almond_axol.cli.collect_data import mcap_setup_problem
 
@@ -1001,9 +1277,17 @@ class CollectDataSetupTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory) / "settings.json")
-            store.update(values={"recording.format": "mcap"})
+            store.update(
+                values={
+                    "recording.format": "mcap",
+                    "recording.mcap_topics": "/joint_states=/robot/joints",
+                    "recording.mcap_video_codec": "h264",
+                }
+            )
             args = store.merged_args("collect-data", {})
             self.assertEqual(args["format"], "mcap")
+            self.assertEqual(args["mcap_video_codec"], "h264")
+            self.assertEqual(args["mcap_topics"], "/joint_states=/robot/joints")
             argv = build_argv("collect-data", {**args, "repo_id": "a/b", "task": "t"})
             self.assertIn("--format", argv)
         (entry,) = [
@@ -1015,6 +1299,11 @@ class CollectDataSetupTest(unittest.TestCase):
         self.assertEqual(entry["options"], ["lerobot", "mcap"])
         self.assertEqual(entry["default"], "lerobot")
         self.assertIn("operator", COMMANDS["collect-data"].per_run_fields)
+        from almond_axol.cli.collect_data import CollectDataConfig
+
+        self.assertEqual(
+            CollectDataConfig(repo_id="a/b", task="t").mcap_video_codec, "h265"
+        )
 
 
 if __name__ == "__main__":
@@ -1048,3 +1337,124 @@ class StateListenerTest(unittest.TestCase):
         self.assertEqual(positions.tolist(), [0.0] * 8 + [1.0] * 8)
         self.assertEqual(velocities.tolist(), [2.0] * 8 + [3.0] * 8)
         self.assertEqual(torques.tolist(), [4.0] * 8 + [5.0] * 8)
+
+
+class ImuTest(unittest.TestCase):
+    def _packet(self, ts_ns: int, gyro_deg: tuple = (90.0, 0.0, -45.0)) -> bytes:
+        from almond_axol.recording.mcap.imu import PACKET
+
+        return PACKET.pack(b"AXIM", 1, ts_ns, 0.1, -9.8, 0.2, *gyro_deg, 31.5)
+
+    def test_packet_layout_matches_the_plugin_patch(self) -> None:
+        from almond_axol.cli.gst import build_zed
+        from almond_axol.recording.mcap.imu import PACKET, parse_packet
+
+        # The C struct AxolImuSample is packed: 4 + 4 + 8 + 3*4 + 3*4 + 4 bytes.
+        self.assertEqual(PACKET.size, 44)
+        (imu_patch,) = (
+            p
+            for p in build_zed._PATCHES  # noqa: SLF001
+            if p.name == "zed-gstreamer-imu-socket.patch"
+        )
+        text = imu_patch.read_text(encoding="utf-8")
+        self.assertIn('g_param_spec_string("imu-socket"', text)
+        self.assertIn("getSensorsDataBatch", text)
+        self.assertIn("ZED_SDK_MINOR_VERSION >= 1", text)
+        self.assertIn("MSG_DONTWAIT", text)
+
+        sample = parse_packet(self._packet(2_000_000_000), wall_minus_perf=1.5)
+        assert sample is not None
+        self.assertAlmostEqual(sample.perf, 0.5)
+        self.assertAlmostEqual(sample.angular_velocity[0], math.pi / 2, places=6)
+        self.assertAlmostEqual(sample.angular_velocity[2], -math.pi / 4, places=6)
+        self.assertAlmostEqual(sample.acceleration[1], -9.8, places=5)
+        self.assertIsNone(parse_packet(b"XXXX" + self._packet(1)[4:], 0.0))
+        self.assertIsNone(parse_packet(self._packet(1)[:-1], 0.0))
+
+    def test_receiver_collects_samples_sent_to_its_socket(self) -> None:
+        import socket as socketlib
+
+        from almond_axol.recording.mcap.imu import ImuReceiver
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "imu.sock")
+            receiver = ImuReceiver(path)
+            try:
+                sender = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_DGRAM)
+                now_ns = time.time_ns()
+                for i in range(5):
+                    sender.sendto(self._packet(now_ns + i * 5_000_000), path)
+                # A stale sample (an hour old) and a malformed one are rejected.
+                sender.sendto(self._packet(now_ns - 3600 * 10**9), path)
+                sender.sendto(b"junk", path)
+                sender.close()
+                deadline = time.monotonic() + 2.0
+                samples: list = []
+                while len(samples) < 5 and time.monotonic() < deadline:
+                    samples += receiver.drain()
+                    time.sleep(0.01)
+                while receiver.rejected < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            finally:
+                receiver.close()
+            self.assertFalse(Path(path).exists())
+        self.assertEqual(len(samples), 5)
+        self.assertEqual(receiver.rejected, 2)
+        steps = np.diff([s.perf for s in samples])
+        np.testing.assert_allclose(steps, 0.005, atol=1e-6)
+
+    def test_stereo_pipeline_sends_imu_only_when_asked(self) -> None:
+        from almond_axol.video.gst_zed import ZedGstStereoCamera
+
+        with_imu = ZedGstStereoCamera(
+            51617969, "HD1200", 60, imu_socket="/tmp/axol-imu-1-2.sock"
+        )._pipeline_str()
+        self.assertIn(
+            "do-timestamp=false imu-socket=/tmp/axol-imu-1-2.sock !", with_imu
+        )
+        without = ZedGstStereoCamera(51617969, "HD1200", 60)._pipeline_str()
+        self.assertNotIn("imu-socket", without)
+
+    def test_scene_lists_one_imu_per_camera(self) -> None:
+        cameras = {
+            src: CameraSource.from_meta(
+                src,
+                {
+                    **_meta("overhead", eye, HEAD_SERIAL, True),
+                    "imu_socket": "/tmp/imu.sock",
+                    "imu_requested": True,
+                },
+            )
+            for src, eye in (("overhead_left", "left"), ("overhead_right", "right"))
+        }
+        scene = Scene.build(
+            urdf_path(AxolModel.MOBILE),
+            has_gripper=True,
+            jelly_wheels=False,
+            jelly_lift=False,
+            cameras=cameras,
+            calibration_dir=Path("/nonexistent"),
+        )
+        self.assertEqual(
+            scene.imus(), {"/head/imu": ("/tmp/imu.sock", "head_camera_left_optical")}
+        )
+
+    def test_imu_message_decodes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "t.mcap"
+            f = EpisodeFile(path, clock_offset_ns=0)
+            f.write(
+                "/head/imu",
+                "sensor_msgs/Imu",
+                messages.imu(
+                    5, "head_camera_left_optical", (0.1, 0.2, 0.3), (0, -9.8, 0)
+                ),
+                5,
+            )
+            f.finish()
+            (msg,) = read_ros2_messages(str(path))
+        imu = msg.ros_msg
+        self.assertEqual(imu.header.frame_id, "head_camera_left_optical")
+        self.assertEqual(imu.orientation_covariance[0], -1.0)
+        self.assertEqual(imu.angular_velocity.y, 0.2)
+        self.assertEqual(imu.linear_acceleration.y, -9.8)

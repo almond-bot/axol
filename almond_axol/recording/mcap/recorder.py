@@ -51,7 +51,9 @@ from .rings import (
     joint_ring_keys,
     tick_ring_keys,
 )
+from .imu import ImuReceiver
 from .scene import CameraSource, Scene
+from .topics import format_topic_names
 
 _logger = logging.getLogger(__name__)
 
@@ -125,6 +127,10 @@ class McapSession:
         # Jelly's per-wheel spin signs (almond_axol.robot.jelly.WHEEL_SIGNS),
         # passed in so this process need not import the robot package.
         self.wheel_signs: dict[int, float] = dict(config.get("wheel_signs") or {})
+        # Renamed topics (default name -> customer's name), see .topics.
+        self.topic_names: dict[str, str] = dict(config.get("topic_names") or {})
+        # One receiver per camera IMU: {topic: (receiver, frame_id)}.
+        self.imus: dict[str, tuple[Any, str]] = {}
         self.episode: EpisodeRecording | None = None
         self.episode_index = 0
         self.task = ""
@@ -189,13 +195,19 @@ class McapSession:
                     with contextlib.suppress(Exception):
                         ring.close()
             raise
-        return cls(
+        session = cls(
             config,
             cameras=readers,
             scene=scene,
             tick_reader=tick_reader,
             joint_reader=joint_reader,
         )
+        for topic, (path, frame_id) in scene.imus().items():
+            try:
+                session.imus[topic] = (ImuReceiver(path), frame_id)
+            except OSError as exc:
+                _logger.warning("can't record %s: %s", topic, exc)
+        return session
 
     @property
     def episode_count(self) -> int:
@@ -232,12 +244,15 @@ class McapSession:
         self._paused.clear()
         self._tick_after = self.tick_reader.published()
         self._joint_after = self.joint_reader.published()
+        for receiver, _frame_id in self.imus.values():
+            receiver.drain()  # samples from between takes
         self.episode = EpisodeRecording(
             episode_path(self.root, self.episode_index),
             scene=self.scene,
             start_perf=start_perf,
             clock_offset_ns=clock_offset_ns(),
             wheel_signs={int(k): float(v) for k, v in self.wheel_signs.items()},
+            topic_names=self.topic_names,
         )
         self._stop.clear()
         self._thread = threading.Thread(
@@ -280,6 +295,12 @@ class McapSession:
             moved = True
             if not paused:
                 episode.add_tick_rows(rows)
+        for topic, (receiver, frame_id) in self.imus.items():
+            samples = receiver.drain()
+            if samples:
+                moved = True
+                if not paused:
+                    episode.add_imu(topic, frame_id, samples)
         return moved
 
     def _capture_loop(self) -> None:
@@ -363,6 +384,9 @@ class McapSession:
         for ring in (self.tick_reader, self.joint_reader):
             with contextlib.suppress(Exception):
                 ring.close()
+        for receiver, _frame_id in self.imus.values():
+            with contextlib.suppress(Exception):
+                receiver.close()
 
     # -- metadata ----------------------------------------------------------
 
@@ -407,7 +431,7 @@ class McapSession:
             "format_version": FORMAT_VERSION,
             "clock": "host monotonic clock (perf_counter), as Unix time",
             "clock_offset_ns": episode.file.clock_offset_ns,
-            "video_codec": "h265",
+            "video_codec": ",".join(sorted({c.codec for c in scene.cameras.values()})),
             "video_keyframes": "every frame",
             "images": "unrectified sensor images",
             "joint_rate_hz": 240,
@@ -425,12 +449,31 @@ class McapSession:
                 episode.odometry.rejected if episode.odometry is not None else 0
             ),
             "assumed_joints": ",".join(scene.assumed_joints()),
+            "topic_names": format_topic_names(self.topic_names),
             **episode.camera_metadata(),
         }
         for source, camera in scene.cameras.items():
             prefix = camera.topic.strip("/").replace("/", "_")
             recording_meta[f"{prefix}.lost_in_transport"] = self._lost_exposures.get(
                 source, 0
+            )
+        duration = max(end_perf - episode.start_perf, 1e-9)
+        for topic in self.imus:
+            key = topic.strip("/").replace("/", "_")
+            count = episode.imu_samples.get(topic, 0)
+            recording_meta[f"{key}.samples"] = count
+            recording_meta[f"{key}.rate_hz"] = f"{count / duration:.1f}"
+        missing_imu = sorted(
+            {
+                c.camera
+                for c in scene.cameras.values()
+                if c.imu_requested and not c.imu_socket
+            }
+        )
+        if missing_imu:
+            recording_meta["imu_missing"] = (
+                f"{', '.join(missing_imu)}: the ZED camera plugins need updating "
+                "(axol gst.build-zed)"
             )
         return {
             "episode": episode_meta,
@@ -559,9 +602,9 @@ class McapRecorderProcess:
     ``raw_meta`` is the video relay's per-source description (every source
     must use an encoded transport). ``config`` keys: ``dataset_root``,
     ``urdf_path``, ``calibration_dir``, ``has_gripper``, ``jelly_wheels``,
-    ``jelly_lift``, ``wheel_signs``, ``operator``, ``robot_serial``,
-    ``robot_model``, ``gripper``, ``software_version``, ``teleop_hz`` and
-    ``log_level``.
+    ``jelly_lift``, ``wheel_signs``, ``topic_names``, ``operator``,
+    ``robot_serial``, ``robot_model``, ``gripper``, ``software_version``,
+    ``teleop_hz`` and ``log_level``.
     """
 
     def __init__(

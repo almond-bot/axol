@@ -74,6 +74,38 @@ _DEFS: dict[str, str] = {
         "sensor_msgs/RegionOfInterest roi\n"
     ),
     "sensor_msgs/Joy": "std_msgs/Header header\nfloat32[] axes\nint32[] buttons\n",
+    "sensor_msgs/Imu": (
+        "std_msgs/Header header\n"
+        "geometry_msgs/Quaternion orientation\n"
+        "float64[9] orientation_covariance\n"
+        "geometry_msgs/Vector3 angular_velocity\n"
+        "float64[9] angular_velocity_covariance\n"
+        "geometry_msgs/Vector3 linear_acceleration\n"
+        "float64[9] linear_acceleration_covariance\n"
+    ),
+    # Almond's command messages: when the control software sent a command and
+    # how each device applies it. CommandInfo accompanies a standard command
+    # message (/joint_command's JointState) with the same stamp. Field meanings
+    # are in docs/operations/mcap.mdx.
+    "almond_msgs/CommandInfo": (
+        "std_msgs/Header header\n"
+        "uint64 command_id\n"
+        "builtin_interfaces/Time issue_timestamp\n"
+        "string[] name\n"
+        "string[] target_device_id\n"
+        "string[] control_mode\n"
+    ),
+    "almond_msgs/BaseCommand": (
+        "std_msgs/Header header\n"
+        "uint64 command_id\n"
+        "builtin_interfaces/Time issue_timestamp\n"
+        "string target_device_id\n"
+        "string control_mode\n"
+        "float64 vx\n"
+        "float64 vy\n"
+        "float64 wz\n"
+        "int8 lift_direction\n"
+    ),
     "foxglove_msgs/CompressedVideo": (
         "builtin_interfaces/Time timestamp\nstring frame_id\nuint8[] data\n"
         "string format\n"
@@ -141,6 +173,9 @@ MESSAGE_TYPES: tuple[str, ...] = (
     "sensor_msgs/CameraInfo",
     "sensor_msgs/JointState",
     "sensor_msgs/Joy",
+    "sensor_msgs/Imu",
+    "almond_msgs/CommandInfo",
+    "almond_msgs/BaseCommand",
     "tf2_msgs/TFMessage",
     "nav_msgs/Odometry",
     "geometry_msgs/PoseStamped",
@@ -188,6 +223,13 @@ class CdrWriter:
 
     def boolean(self, value: bool) -> None:
         self.buf += b"\x01" if value else b"\x00"
+
+    def i8(self, value: int) -> None:
+        self.buf += struct.pack("<b", value)
+
+    def u64(self, value: int) -> None:
+        self._align(8)
+        self.buf += struct.pack("<Q", value)
 
     def f64(self, value: float) -> None:
         self._align(8)
@@ -437,6 +479,76 @@ def joy(
     w.header(stamp_ns, frame_id)
     w.f32_seq(axes)
     w.i32_seq(buttons)
+    return w.bytes()
+
+
+def command_info(
+    stamp_ns: int,
+    command_id: int,
+    issue_ns: int,
+    names: Sequence[str],
+    target_device_id: Sequence[str],
+    control_mode: Sequence[str],
+) -> bytes:
+    """``almond_msgs/CommandInfo``: the facts about one command's targets."""
+    w = CdrWriter()
+    w.header(stamp_ns, "")
+    w.u64(command_id)
+    w.time(issue_ns)
+    w.string_seq(names)
+    w.string_seq(target_device_id)
+    w.string_seq(control_mode)
+    return w.bytes()
+
+
+def base_command(
+    stamp_ns: int,
+    command_id: int,
+    issue_ns: int,
+    target_device_id: str,
+    control_mode: str,
+    vx: float,
+    vy: float,
+    wz: float,
+    lift_direction: int,
+) -> bytes:
+    """``almond_msgs/BaseCommand``: one drive and lift command to Jelly."""
+    w = CdrWriter()
+    w.header(stamp_ns, "")
+    w.u64(command_id)
+    w.time(issue_ns)
+    w.string(target_device_id)
+    w.string(control_mode)
+    w.f64(vx)
+    w.f64(vy)
+    w.f64(wz)
+    w.i8(lift_direction)
+    return w.bytes()
+
+
+_NO_ORIENTATION = (-1.0,) + (0.0,) * 8
+_UNKNOWN_COVARIANCE = (0.0,) * 9
+
+
+def imu(
+    stamp_ns: int,
+    frame_id: str,
+    angular_velocity: Sequence[float],
+    linear_acceleration: Sequence[float],
+) -> bytes:
+    """``sensor_msgs/Imu`` without an orientation (its covariance starts at -1).
+
+    Angular velocity in rad/s, linear acceleration in m/s^2 including gravity;
+    a zero covariance means it is unknown, as ROS defines it.
+    """
+    w = CdrWriter()
+    w.header(stamp_ns, frame_id)
+    w.quaternion((0.0, 0.0, 0.0, 1.0))
+    w.f64_array(_NO_ORIENTATION)
+    w.vector3(angular_velocity)
+    w.f64_array(_UNKNOWN_COVARIANCE)
+    w.vector3(linear_acceleration)
+    w.f64_array(_UNKNOWN_COVARIANCE)
     return w.bytes()
 
 

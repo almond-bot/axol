@@ -1093,6 +1093,29 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 targets={"collect-data": ("format",)},
             ),
             SettingDef(
+                key="recording.mcap_topics",
+                label="MCAP topic names",
+                type="text",
+                help=(
+                    "Rename MCAP topics, as default=new pairs separated by commas. "
+                    "For example: /joint_states=/robot/joints. Leave empty to keep "
+                    "the default names."
+                ),
+                effective_default="the default names",
+                targets={"collect-data": ("mcap_topics",)},
+            ),
+            SettingDef(
+                key="recording.mcap_video_codec",
+                label="MCAP video codec",
+                type="select",
+                options=("h265", "h264"),
+                help=(
+                    "Video codec of MCAP episodes. h265 makes smaller files. h264 "
+                    "plays in a web browser on any computer."
+                ),
+                targets={"collect-data": ("mcap_video_codec",)},
+            ),
+            SettingDef(
                 key="recording.fps",
                 label="Recording fps",
                 type="number",

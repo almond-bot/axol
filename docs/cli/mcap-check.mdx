@@ -1,6 +1,6 @@
 ---
 title: "mcap.check"
-description: "Check MCAP episodes from Collect data for missing video, joints, transforms, calibration or metadata."
+description: "Check MCAP episodes from Collect data for broken video, timestamps, transforms, calibration or metadata."
 ---
 
 `axol mcap.check` reads MCAP episodes recorded with **Recording format** set to `mcap` and reports what each one contains. See [MCAP Recording](/operations/mcap).
@@ -14,20 +14,22 @@ Pass several files to check them all. Each line starts with one of these:
 | Status | Meaning |
 |---|---|
 | `PASS` | The part is there and looks right. |
-| `WARN` | The part is optional or wasn't checked. For example, the base topics on a robot without Jelly. |
-| `FAIL` | A required part is missing or wrong. |
+| `WARN` | An optional part is missing. For example, a camera with no factory calibration file, or no headset input. |
+| `FAIL` | The file is broken or contradicts itself. |
 
 The command exits with status 1 if any line is `FAIL`.
 
-It checks:
+The checks follow what the file says it recorded, so any set of cameras can pass. It checks:
 
-- each camera's video: H.265, a keyframe on every frame, increasing timestamps, no repeated frames, and the measured frame rate;
-- `/joint_states` at 240 Hz with position, velocity and effort;
-- the base topics on Axol on Jelly;
-- a transform path from the root of the tree to each camera;
-- the head stereo transform and the wrist camera mounts on `/tf_static`;
-- the commands, end-effector targets and headset input;
-- the episode, robot and calibration metadata;
-- each camera's `camera_info`, its image size, and `equidistant` distortion for the wrist cameras.
+- each recorded camera's video: one codec, a keyframe on every frame, increasing timestamps, no repeated frames, and the measured frame rate;
+- a transform path from the root of the tree to each recorded camera;
+- each camera's `camera_info`, and that it matches the recorded image size;
+- the head camera's IMU, and whether it was left out;
+- the head stereo transform, when both head eyes are recorded;
+- `/joint_states` at 200 Hz or more, with position, velocity and effort;
+- `/joint_command` and its `/joint_command/info`, with increasing `command_id`, and the end-effector targets;
+- renamed topics, read back through the file's `topic_names` metadata;
+- the headset input, and the base topics on Axol on Jelly;
+- the episode, robot and calibration metadata.
 
 The checker needs only the `mcap` and `mcap-ros2-support` Python packages. To run it on another computer, install them and run its source file, `almond_axol/recording/mcap/check.py`, with Python.

@@ -1,14 +1,14 @@
 ---
 title: "MCAP Recording"
-description: "Record each episode as an MCAP file with H.265 video, joints, calibration and transforms."
+description: "Record each episode as an MCAP file with video, joints, IMU, calibration and transforms."
 ---
 
 Collect data saves a LeRobot dataset by default. Set **Recording format** to `mcap` to save each episode as its own MCAP file instead. Open the files in [Foxglove](https://foxglove.dev), replay them with `ros2 bag`, or read them in Python with the `mcap` and `mcap-ros2-support` packages.
 
 Each file holds:
 
-- every camera's video, encoded to H.265 once on the robot and stored as is;
-- each camera's calibration;
+- every camera's video, encoded to H.265 or H.264 once on the robot and stored as is;
+- each camera's calibration, and the head camera's IMU;
 - the joints, commands, headset input and, on Jelly, the base;
 - the full transform tree, from the base to every camera;
 - the episode's task, operator, robot, software version, outcome and calibration ID.
@@ -22,6 +22,8 @@ Every sample is stored at its own time, on one clock. Nothing is resampled and n
 3. Set **Streaming resolution** to the **Recording resolution** or higher. Collect data won't start otherwise, because the cameras capture at the streaming size.
 4. In the **Collect data** form, type your name in **Operator**. It is saved in every episode and kept for the next session.
 
+**MCAP video codec**, under **Settings**, then **Recording**, picks the codec: `h265` (the default) makes smaller files, and `h264` plays in a web browser on any computer. On the command line, use `--mcap_video_codec`.
+
 MCAP recording works with Collect data on Axol. Mantis, Collect DAgger data and Run policy save LeRobot datasets. **Push to HuggingFace Hub** doesn't apply to MCAP episodes.
 
 ## Where the files go
@@ -30,17 +32,19 @@ Episodes are saved in the **Dataset root** folder, in a subfolder named after th
 
 A file appears only when you save the episode. A discarded take leaves nothing behind.
 
-Plan for storage. Every frame is a keyframe, so each 1920x1200 camera at 60 fps records about 40 Mbit/s. With four cameras that is about 20 MB/s, or 72 GB per hour of recording. Collect data won't start an episode with less than 2 GB free.
+Plan for storage. Every frame is a keyframe, so each 1920x1200 camera at 60 fps records about 40 Mbit/s with H.265, or 50 Mbit/s with H.264. With four cameras and H.265 that is about 20 MB/s, or 72 GB per hour of recording. Collect data won't start an episode with less than 2 GB free.
 
 ## Topics
 
 | Topic | Type | Rate | Contents |
 |---|---|---|---|
-| `/head/left/video`, `/head/right/video` | `foxglove_msgs/CompressedVideo` | Recording fps | The two eyes of the head camera, H.265. |
-| `/wrist/left/video`, `/wrist/right/video` | `foxglove_msgs/CompressedVideo` | Recording fps | The wrist cameras, H.265. |
+| `/head/left/video`, `/head/right/video` | `foxglove_msgs/CompressedVideo` | Recording fps | The two eyes of the head camera. |
+| `/wrist/left/video`, `/wrist/right/video` | `foxglove_msgs/CompressedVideo` | Recording fps | The wrist cameras. |
+| `/head/imu` | `sensor_msgs/Imu` | About 200 Hz | The head camera's IMU. See [Head camera IMU](#head-camera-imu). |
 | `<camera>/camera_info` | `sensor_msgs/CameraInfo` | With every frame | The camera's calibration at the recorded size. |
 | `/joint_states` | `sensor_msgs/JointState` | 240 Hz | Measured position, velocity and torque of every joint. |
 | `/joint_command` | `sensor_msgs/JointState` | 120 Hz | Joint and gripper targets sent to the arms. |
+| `/joint_command/info` | `almond_msgs/CommandInfo` | 120 Hz | When each `/joint_command` was sent and how each device follows it. See [Commands](#commands). |
 | `/ee_pose/left`, `/ee_pose/right` | `geometry_msgs/PoseStamped` | 240 Hz | Measured gripper pose, in the `root` frame. |
 | `/ee_target/left`, `/ee_target/right` | `geometry_msgs/PoseStamped` | 120 Hz | Commanded gripper pose, in the `root` frame. |
 | `/teleop/left/pose`, `/teleop/right/pose` | `geometry_msgs/PoseStamped` | Headset rate | Controller poses as the headset sent them, in the headset's tracking space (`vr_world`). |
@@ -48,7 +52,8 @@ Plan for storage. Every frame is a keyframe, so each 1920x1200 camera at 60 fps 
 | `/base/odom` | `nav_msgs/Odometry` | 50 Hz | Jelly's pose and velocity, worked out from its wheels. |
 | `/base/wheel_states` | `sensor_msgs/JointState` | 50 Hz | Jelly's wheel angles (rad, zero at the start of the episode) and speeds. |
 | `/base/lift` | `sensor_msgs/JointState` | On change, and once a second | Jelly's lift (`lift`), in metres lowered from fully raised. |
-| `/base/cmd_vel` | `geometry_msgs/TwistStamped` | On change | The drive command sent to Jelly. |
+| `/base/command` | `almond_msgs/BaseCommand` | Each command | The drive and lift command sent to Jelly. See [Commands](#commands). |
+| `/base/cmd_vel` | `geometry_msgs/TwistStamped` | On change | The speed Jelly's wheels are driven at, in m/s and rad/s. |
 | `/tf` | `tf2_msgs/TFMessage` | As measured | Every moving joint: the arms and grippers at 240 Hz, Jelly's base at 50 Hz, the lift when it moves. |
 | `/tf_static` | `tf2_msgs/TFMessage` | Once | Every fixed joint, including the camera mounts. |
 | `/robot_description` | `std_msgs/String` | Once | The robot's URDF. |
@@ -68,6 +73,43 @@ The `/base` topics appear on Axol on Jelly only. Time stamps are Unix time. Each
 
 The right arm uses the same names with `right_`. Positions are in radians, with zero at the rest pose.
 
+### Commands
+
+Each `/joint_command` message holds one control tick's targets for the arms and grippers, as a standard `sensor_msgs/JointState`. A `/joint_command/info` message goes with each one, with the same time stamp: the time the software sent the targets.
+
+`/joint_command/info` and `/base/command` use two Almond message types. Their definitions are stored in each file, so Foxglove and the `mcap` Python packages read them with no setup.
+
+`almond_msgs/CommandInfo` describes one `/joint_command`:
+
+| Field | Contents |
+|---|---|
+| `command_id` | Counts the commands sent since Collect data started. It goes up by one each control tick. |
+| `issue_timestamp` | When the software sent the targets to the arms. |
+| `name` | The joints, in the same order as the matching `/joint_command`. |
+| `target_device_id` | The device each joint belongs to: `left_arm`, `right_arm`, `left_gripper` or `right_gripper`. |
+| `control_mode` | How that device follows its target. |
+
+`almond_msgs/BaseCommand` holds one command to Jelly:
+
+| Field | Contents |
+|---|---|
+| `command_id` | Counts the commands Jelly received since Collect data started. |
+| `issue_timestamp` | When the software sent the command to Jelly. |
+| `target_device_id` | `jelly`. |
+| `control_mode` | How Jelly's wheels are run when the command arrives. |
+| `vx`, `vy`, `wz` | Forward, left and counter-clockwise speed, each as a fraction of full speed from `-1` to `1`. |
+| `lift_direction` | `1` raises the lift, `-1` lowers it and `0` stops it. |
+
+`control_mode` is one of these:
+
+| Value | Meaning |
+|---|---|
+| `impedance` | An arm joint moves toward its target with set stiffness and damping. |
+| `gravity_compensation` | The arms went limp after a fault, so their targets are not followed. |
+| `position_force` | A gripper moves to its opening with a force limit. |
+| `velocity` | Jelly's wheels follow the drive command. |
+| `position_hold` | Jelly is parked and holds its wheels in place. |
+
 ### Teleop input
 
 `/teleop/joy` has these axes and buttons, in order:
@@ -77,9 +119,31 @@ The right arm uses the same names with `right_`. Positions are in radians, with 
 | Axes | left grip, right grip, left stick x, left stick y, right stick x, right stick y |
 | Buttons | left grip button, right grip button, left stick click, right stick click, reset, **A** (stow), left controller tracked, right controller tracked |
 
+### Rename topics
+
+To use your own topic names, set **MCAP topic names** under **Settings**, then **Recording**. Write `default=new` pairs, separated by commas:
+
+```
+/head/left/video=/top-left-camera/image-raw, /joint_states=/robot/joints
+```
+
+Only the names change. The message types stay the same. Collect data won't start if a name is misspelled, isn't a topic this session records, or would clash with another topic. Each file lists its renames in the `recording` metadata as `topic_names`. On the command line, use `--mcap_topics`.
+
+## Head camera IMU
+
+`/head/imu` holds every sample of the head camera's IMU, about 200 per second, each at the time the IMU measured it. Each sample has:
+
+- `linear_acceleration` in m/s², gravity included;
+- `angular_velocity` in rad/s;
+- no orientation (`orientation_covariance[0]` is `-1`).
+
+The axes are those of the left head camera's optical frame, `head_camera_left_optical`: x to the right, y down and z forward.
+
+The IMU needs the ZED camera plugins that come with this version of Axol. If the episode's `recording` metadata has `imu_missing`, run [`axol gst.build-zed`](/cli/gst-build-zed) once, then record again. With a ZED SDK older than 5.1 the IMU is recorded once per video frame instead.
+
 ## Video
 
-Each frame is one H.265 access unit, encoded on the Jetson as the camera captured it. It is stamped with the time the sensor exposed it. Every frame is a keyframe and carries its own parameter sets, so you can decode from any frame.
+Each frame is one H.265 or H.264 access unit, encoded on the Jetson as the camera captured it. It is stamped with the time the sensor exposed it. Every frame is a keyframe and carries its own parameter sets, so you can decode from any frame.
 
 The images are the cameras' raw images, without rectification. Undistort them with the `camera_info` on the same topic.
 

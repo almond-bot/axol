@@ -38,9 +38,18 @@ class EpisodeFile:
     clock every sample is stamped on) to Unix time: ``unix_ns = perf_s * 1e9
     + clock_offset_ns``. Message log and publish times are both that instant,
     which is also each message's header stamp.
+
+    ``topic_names`` renames topics as they are written (default name to the
+    customer's name; see :mod:`.topics`). Callers always pass default names.
     """
 
-    def __init__(self, final_path: Path, *, clock_offset_ns: int) -> None:
+    def __init__(
+        self,
+        final_path: Path,
+        *,
+        clock_offset_ns: int,
+        topic_names: Mapping[str, str] | None = None,
+    ) -> None:
         from mcap.writer import CompressionType, Writer
 
         self.final_path = Path(final_path)
@@ -48,6 +57,7 @@ class EpisodeFile:
             self.final_path.name + PARTIAL_SUFFIX
         )
         self.clock_offset_ns = int(clock_offset_ns)
+        self.topic_names = dict(topic_names or {})
         self.final_path.parent.mkdir(parents=True, exist_ok=True)
         self._file: IO[bytes] | None = open(self.partial_path, "wb")  # noqa: SIM115
         try:
@@ -89,7 +99,9 @@ class EpisodeFile:
             )
             self._schemas[msg_type] = schema
         channel = self._writer.register_channel(
-            topic=topic, message_encoding="cdr", schema_id=schema
+            topic=self.topic_names.get(topic, topic),
+            message_encoding="cdr",
+            schema_id=schema,
         )
         self._channels[topic] = channel
         self._sequence[channel] = 0

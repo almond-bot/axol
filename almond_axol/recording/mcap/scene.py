@@ -55,6 +55,18 @@ def camera_topic(camera: str, eye: str | None) -> str:
     return f"/{camera}" + (f"/{eye}" if eye else "")
 
 
+def camera_base_topic(camera: str) -> str:
+    """Topic prefix for a whole camera (both eyes), such as ``/head``."""
+    if camera == "overhead":
+        return "/head"
+    return camera_topic(camera, None)
+
+
+def imu_topic(camera: str) -> str:
+    """The topic a camera's IMU samples go to (``/head/imu``)."""
+    return f"{camera_base_topic(camera)}/imu"
+
+
 def camera_frame_id(camera: str, eye: str | None) -> str:
     """The camera's optical frame: +z out of the lens, +x right, +y down."""
     if camera == "overhead":
@@ -82,6 +94,10 @@ class CameraSource:
     stereo: bool
     intrinsics: Intrinsics | None = None
     calibration: CalibrationFile | None = None
+    # The socket this camera's IMU samples arrive on (stereo cameras whose
+    # ZED plugin has Axol's IMU patch), else None.
+    imu_socket: str | None = None
+    imu_requested: bool = False
 
     @classmethod
     def from_meta(cls, source: str, meta: dict[str, Any]) -> CameraSource:
@@ -101,6 +117,8 @@ class CameraSource:
             serial=int(serial) if serial is not None else None,
             resolution=str(meta["resolution"]) if meta.get("resolution") else None,
             stereo=bool(meta.get("stereo", False)),
+            imu_socket=str(meta["imu_socket"]) if meta.get("imu_socket") else None,
+            imu_requested=bool(meta.get("imu_requested", False)),
         )
 
     def load_calibration(self, directory: Path) -> None:
@@ -351,6 +369,21 @@ class Scene:
             out.append(
                 (joint.parent, joint.child, joint.transform(tree.value(joint, {})))
             )
+        return out
+
+    def imus(self) -> dict[str, tuple[str, str]]:
+        """``{topic: (socket path, frame_id)}`` for every camera IMU recorded.
+
+        A camera's IMU samples are given in its left eye's optical frame axes
+        (the ZED plugin opens the camera in the SDK's IMAGE coordinate system).
+        """
+        out: dict[str, tuple[str, str]] = {}
+        for camera in self.cameras.values():
+            if camera.imu_socket:
+                out.setdefault(
+                    imu_topic(camera.camera),
+                    (camera.imu_socket, camera_frame_id(camera.camera, "left")),
+                )
         return out
 
     def ee_links(self) -> dict[str, str]:

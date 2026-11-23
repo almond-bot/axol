@@ -15,8 +15,10 @@ This command is configured through draccus. The robot and teleop settings live i
 |---|---|
 | `--repo_id <user>/<dataset>` | HuggingFace dataset repo ID (required) |
 | `--task TEXT` | Natural language task description (required) |
-| `--format {lerobot,mcap}` | Episode file format (default: `lerobot`). `mcap` saves one MCAP file per episode with H.265 video. See [MCAP Recording](/operations/mcap). |
+| `--format {lerobot,mcap}` | Episode file format (default: `lerobot`). `mcap` saves one MCAP file per episode. See [MCAP Recording](/operations/mcap). |
 | `--operator TEXT` | Who is recording. Saved in each MCAP episode. |
+| `--mcap_video_codec {h265,h264}` | Video codec of MCAP episodes (default: `h265`). |
+| `--mcap_topics TEXT` | Rename MCAP topics, as `default=new` pairs separated by commas. See [Rename topics](/operations/mcap#rename-topics). |
 | `--fps INT` | Dataset frame rate (default: 30). It can't be higher than the camera capture rate. The headset stream is separate. |
 | `--dataset_resolution {SVGA,HD1080,HD1200}` | Resolution of the dataset video (default: `SVGA`, 960×600). The headset still gets full resolution. A resumed dataset keeps its original resolution. |
 | `--vcodec STR` | Dataset video codec (default: `h264` on Jetson, `auto` elsewhere). Accepts any LeRobot codec, e.g. `auto`, `h264` or `libsvtav1`. |

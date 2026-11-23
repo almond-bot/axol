@@ -167,6 +167,8 @@ MantisSource = register_literal(Literal["quest", "lighthouse"])
 # Collect data's episode file format: a LeRobot dataset (the default) or one
 # MCAP file per episode (``almond_axol.recording.mcap``).
 RecordingFormat = register_literal(Literal["lerobot", "mcap"])
+# The video codec of MCAP episodes, encoded once on the Jetson.
+McapVideoCodec = register_literal(Literal["h265", "h264"])
 
 
 # ----------------------------------------------------------------------

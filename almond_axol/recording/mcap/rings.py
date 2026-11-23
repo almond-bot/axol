@@ -60,9 +60,30 @@ VR_BUTTONS = (
 )
 WHEEL_IDS = (1, 2, 3, 4)
 
+# How a device applies its commands, as recorded in each command message's
+# ``control_mode``. The ring stores the index.
+CONTROL_MODES = (
+    "impedance",  # arm joints: stiffness and damping toward the target
+    "gravity_compensation",  # arm joints gone limp: targets are not followed
+    "position_force",  # grippers: position with a force limit
+    "velocity",  # Jelly's wheels while driving
+    "position_hold",  # Jelly's wheels while parked
+)
+
+
+def mode_index(mode: str) -> float:
+    return float(CONTROL_MODES.index(mode))
+
+
+def mode_name(value: float) -> str:
+    if math.isfinite(value) and 0 <= int(value) < len(CONTROL_MODES):
+        return CONTROL_MODES[int(value)]
+    return ""
+
 
 def tick_ring_keys() -> list[str]:
-    keys = [f"cmd.{side}_{joint}" for side in SIDES for joint in JOINT_NAMES]
+    keys = ["cmd.id", "cmd.issue_t", "cmd.arm_mode"]
+    keys += [f"cmd.{side}_{joint}" for side in SIDES for joint in JOINT_NAMES]
     keys += ["vr.seq", "vr.t_host"]
     keys += [f"vr.{side}.{axis}" for side in ("l", "r") for axis in POSE_AXES]
     keys += [f"vr.{name}" for name in VR_AXES + VR_BUTTONS]
@@ -70,7 +91,15 @@ def tick_ring_keys() -> list[str]:
     keys += [f"jelly.pos{i}" for i in WHEEL_IDS]
     keys += [f"jelly.vel{i}" for i in WHEEL_IDS]
     keys += [f"jelly.cmd{i}" for i in WHEEL_IDS]
-    keys += ["jelly.lift"]
+    keys += ["jelly.lift", "jelly.parked"]
+    keys += [
+        "jelly.cmd_id",
+        "jelly.cmd_t",
+        "jelly.cmd_vx",
+        "jelly.cmd_vy",
+        "jelly.cmd_wz",
+        "jelly.cmd_lift",
+    ]
     return keys
 
 
@@ -91,17 +120,26 @@ def pack_tick(
     jelly: Any = None,
     *,
     perf_minus_monotonic: float = 0.0,
+    command_id: int | None = None,
+    issue_t: float | None = None,
+    arm_mode: str = "impedance",
 ) -> dict[str, float]:
     """One tick-ring row from the control loop's live values.
 
     ``command`` is the teleop's joint-target action (``{side}_{joint}.pos``
-    keys). ``frame`` is the headset's latest
+    keys), sent to the arms as command ``command_id`` at ``issue_t``
+    (``perf_counter``) with the arms in ``arm_mode`` (one of
+    :data:`CONTROL_MODES`). ``frame`` is the headset's latest
     :class:`~almond_axol.vr.models.VRFrame` (or ``None``). ``jelly`` is the
-    running :class:`~almond_axol.robot.jelly.Jelly` (or ``None``); its wheel
-    sample time is on :func:`time.monotonic`, moved onto ``perf_counter`` by
+    running :class:`~almond_axol.robot.jelly.Jelly` (or ``None``); its times
+    are on :func:`time.monotonic`, moved onto ``perf_counter`` by
     ``perf_minus_monotonic``.
     """
-    row: dict[str, float] = {}
+    row: dict[str, float] = {
+        "cmd.id": NAN if command_id is None else float(command_id),
+        "cmd.issue_t": NAN if issue_t is None else float(issue_t),
+        "cmd.arm_mode": mode_index(arm_mode),
+    }
     for side in SIDES:
         for joint in JOINT_NAMES:
             key = f"{side}_{joint}"
@@ -143,6 +181,9 @@ def pack_tick(
         row[f"jelly.vel{i}"] = NAN
         row[f"jelly.cmd{i}"] = NAN
     row["jelly.lift"] = NAN
+    row["jelly.parked"] = NAN
+    for key in ("id", "t", "vx", "vy", "wz", "lift"):
+        row[f"jelly.cmd_{key}"] = NAN
     if jelly is not None:
         sample = getattr(jelly, "wheel_sample", None)
         if sample is not None and sample.at > 0:
@@ -157,6 +198,17 @@ def pack_tick(
             for i, value in zip(WHEEL_IDS, speeds, strict=False):
                 row[f"jelly.cmd{i}"] = _finite(value)
         row["jelly.lift"] = _finite(getattr(jelly, "lift_raised", None))
+        parked = getattr(jelly, "parked", None)
+        row["jelly.parked"] = NAN if parked is None else (1.0 if parked else 0.0)
+        latest = getattr(jelly, "latest_command", None)
+        if latest is not None:
+            cmd_id, issued, vx, vy, wz, lift = latest
+            row["jelly.cmd_id"] = float(cmd_id)
+            row["jelly.cmd_t"] = float(issued) + perf_minus_monotonic
+            row["jelly.cmd_vx"] = _finite(vx)
+            row["jelly.cmd_vy"] = _finite(vy)
+            row["jelly.cmd_wz"] = _finite(wz)
+            row["jelly.cmd_lift"] = _finite(lift)
     return row
 
 
