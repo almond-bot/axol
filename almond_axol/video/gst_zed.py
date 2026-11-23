@@ -841,6 +841,34 @@ def _enc_branch(bitrate: int, fps: int, name: str = "venc") -> str:
     )
 
 
+def _stream_scale(capture: tuple[int, int], stream: tuple[int, int] | None) -> str:
+    """GStreamer prefix that scales the headset branch down on the GPU.
+
+    Empty when the stream is the capture size. The VIC (``nvvidconv``) does the
+    resize in NVMM, so the camera can capture at a larger recording
+    resolution while the headset gets the smaller **Streaming resolution**.
+    Placed after the headset's rate limit so it only resizes frames that are
+    sent.
+    """
+    if stream is None or tuple(stream) == tuple(capture):
+        return ""
+    w, h = stream
+    return (
+        "nvvidconv ! "
+        f"video/x-raw(memory:NVMM),format=NV12,width={w},height={h},"
+        "pixel-aspect-ratio=1/1 ! "
+    )
+
+
+def _clamp_stream_dims(
+    capture: tuple[int, int], stream: tuple[int, int] | None
+) -> tuple[int, int]:
+    """The headset size: ``stream`` when smaller than the capture, else it."""
+    if stream is None or stream[0] >= capture[0] or stream[1] >= capture[1]:
+        return capture
+    return int(stream[0]), int(stream[1])
+
+
 def _stream_rate_limit(capture_fps: int, stream_fps: int) -> str:
     """GStreamer prefix that fixes only the encoded branch at headset rate.
 
@@ -1588,6 +1616,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         dataset_fps: int | None = None,
         policy_fps: int | None = None,
         dataset_codec: str = "h264",
+        stream_dims: tuple[int, int] | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _RESOLUTION_ENUM:
@@ -1625,9 +1654,13 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
                 f"policy fps must be in [1, {self.fps}], got {self.policy_fps}"
             )
         self.width, self.height = _RESOLUTION_DIMS[resolution]
+        # The headset stream's size: ``stream_dims`` (the Streaming resolution)
+        # when smaller than the capture, which then scales down on the VIC.
+        self.stream_width, self.stream_height = _clamp_stream_dims(
+            (self.width, self.height), stream_dims
+        )
         # The raw (dataset) branch can be downscaled on the VIC to cut the bytes
-        # that cross to the control process; the encoded headset branch always
-        # keeps the full capture resolution. ``raw_dims`` is the relay's target.
+        # that cross to the control process. ``raw_dims`` is the relay's target.
         self.raw_width, self.raw_height = raw_dims or (self.width, self.height)
         self._want_encoded = want_encoded
         self._want_raw = want_raw
@@ -1645,7 +1678,10 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         return f"ZedGstCamera(serial={self.serial})"
 
     def _pipeline_str(self) -> str:
-        bitrate = _bitrate_for(self.width, self.height, self.stream_fps)
+        bitrate = _bitrate_for(self.stream_width, self.stream_height, self.stream_fps)
+        scale = _stream_scale(
+            (self.width, self.height), (self.stream_width, self.stream_height)
+        )
         src = (
             f"zedxonesrc name={_SOURCE_ELEMENT_NAME} camera-sn={self.serial} "
             f"camera-resolution={_RESOLUTION_ENUM[self.resolution]} "
@@ -1655,7 +1691,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         )
         rate = _stream_rate_limit(self.fps, self.stream_fps)
         enc = (
-            f"{_QUEUE} ! {rate}"
+            f"{_QUEUE} ! {rate}{scale}"
             f"{_enc_branch(bitrate, self.stream_fps)} ! {_enc_appsink('enc')}"
         )
         # The dataset branch sits behind a `valve` so it can be gated shut at
@@ -1895,6 +1931,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         raw_eyes: "list[str] | tuple[str, ...] | None" = None,
         encoded_sbs: bool = False,
         imu_socket: str | None = None,
+        stream_dims: tuple[int, int] | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _STEREO_RESOLUTION_ENUM:
@@ -1975,8 +2012,13 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 f"policy fps must be in [1, {self.fps}], got {self.policy_fps}"
             )
         self.width, self.height = _RESOLUTION_DIMS[resolution]
-        # Per-eye downscale target for the raw (dataset) branch; encoded eyes keep
-        # the full capture resolution. See ZedGstCamera for the rationale.
+        # Per-eye headset size (see ZedGstCamera); the packed side-by-side
+        # stream is twice as wide.
+        self.stream_width, self.stream_height = _clamp_stream_dims(
+            (self.width, self.height), stream_dims
+        )
+        # Per-eye downscale target for the raw (dataset) branch. See
+        # ZedGstCamera for the rationale.
         self.raw_width, self.raw_height = raw_dims or (self.width, self.height)
         self._want_encoded = want_encoded
         self._want_raw = want_raw
@@ -2044,8 +2086,10 @@ class ZedGstStereoCamera(_GstPipelineBase):
         eye_w, eye_h = self.width, self.height
         left = 0 if side == "left" else eye_w
         right = eye_w if side == "left" else eye_w * 2
-        bitrate = _bitrate_for(eye_w, eye_h, self.stream_fps)
-        rate = _stream_rate_limit(self.fps, self.stream_fps)
+        bitrate = _bitrate_for(self.stream_width, self.stream_height, self.stream_fps)
+        rate = _stream_rate_limit(self.fps, self.stream_fps) + _stream_scale(
+            (eye_w, eye_h), (self.stream_width, self.stream_height)
+        )
         caps = (
             f"video/x-raw(memory:NVMM),format=NV12,width={eye_w},height={eye_h},"
             "pixel-aspect-ratio=1/1"
@@ -2124,8 +2168,12 @@ class ZedGstStereoCamera(_GstPipelineBase):
         bitrate is twice the per-eye default (same total bits as two per-eye
         streams, just in one track).
         """
-        bitrate = 2 * _bitrate_for(self.width, self.height, self.stream_fps)
-        rate = _stream_rate_limit(self.fps, self.stream_fps)
+        bitrate = 2 * _bitrate_for(
+            self.stream_width, self.stream_height, self.stream_fps
+        )
+        rate = _stream_rate_limit(self.fps, self.stream_fps) + _stream_scale(
+            (2 * self.width, self.height), (2 * self.stream_width, self.stream_height)
+        )
         return (
             f"{_QUEUE} ! {rate}"
             f"{_enc_branch(bitrate, self.stream_fps, 'venc_s')} ! "

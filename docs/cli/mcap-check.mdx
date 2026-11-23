@@ -27,7 +27,7 @@ The checks follow what the file says it recorded, so any set of cameras can pass
 - the head camera's IMU, and whether it was left out;
 - the head stereo transform, when both head eyes are recorded;
 - `/joint_states` at 200 Hz or more, with position, velocity and effort;
-- `/joint_command` and its `/joint_command/info`, with increasing `command_id`, and the end-effector targets;
+- `/joint_command` and its `/joint_command/info`, with increasing `command_id` and the time the robot applied each command, and the end-effector targets;
 - renamed topics, read back through the file's `topic_names` metadata;
 - the headset input, and the base topics on Axol on Jelly;
 - the episode, robot and calibration metadata.

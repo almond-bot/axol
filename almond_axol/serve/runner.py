@@ -201,6 +201,16 @@ def _managed_tracker_bridge_main(
             pass
 
 
+def _takes_stream_resolution(op_id: str) -> bool:
+    """Whether ``op_id`` can stream its headset feed smaller than its capture."""
+    from .commands import get_schema
+
+    try:
+        return "stream_resolution" in get_schema(op_id).emit
+    except Exception:  # noqa: BLE001 - an op without a schema can't
+        return False
+
+
 def _forward_line(sink: Any, line: str) -> None:
     """Emit a completed output line to a session sink.
 
@@ -810,7 +820,10 @@ class OperationRunner:
             # camera serials are required draccus inputs.
             if cameras and cmd.camera_mode == "argv":
                 args = self._merge_camera_args(
-                    args, cameras, streams_video=cmd.streams_video
+                    args,
+                    cameras,
+                    streams_video=cmd.streams_video,
+                    scaled_stream=_takes_stream_resolution(op_id),
                 )
 
             # Expose the immutable, fully merged run selection to every UI
@@ -1419,7 +1432,12 @@ class OperationRunner:
         return (global_on and enabled), eyes
 
     def _merge_camera_args(
-        self, args: dict[str, Any], cameras: dict[str, Any], *, streams_video: bool
+        self,
+        args: dict[str, Any],
+        cameras: dict[str, Any],
+        *,
+        streams_video: bool,
+        scaled_stream: bool = False,
     ) -> dict[str, Any]:
         """Fold a camera spec into collect-data / run-policy form args.
 
@@ -1450,6 +1468,12 @@ class OperationRunner:
         branch is ignored so every camera captures at the recording
         resolution — the size the dataset was recorded at and the policy was
         trained on.
+
+        ``scaled_stream`` (an op with a ``stream_resolution`` field: collect-data)
+        lets a camera capture at the larger of the two resolutions and stream a
+        smaller headset feed, scaled down on the GPU: the capture is the larger
+        resolution and ``stream_resolution`` carries the headset's. Without it a
+        streaming camera captures at the streaming resolution, as before.
 
         Recording/policy fps is independent of the fixed 30 fps headset stream.
         Cameras normally stay at their 60 fps capture rate and the dataset or
@@ -1503,8 +1527,16 @@ class OperationRunner:
                 if s_eyes is not None:
                     merged[f"{prefix}.stream_eyes"] = s_eyes
             # Capture at the streaming resolution when the camera streams,
-            # otherwise at the (smaller) recording resolution.
+            # otherwise at the recording resolution. An op that can scale its
+            # headset stream down captures at the larger of the two, so a
+            # small headset feed never limits the recording.
             cap = stream_res if streams else record_res
+            if scaled_stream and streams and records and stream_res and record_res:
+                cap = max(
+                    (stream_res, record_res),
+                    key=lambda name: ZED_RESOLUTION_DIMS[name][0]
+                    * ZED_RESOLUTION_DIMS[name][1],
+                )
             if cap:
                 dims = ZED_RESOLUTION_DIMS[cap]
                 merged[f"{prefix}.width"] = dims[0]
@@ -1517,6 +1549,8 @@ class OperationRunner:
 
         if record_res is not None:
             merged["dataset_resolution"] = record_res
+        if scaled_stream and stream_res is not None:
+            merged["stream_resolution"] = stream_res
         return merged
 
     def _attach_cameras_to_teleop(

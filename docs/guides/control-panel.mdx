@@ -263,7 +263,7 @@ Each panel lists the cameras plugged into the host, with serial number, type (st
 | **Stream** | The live video in the VR headset during teleop and data collection. |
 | **Record** | The video saved in the dataset. **Run policy** and **Collect DAgger** also feed the policy at this resolution, so it matches the training data. |
 
-Each output has a resolution setting (`SVGA`, `HD1080` or `HD1200`) or **Off**. Each camera has separate **Stream** and **Record** switches. A stereo camera has **L** and **R** checkboxes for each eye instead. This lets you, for example, stream both eyes of the overhead camera for depth and record only one.
+Each output has a resolution setting (`SVGA`, `HD1080` or `HD1200`) or **Off**. **Collect data** captures at the larger of the two and scales the headset stream down, so a low **Streaming resolution** doesn't lower the recording. Other operations capture at the **Streaming resolution** when a camera streams. Each camera has separate **Stream** and **Record** switches. A stereo camera has **L** and **R** checkboxes for each eye instead. This lets you, for example, stream both eyes of the overhead camera for depth and record only one.
 
 A stereo overhead camera with both eyes recorded is saved as two cameras, `overhead_left` and `overhead_right`. A single eye is saved under the slot name, like a mono camera.
 

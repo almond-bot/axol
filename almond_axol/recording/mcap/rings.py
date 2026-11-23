@@ -5,7 +5,8 @@ one row of float64 per sample, ``[ts, *values, intervention]``, written by the
 control process and read in order by the recorder subprocess.
 
 - The **joint ring** gets one row per Rust core feedback packet pair (240 Hz):
-  measured position, velocity and torque of all 16 joints.
+  measured position, velocity and torque of all 16 joints, and per arm the
+  newest target the core has started applying (its seq and when).
 - The **tick ring** gets one row per control tick (120 Hz): the commanded
   joint targets, the headset's raw input, and Jelly's latest wheel and lift
   readings. Values that do not exist for a tick are NaN.
@@ -32,14 +33,23 @@ NAN = float("nan")
 JOINT_FIELDS = ("pos", "vel", "trq")
 
 
+APPLIED_KEYS = (
+    "applied.seq_left",
+    "applied.t_left",
+    "applied.seq_right",
+    "applied.t_right",
+)
+
+
 def joint_ring_keys() -> list[str]:
-    """``{field}.{side}_{joint}`` for position, velocity and torque."""
+    """``{field}.{side}_{joint}`` for position, velocity and torque, then
+    :data:`APPLIED_KEYS`."""
     return [
         f"{field}.{side}_{joint}"
         for field in JOINT_FIELDS
         for side in SIDES
         for joint in JOINT_NAMES
-    ]
+    ] + list(APPLIED_KEYS)
 
 
 JOINT_RING_CAPACITY = 2048  # ~8.5 s at 240 Hz
@@ -82,7 +92,7 @@ def mode_name(value: float) -> str:
 
 
 def tick_ring_keys() -> list[str]:
-    keys = ["cmd.id", "cmd.issue_t", "cmd.arm_mode"]
+    keys = ["cmd.id", "cmd.issue_t", "cmd.arm_mode", "cmd.seq_left", "cmd.seq_right"]
     keys += [f"cmd.{side}_{joint}" for side in SIDES for joint in JOINT_NAMES]
     keys += ["vr.seq", "vr.t_host"]
     keys += [f"vr.{side}.{axis}" for side in ("l", "r") for axis in POSE_AXES]
@@ -123,13 +133,16 @@ def pack_tick(
     command_id: int | None = None,
     issue_t: float | None = None,
     arm_mode: str = "impedance",
+    target_seqs: tuple[int | None, int | None] | None = None,
 ) -> dict[str, float]:
     """One tick-ring row from the control loop's live values.
 
     ``command`` is the teleop's joint-target action (``{side}_{joint}.pos``
     keys), sent to the arms as command ``command_id`` at ``issue_t``
     (``perf_counter``) with the arms in ``arm_mode`` (one of
-    :data:`CONTROL_MODES`). ``frame`` is the headset's latest
+    :data:`CONTROL_MODES`). ``target_seqs`` are the realtime core's seqs of the
+    targets that send produced, ``(left, right)``, which the core reports back
+    once it applies them. ``frame`` is the headset's latest
     :class:`~almond_axol.vr.models.VRFrame` (or ``None``). ``jelly`` is the
     running :class:`~almond_axol.robot.jelly.Jelly` (or ``None``); its times
     are on :func:`time.monotonic`, moved onto ``perf_counter`` by
@@ -139,7 +152,12 @@ def pack_tick(
         "cmd.id": NAN if command_id is None else float(command_id),
         "cmd.issue_t": NAN if issue_t is None else float(issue_t),
         "cmd.arm_mode": mode_index(arm_mode),
+        "cmd.seq_left": NAN,
+        "cmd.seq_right": NAN,
     }
+    if target_seqs is not None:
+        for side, seq in zip(SIDES, target_seqs, strict=True):
+            row[f"cmd.seq_{side}"] = NAN if seq is None else float(seq)
     for side in SIDES:
         for joint in JOINT_NAMES:
             key = f"{side}_{joint}"

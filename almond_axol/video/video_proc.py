@@ -389,6 +389,11 @@ def _open_gst_camera_raw(
     # episodes (``dataset_codec`` in the spec). Only the shm transport encodes
     # in the relay; the pyshm fallback ships raw frames.
     dataset_codec = str(spec.get("dataset_codec") or "h264")
+    # The headset's size when it is smaller than the capture (the Streaming
+    # resolution, with the camera capturing at a larger Recording resolution):
+    # the encoded branch scales down on the VIC.
+    stream_name = spec.get("stream_resolution")
+    stream_dims = _RESOLUTION_DIMS.get(stream_name) if stream_name else None
     # MCAP recording asks a stereo camera to send its IMU samples to this
     # socket; only a zedsrc built with Axol's IMU patch can.
     imu_socket = spec.get("imu_socket") if stereo else None
@@ -453,6 +458,7 @@ def _open_gst_camera_raw(
                     resolution,
                     fps,
                     raw_dims=raw_dims,
+                    stream_dims=stream_dims,
                     dataset_fps=dataset_fps,
                     policy_fps=policy_fps,
                     dataset_codec=dataset_codec,
@@ -516,6 +522,7 @@ def _open_gst_camera_raw(
                     resolution,
                     fps,
                     raw_dims=raw_dims,
+                    stream_dims=stream_dims,
                     encoded_eyes=enc_sides,
                     raw_eyes=raw_sides,
                     encoded_sbs=sbs,
@@ -550,6 +557,7 @@ def _open_gst_camera_raw(
                     raw_sink=ring.publish if ring is not None else None,
                     raw_socket_path=sock,
                     raw_dims=raw_dims,
+                    stream_dims=stream_dims,
                     dataset_fps=dataset_fps,
                     policy_fps=policy_fps,
                     dataset_codec=dataset_codec,
@@ -592,6 +600,7 @@ def _open_gst_camera_raw(
                 want_encoded=wants_stream,
                 raw_sink=writer.publish,
                 raw_dims=raw_dims,
+                stream_dims=stream_dims,
             )
             cam.connect()
             return (

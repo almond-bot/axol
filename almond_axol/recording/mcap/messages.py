@@ -94,6 +94,7 @@ _DEFS: dict[str, str] = {
         "string[] name\n"
         "string[] target_device_id\n"
         "string[] control_mode\n"
+        "builtin_interfaces/Time[] application_timestamp\n"
     ),
     "almond_msgs/BaseCommand": (
         "std_msgs/Header header\n"
@@ -489,8 +490,12 @@ def command_info(
     names: Sequence[str],
     target_device_id: Sequence[str],
     control_mode: Sequence[str],
+    application_ns: Sequence[int] = (),
 ) -> bytes:
-    """``almond_msgs/CommandInfo``: the facts about one command's targets."""
+    """``almond_msgs/CommandInfo``: the facts about one command's targets.
+
+    ``application_ns`` has one time per joint (0 when unknown).
+    """
     w = CdrWriter()
     w.header(stamp_ns, "")
     w.u64(command_id)
@@ -498,6 +503,9 @@ def command_info(
     w.string_seq(names)
     w.string_seq(target_device_id)
     w.string_seq(control_mode)
+    w.u32(len(application_ns))
+    for ns in application_ns:
+        w.time(ns)
     return w.bytes()
 
 

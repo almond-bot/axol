@@ -360,6 +360,7 @@ class McapSession:
             self.cancel()
             raise RuntimeError(f"camera capture failed ({self.capture_error})")
         try:
+            episode.flush()
             path = episode.finish(self._metadata(episode, outcome, info))
         except BaseException:
             episode.discard()
@@ -440,6 +441,8 @@ class McapSession:
             "joint_samples_lost": episode.joint_lost,
             "control_ticks": episode.tick_samples,
             "control_ticks_lost": episode.tick_lost,
+            "commands_applied": episode.commands_applied,
+            "commands_without_application_time": episode.commands_unapplied,
             "odometry": (
                 "Jelly wheel angles, dead reckoned"
                 if episode.odometry is not None
@@ -688,6 +691,7 @@ class McapRecorderProcess:
         positions: np.ndarray,
         velocities: np.ndarray,
         torques: np.ndarray,
+        applied: tuple[float, float, float, float] | None = None,
     ) -> None:
         """One 240 Hz feedback sample (a Rust core state listener)."""
         if self._closed:
@@ -697,6 +701,7 @@ class McapRecorderProcess:
         values[:n] = positions
         values[n : 2 * n] = velocities
         values[2 * n : 3 * n] = torques
+        values[3 * n : 3 * n + 4] = applied if applied is not None else np.nan
         self._joint_ring.write_values(perf_ts, values)
         self._joint_samples += 1
 

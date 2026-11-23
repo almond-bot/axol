@@ -109,9 +109,12 @@
 //! - `F` + binary      telemetry, one per bus per tick while armed: side
 //!                     u8, valid-mask u8, then 8 x (pos f64, vel f64, tau
 //!                     f64, age_us u32) — the latest decoded feedback per
-//!                     slot. Python fills its Motor caches from these (see
-//!                     `build_feedback`); it does not read CAN while the
-//!                     core is armed.
+//!                     slot — then applied-valid u8, applied seq u32 and
+//!                     applied age_us u32: the newest target this bus has
+//!                     started using and how long ago its first CAN frame
+//!                     went out. Python fills its Motor caches from these
+//!                     (see `build_feedback`); it does not read CAN while
+//!                     the core is armed.
 //!
 //! ## Safety
 //! - **A fault never disables the motors.** Cutting torque drops the arms,
@@ -309,7 +312,11 @@ const HOLDOVER_MAX: f64 = 0.080;
 ///   a current sample resistor that doesn't match its model, and sets
 ///   MAX_TORQUE to the model's rating. A proto-20 core would drive those
 ///   joints the wrong way, with their torque scaled 40x weak.
-const CONFIG_PROTO: u32 = 21;
+/// - 22: `F` telemetry gains a trailer naming the newest target each bus has
+///   applied (its `T` seq) and when its first CAN frame was sent, so a
+///   recording can stamp each command's application time. A proto-21 client
+///   would reject the longer packet.
+const CONFIG_PROTO: u32 = 22;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -2322,10 +2329,10 @@ mod tests {
     fn impedance_joints_run_at_240_hz_only() {
         let spec = |wire: &str, gripper: bool| {
             let text = if gripper {
-                "proto 21\ngripper 0 canL 8\n".to_string()
+                "proto 22\ngripper 0 canL 8\n".to_string()
             } else {
                 format!(
-                    "proto 21\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
+                    "proto 22\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
                 )
             };
             text
@@ -2544,8 +2551,13 @@ mod tests {
         let mut latest: [SlotFeedback; N_SLOTS] = [None; N_SLOTS];
         latest[0] = Some((1.5, -0.25, 3.0, now - Duration::from_micros(1200)));
         latest[7] = Some((0.5, 0.0, 0.1, now));
-        let msg = build_feedback(1, &latest, now);
-        assert_eq!(msg.len(), 3 + N_SLOTS * 28);
+        let msg = build_feedback(
+            1,
+            &latest,
+            now,
+            Some((0xDEADBEEF, now - Duration::from_micros(700))),
+        );
+        assert_eq!(msg.len(), 3 + N_SLOTS * 28 + 9);
         assert_eq!(msg[0], b'F');
         assert_eq!(msg[1], 1);
         assert_eq!(msg[2], 0b1000_0001);
@@ -2557,12 +2569,20 @@ mod tests {
         let slot7 = 3 + 7 * 28;
         let pos7 = f64::from_le_bytes(msg[slot7..slot7 + 8].try_into().unwrap());
         assert_eq!(pos7, 0.5);
+        let tail = 3 + N_SLOTS * 28;
+        assert_eq!(msg[tail], 1);
+        let seq = u32::from_le_bytes(msg[tail + 1..tail + 5].try_into().unwrap());
+        let age = u32::from_le_bytes(msg[tail + 5..tail + 9].try_into().unwrap());
+        assert_eq!((seq, age), (0xDEADBEEF, 700));
+        // Before any target has gone out the trailer says so.
+        let none = build_feedback(0, &latest, now, None);
+        assert_eq!(&none[tail..], &[0u8; 9]);
     }
 
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 21\n\
+            "proto 22\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
@@ -2614,39 +2634,39 @@ mod tests {
         );
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 21\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
+            "proto 22\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 21\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 22\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
         // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
         assert!(parse_config(
-            "proto 21\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 22\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 21\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 22\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 21\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 22\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 21\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 22\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 21\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+            "proto 22\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 21\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+            "proto 22\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 21\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 22\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -2657,7 +2677,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 21\n\
+            "proto 22\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
@@ -2671,15 +2691,15 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 21\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 22\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 21\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 22\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 21\n\
+            "proto 22\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
@@ -2719,7 +2739,7 @@ mod tests {
     #[test]
     fn parse_config_takes_tf_scale() {
         let cfg = parse_config(&format!(
-            "proto 21\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
+            "proto 22\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
              joint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         ))
         .unwrap();
@@ -2734,27 +2754,27 @@ mod tests {
     #[test]
     fn fast_impedance_needs_a_480_hz_loop() {
         let mit = "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n";
-        let cfg = parse_config(&format!("proto 21\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
+        let cfg = parse_config(&format!("proto 22\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
         assert_eq!(cfg.impedance_hz, FAST_IMPEDANCE_HZ);
         assert_eq!(
-            parse_config(&format!("proto 21\n{mit}"))
+            parse_config(&format!("proto 22\n{mit}"))
                 .unwrap()
                 .impedance_hz,
             IMPEDANCE_HZ
         );
-        let err = parse_config(&format!("proto 21\nloop_hz 240\nimpedance_hz 480\n{mit}"))
+        let err = parse_config(&format!("proto 22\nloop_hz 240\nimpedance_hz 480\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("480 Hz only"), "{err}");
-        let err = parse_config(&format!("proto 21\nloop_hz 480\nimpedance_hz 400\n{mit}"))
+        let err = parse_config(&format!("proto 22\nloop_hz 480\nimpedance_hz 400\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("impedance_hz 400"), "{err}");
         // A bus with no impedance joint is not held to the rule.
         assert!(parse_config(&format!(
-            "proto 21\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
+            "proto 22\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
         ))
         .is_ok());
     }
@@ -2770,7 +2790,7 @@ mod tests {
             )
         };
         let text = format!(
-            "proto 21\nloop_hz 480\n{}{}{}{}",
+            "proto 22\nloop_hz 480\n{}{}{}{}",
             line("shoulder_1", 1, 480.0),
             line("shoulder_2", 2, 0.0),
             line("elbow", 4, 480.0),
@@ -2927,9 +2947,17 @@ type SlotFeedback = Option<(f64, f64, f64, Instant)>;
 /// has been seen), then per slot: pos f64, vel f64, tau f64 (all LE) and
 /// age_us u32 — microseconds between the frame's CAN receive and this
 /// packet, so the Python side can reconstruct per-slot receive timestamps
-/// on its own clock. Mirrored by `RtLink._parse_feedback`.
-fn build_feedback(side: u8, latest: &[SlotFeedback; N_SLOTS], now: Instant) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(3 + N_SLOTS * 28);
+/// on its own clock. Then the applied trailer: valid u8, seq u32 and age_us
+/// u32 of the newest target whose commands have gone out on this bus
+/// (`applied`: its seq and the instant its first frame was sent). Mirrored by
+/// `RtLink._parse_feedback` and `RtLink._parse_applied`.
+fn build_feedback(
+    side: u8,
+    latest: &[SlotFeedback; N_SLOTS],
+    now: Instant,
+    applied: Option<(u32, Instant)>,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3 + N_SLOTS * 28 + 9);
     msg.push(b'F');
     msg.push(side);
     let mut mask = 0u8;
@@ -2947,6 +2975,17 @@ fn build_feedback(side: u8, latest: &[SlotFeedback; N_SLOTS], now: Instant) -> V
         let age_us = now.duration_since(ts).as_micros().min(u32::MAX as u128) as u32;
         msg.extend_from_slice(&age_us.to_le_bytes());
     }
+    let (valid, seq, age_us) = match applied {
+        Some((seq, at)) => (
+            1u8,
+            seq,
+            now.duration_since(at).as_micros().min(u32::MAX as u128) as u32,
+        ),
+        None => (0u8, 0u32, 0u32),
+    };
+    msg.push(valid);
+    msg.extend_from_slice(&seq.to_le_bytes());
+    msg.extend_from_slice(&age_us.to_le_bytes());
     msg
 }
 
@@ -3439,6 +3478,11 @@ fn bus_loop(
     let mut feedback_fresh = [false; N_SLOTS];
     let mut have_target = false;
     let mut last_seq: Option<u32> = None;
+    // The newest accepted target not yet sent, and the newest one whose
+    // first frame has gone out (seq, send instant): its application time,
+    // reported in every `F` packet.
+    let mut pending_apply: Option<u32> = None;
+    let mut applied: Option<(u32, Instant)> = None;
     let mut last_arrival: Option<Instant> = None;
     // Arrival of the last *accepted* target: the holdover's clock. A
     // rejected packet feeds the watchdog (the client is alive) but must not
@@ -3777,6 +3821,7 @@ fn bus_loop(
                             None => {
                                 play = t.cmds;
                                 have_target = true;
+                                pending_apply = Some(t.seq);
                                 last_accepted = Some(t.arrival);
                                 if let Some(gap) = gap {
                                     cadence.observe(gap);
@@ -3911,6 +3956,7 @@ fn bus_loop(
             // motors were successfully queued in this tick.
             expected.fill(0);
             attempted.fill(false);
+            let mut first_sent: Option<Instant> = None;
             let mut trace_pending: [Option<TraceRow>; N_SLOTS] = [None; N_SLOTS];
             for (motor_index, m) in motors.iter().enumerate() {
                 // An impedance joint on its own 240 Hz cadence runs nothing on
@@ -4293,7 +4339,10 @@ fn bus_loop(
                 }
                 attempted[motor_index] = true;
                 match guarded_send(&sock, arb, &frame, &mut enobufs_since)? {
-                    SendOutcome::Sent => expected[motor_index] = 1,
+                    SendOutcome::Sent => {
+                        expected[motor_index] = 1;
+                        first_sent.get_or_insert_with(Instant::now);
+                    }
                     SendOutcome::Dropped => {}
                     SendOutcome::Unacked => {
                         // The e-stop path on hub firmware 2.01+: the hub saw
@@ -4344,6 +4393,14 @@ fn bus_loop(
                         )));
                     }
                 }
+            }
+
+            // The first frame sent from a newly adopted target is when the
+            // core started applying it (a thinned tick that sends nothing
+            // leaves it pending for the next one).
+            if let (Some(seq), Some(at)) = (pending_apply, first_sent) {
+                applied = Some((seq, at));
+                pending_apply = None;
             }
 
             // 0xA4 joints: ask for the 0.01° multi-turn angle right behind the
@@ -4668,7 +4725,7 @@ fn bus_loop(
             // writer thread does the socket I/O). Skipped until the first
             // reply so an all-empty packet never races the bring-up reads.
             if latest.iter().any(|s| s.is_some()) {
-                let _ = out_tx.send(build_feedback(side, &latest, Instant::now()));
+                let _ = out_tx.send(build_feedback(side, &latest, Instant::now(), applied));
             }
 
             if let Some(t) = bus_last_reply.filter(|_| bus_busy.len() < BUS_BUSY_CAPACITY) {

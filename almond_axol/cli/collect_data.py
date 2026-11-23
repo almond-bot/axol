@@ -683,9 +683,12 @@ def _start_video_relay(
         res = camcfg.resolution_name() if hasattr(camcfg, "resolution_name") else None
         if res:
             spec["resolution"] = res
-        # Downscale target for the dataset (raw) branch only; the encoded headset
-        # branch keeps the full capture resolution. Clamped to capture in the relay.
+        # Downscale targets, each clamped to the capture in the relay: the
+        # dataset (raw) branch, and the headset branch when it streams smaller.
         spec["dataset_resolution"] = dataset_resolution
+        stream_resolution = getattr(cfg, "stream_resolution", None)
+        if stream_resolution:
+            spec["stream_resolution"] = stream_resolution
         if raw_transport is not None:
             spec["raw_transport"] = raw_transport
         if policy_fps:
@@ -779,9 +782,8 @@ def mcap_setup_problem(
         if cap_w < rec_w or cap_h < rec_h:
             return (
                 f"The {name} camera captures at {capture}, smaller than the "
-                f"Recording resolution ({dataset_resolution}). In Axol settings, "
-                f"open Cameras and set Streaming resolution to {dataset_resolution}, "
-                "or lower Recording resolution."
+                f"Recording resolution ({dataset_resolution}). Capture at "
+                f"{dataset_resolution} or more, or lower Recording resolution."
             )
     return None
 
@@ -912,6 +914,11 @@ class CollectDataConfig:
     # saturates the Jetson CPU moving raw bytes, collapsing the control loop.
     # Clamped to the capture resolution, so it only ever downscales.
     dataset_resolution: DatasetResolution = "SVGA"
+    # Resolution of the headset stream when it is smaller than the capture:
+    # the control panel's Streaming resolution, with the cameras capturing at a
+    # larger Recording resolution. The relay scales the headset branch down on
+    # the GPU. None streams at the capture resolution.
+    stream_resolution: DatasetResolution | None = None
     # Video codec for the recorded LeRobot dataset; defaults per-platform (see
     # record_proc.default_vcodec). Override with any of LeRobot's
     # VALID_VIDEO_CODECS (e.g. auto, h264, libsvtav1).
@@ -2788,7 +2795,8 @@ def _run_session(
             # see recording.mcap.
             if mcap_mode:
                 mcap_commands_sent[0] += 1
-                limp = getattr(getattr(robot, "axol", None), "limp", None)
+                axol = getattr(robot, "axol", None)
+                limp = getattr(axol, "limp", None)
                 recorder.publish(
                     pack_tick(
                         command,
@@ -2798,6 +2806,8 @@ def _run_session(
                         command_id=mcap_commands_sent[0],
                         issue_t=issued,
                         arm_mode="gravity_compensation" if limp else "impedance",
+                        # The core reports when it applies these (see rt.link).
+                        target_seqs=getattr(axol, "last_target_seqs", None),
                     ),
                     {},
                     ts,

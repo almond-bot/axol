@@ -301,6 +301,8 @@ class Axol(RobotBase):
         self._max_vel = max_vel
         self._max_accel = max_accel
         self._seq = 0
+        # The seq of the newest target sent to each side (0 = left, 1 = right).
+        self._sent_seq: dict[int, int] = {}
         self._limp_announced = False
         # Telemetry packets received per side since arm.
         self._fb_packets = [0, 0]
@@ -941,15 +943,28 @@ class Axol(RobotBase):
 
         return feed
 
+    @property
+    def last_target_seqs(self) -> tuple[int | None, int | None]:
+        """``(left, right)``: the seq of the newest target sent to each arm.
+
+        Every :meth:`motion_control` (and gravity comp) sends each arm one
+        target with its own seq; the core reports when it started applying
+        it (see :meth:`add_state_listener`). ``None`` before the first send.
+        """
+        return self._sent_seq.get(0), self._sent_seq.get(1)
+
     def add_state_listener(self, listener: Callable[..., None]) -> None:
         """Call ``listener`` with every complete 240 Hz state sample.
 
-        Called as ``listener(perf_ts, positions, velocities, torques)`` on the
-        telemetry thread, where each array is ``(16,)``: the left arm's 8
-        joints then the right arm's, in Joint order and the units of
-        :attr:`AxolArm.positions`, :attr:`AxolArm.velocities` and
-        :attr:`AxolArm.torques`. It must be quick and must not block; an
-        exception is logged once and the listener is dropped.
+        Called as ``listener(perf_ts, positions, velocities, torques,
+        applied)`` on the telemetry thread, where each array is ``(16,)``: the
+        left arm's 8 joints then the right arm's, in Joint order and the units
+        of :attr:`AxolArm.positions`, :attr:`AxolArm.velocities` and
+        :attr:`AxolArm.torques`. ``applied`` is ``(left_seq, left_ts,
+        right_seq, right_ts)``: per arm, the seq of the newest target the core
+        has started sending to the motors and when (``perf_counter``), NaN
+        before the first. It must be quick and must not block; an exception
+        is logged once and the listener is dropped.
         """
         self._state_listeners.append(listener)
 
@@ -968,12 +983,25 @@ class Axol(RobotBase):
             velocities = np.full(2 * len(left_pos), np.nan, dtype=np.float32)
         positions = np.concatenate([left_pos, right_pos])
         torques = np.concatenate([left_trq, right_trq])
+        applied = self._applied_targets()
         for listener in list(self._state_listeners):
             try:
-                listener(perf_ts, positions, velocities, torques)
+                listener(perf_ts, positions, velocities, torques, applied)
             except Exception:  # noqa: BLE001 - never break the telemetry feed
                 _logger.exception("rt: state listener failed; removing it")
                 self.remove_state_listener(listener)
+
+    def _applied_targets(self) -> tuple[float, float, float, float]:
+        """``(left_seq, left_ts, right_seq, right_ts)`` from the link, NaN-filled."""
+        out = [math.nan] * 4
+        wall_minus_perf = time.time() - time.perf_counter()
+        for side in (0, 1):
+            applied = self._link.applied.get(side)
+            if applied is not None:
+                seq, wall_ts = applied
+                out[2 * side] = float(seq)
+                out[2 * side + 1] = wall_ts - wall_minus_perf
+        return out[0], out[1], out[2], out[3]
 
     def state_nearest(
         self, target_perf_ts: float, timeout: float = 0.1
@@ -1070,6 +1098,7 @@ class Axol(RobotBase):
         def sink(cmds: list[tuple[float, ...]]) -> None:
             self._seq += 1
             self._link.send_target(side, self._seq, cmds)
+            self._sent_seq[side] = self._seq
 
         return sink
 

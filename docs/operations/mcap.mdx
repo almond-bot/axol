@@ -19,8 +19,9 @@ Every sample is stored at its own time, on one clock. Nothing is resampled and n
 
 1. In the control panel, open **Settings**, then **Recording**, and set **Recording format** to `mcap`. On the command line, add `--format mcap`.
 2. Choose the video size and rate. In **Axol settings**, open **Cameras** and set **Recording resolution**. Set **Recording fps** under **Settings**, then **Recording**. For 1920x1200 at 60 fps, choose `HD1200` and `60`.
-3. Set **Streaming resolution** to the **Recording resolution** or higher. Collect data won't start otherwise, because the cameras capture at the streaming size.
-4. In the **Collect data** form, type your name in **Operator**. It is saved in every episode and kept for the next session.
+3. In the **Collect data** form, type your name in **Operator**. It is saved in every episode and kept for the next session.
+
+**Streaming resolution** only sets the headset's picture. Collect data captures at the larger of the two resolutions, so you can record at `HD1200` and stream `SVGA` to keep the headset and the Jetson's encoders lighter.
 
 **MCAP video codec**, under **Settings**, then **Recording**, picks the codec: `h264` (the default) plays in a web browser on any computer, and `h265` makes smaller files. On the command line, use `--mcap_video_codec`.
 
@@ -88,6 +89,7 @@ Each `/joint_command` message holds one control tick's targets for the arms and 
 | `name` | The joints, in the same order as the matching `/joint_command`. |
 | `target_device_id` | The device each joint belongs to: `left_arm`, `right_arm`, `left_gripper` or `right_gripper`. |
 | `control_mode` | How that device follows its target. |
+| `application_timestamp` | For each joint, when the robot started applying its target: the time its arm's realtime controller sent the first motor command computed from it. It is zero when the robot never used that target, because a newer one replaced it first. |
 
 `almond_msgs/BaseCommand` holds one command to Jelly:
 

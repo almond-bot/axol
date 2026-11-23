@@ -265,6 +265,16 @@ def check(path: Path) -> list[Result]:
             f"one per command, ids {ids[0]} to {ids[-1]}, modes "
             + ",".join(sorted({m for c in infos for m in c.control_mode})),
         )
+        applied = sum(
+            1
+            for c in infos
+            if any(t.sec or t.nanosec for t in getattr(c, "application_timestamp", []))
+        )
+        add(
+            True if applied >= 0.95 * len(infos) else None,
+            "/joint_command/info application times",
+            f"{applied} of {len(infos)} commands have the time the robot applied them",
+        )
     elif commands:
         add(False, "/joint_command/info", "missing")
     for side in ("left", "right"):

@@ -17,6 +17,7 @@ a grid and no frame is repeated to fill a gap; gaps are counted instead.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict, deque
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from .odometry import XDriveOdometry
 from .rings import (
     JOINT_NAMES,
     POSE_AXES,
+    SIDES,
     VR_AXES,
     VR_BUTTONS,
     WHEEL_IDS,
@@ -41,6 +43,12 @@ from .urdf_tree import pose7, quaternion_xyzw
 from .writer import EpisodeFile
 
 FORMAT_VERSION = "1"
+# A command whose application the realtime core hasn't reported within this
+# long (s, on the joint feed's clock) is written with its application unknown:
+# it was superseded before the core used it, or rejected.
+_APPLY_WAIT_S = 0.5
+# Application times remembered per arm (by target seq).
+_APPLIED_MEMORY = 4096
 VR_FRAME = "vr_world"
 # Re-publish an unchanged lift height this often (s), so a reader starting
 # anywhere in the file finds a recent value.
@@ -121,6 +129,19 @@ class EpisodeRecording:
         self._base_command_id: float | None = None
         self.imu_samples: dict[str, int] = {}
         self._imu_last: dict[str, float] = {}
+        # Application times from the joint feed: per arm, target seq -> perf.
+        self._applied_at: dict[str, OrderedDict[int, float]] = {
+            side: OrderedDict() for side in SIDES
+        }
+        self._applied_last: dict[str, float] = {}
+        self._applied_cols = {
+            side: (jk[f"applied.seq_{side}"], jk[f"applied.t_{side}"]) for side in SIDES
+        }
+        self._joint_clock: float | None = None
+        # /joint_command/info waiting for its application time (FIFO).
+        self._pending_info: deque[tuple] = deque()
+        self.commands_applied = 0
+        self.commands_unapplied = 0
         # The device each /joint_states name belongs to: an arm or a gripper.
         self._devices = [
             name if name.endswith("_gripper") else f"{name.split('_', 1)[0]}_arm"
@@ -322,6 +343,67 @@ class EpisodeRecording:
                     stamp,
                 )
             self.joint_samples += 1
+            self._note_applied(row)
+            self._joint_clock = ts
+        self._flush_command_info()
+
+    def _note_applied(self, row: np.ndarray) -> None:
+        """Remember each arm's newly applied target and when it was applied."""
+        for side, (seq_col, t_col) in self._applied_cols.items():
+            seq, t = float(row[seq_col]), float(row[t_col])
+            if not (math.isfinite(seq) and math.isfinite(t)):
+                continue
+            if self._applied_last.get(side) == seq:
+                continue
+            self._applied_last[side] = seq
+            memory = self._applied_at[side]
+            memory[int(seq)] = t
+            while len(memory) > _APPLIED_MEMORY:
+                memory.popitem(last=False)
+
+    def _flush_command_info(self, final: bool = False) -> None:
+        """Write the pending command infos whose application is known.
+
+        In order: one still waiting holds back the later ones, until the
+        joint feed has moved :data:`_APPLY_WAIT_S` past its issue time (or the
+        episode ends), when it is written with its application unknown.
+        """
+        while self._pending_info:
+            stamp, command_id, names, devices, modes, seqs, issue_t = (
+                self._pending_info[0]
+            )
+            applied: dict[str, float | None] = {}
+            for side in SIDES:
+                seq = seqs[side]
+                applied[side] = (
+                    self._applied_at[side].get(int(seq)) if math.isfinite(seq) else None
+                )
+            waiting = any(
+                math.isfinite(seqs[side]) and applied[side] is None for side in SIDES
+            )
+            timed_out = (
+                self._joint_clock is not None
+                and self._joint_clock - issue_t > _APPLY_WAIT_S
+            )
+            if waiting and not (final or timed_out):
+                return
+            self._pending_info.popleft()
+            application = []
+            for device in devices:
+                t = applied.get(device.split("_", 1)[0])
+                application.append(self.stamp(t) if t is not None else 0)
+            if waiting:
+                self.commands_unapplied += 1
+            else:
+                self.commands_applied += 1
+            self.file.write(
+                "/joint_command/info",
+                "almond_msgs/CommandInfo",
+                messages.command_info(
+                    stamp, command_id, stamp, names, devices, modes, application
+                ),
+                stamp,
+            )
 
     # -- 120 Hz tick rows ----------------------------------------------------
 
@@ -329,6 +411,7 @@ class EpisodeRecording:
         for row in rows:
             self._tick_row(row)
             self.tick_samples += 1
+        self._flush_command_info()
 
     def _col(self, row: np.ndarray, key: str) -> float:
         return float(row[self._tick[key]])
@@ -362,18 +445,16 @@ class EpisodeRecording:
                 messages.joint_state(stamp, names, picked[keep].tolist()),
                 stamp,
             )
-            self.file.write(
-                "/joint_command/info",
-                "almond_msgs/CommandInfo",
-                messages.command_info(
+            self._pending_info.append(
+                (
                     stamp,
                     int(command_id) if math.isfinite(command_id) else 0,
-                    stamp,
                     names,
                     devices,
                     modes,
-                ),
-                stamp,
+                    {side: self._col(row, f"cmd.seq_{side}") for side in SIDES},
+                    issue_t,
+                )
             )
             if np.isfinite(commanded[cols]).all():
                 values = self.scene.urdf_values(commanded)
@@ -589,6 +670,10 @@ class EpisodeRecording:
                 }
             )
         return out
+
+    def flush(self) -> None:
+        """Write everything still waiting (call once capture has stopped)."""
+        self._flush_command_info(final=True)
 
     def finish(self, metadata: dict[str, dict[str, Any]]) -> Path:
         for name, values in metadata.items():

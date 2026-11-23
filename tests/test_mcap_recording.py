@@ -798,12 +798,27 @@ class SessionTest(unittest.TestCase):
 
     def _record(self, start: float) -> None:
         """Feed 0.5 s of cameras (one dropped frame), joints, ticks and wheels."""
-        n = len(joint_ring_keys()) // 3
+        n = 2 * len(Joint)
         for i in range(120):  # 240 Hz
             t = start + i / 240
             positions = np.full(n, 0.01 * i)
+            # The core applies each 120 Hz command (seqs 2k+1 left, 2k+2
+            # right, sent at start + k/120 + 0.5 ms) 2 ms after it is sent;
+            # until the first, nothing has been applied.
+            k = math.floor((t - start - 0.0025) * 120)
+            applied = (
+                [np.nan] * 4
+                if k < 0
+                else [
+                    2 * k + 1,
+                    start + k / 120 + 0.0025,
+                    2 * k + 2,
+                    start + k / 120 + 0.0025,
+                ]
+            )
             self.joint_writer.write_values(
-                t, np.concatenate([positions, np.ones(n), np.full(n, 2.0)])
+                t,
+                np.concatenate([positions, np.ones(n), np.full(n, 2.0), applied]),
             )
         frame = SimpleNamespace(
             seq=0,
@@ -847,6 +862,7 @@ class SessionTest(unittest.TestCase):
                     command_id=1000 + i,
                     issue_t=t + 0.0005,
                     arm_mode="impedance",
+                    target_seqs=(2 * i + 1, 2 * i + 2),
                 ),
                 {},
                 t,
@@ -934,6 +950,18 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(first.target_device_id[7], "left_gripper")
         self.assertEqual(first.control_mode[0], "impedance")
         self.assertEqual(first.control_mode[7], "position_force")
+
+        # Applied 2 ms after it was sent (issue is 0.5 ms after the tick).
+        def ns(t) -> int:
+            return t.sec * 10**9 + t.nanosec
+
+        for info in infos:
+            delay = ns(info.application_timestamp[0]) - ns(info.issue_timestamp)
+            self.assertAlmostEqual(delay / 1e6, 2.0, delta=0.01)
+            self.assertEqual(
+                info.application_timestamp[0], info.application_timestamp[7]
+            )
+        self.assertEqual(len(infos[0].application_timestamp), len(infos[0].name))
         base = [m.ros_msg for m in by_topic["/base/command"]]
         self.assertEqual([b.command_id for b in base], list(range(100, 130)))
         self.assertEqual((base[0].control_mode, base[0].vx), ("velocity", 0.2))
@@ -983,6 +1011,10 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(metadata["recording"]["wrist_left.gaps"], "1")
         self.assertEqual(metadata["recording"]["wrist_left.missing_frames"], "1")
         self.assertEqual(metadata["recording"]["joint_samples"], "120")
+        self.assertEqual(metadata["recording"]["commands_applied"], "60")
+        self.assertEqual(
+            metadata["recording"]["commands_without_application_time"], "0"
+        )
         self.assertNotIn("calibration_passed", metadata["calibration"])
         self.assertEqual(len(metadata["calibration"]["calibration_id"]), 16)
         self.assertNotEqual(metadata["calibration"]["calibration_date"], "")
@@ -1118,6 +1150,49 @@ class SessionTest(unittest.TestCase):
         trail = b"\x00\x00\x01\x02\x01\xbb"  # an H.265 TRAIL_R picture
         results = self._record_and_check({"right_arm"}, ("right_arm", trail))
         self.assertEqual(results["/wrist/right/video keyframes"].status, "FAIL")
+
+    def test_a_command_the_core_never_applies_is_written_as_unknown(self) -> None:
+        self.session.start("task")
+        start = time.perf_counter()
+        command = {f"{s}_{j.value}.pos": 0.0 for s in ("left", "right") for j in Joint}
+        for i in range(2):
+            self.tick_writer.write(
+                pack_tick(
+                    command,
+                    command_id=i + 1,
+                    issue_t=start + i,
+                    target_seqs=(10 + i, 20 + i),
+                ),
+                {},
+                start + i,
+            )
+        # Only the first command's targets are applied; the second is
+        # superseded (or rejected) and never reported.
+        n = 2 * len(Joint)
+        self.joint_writer.write_values(
+            start + 0.01,
+            np.concatenate([np.zeros(3 * n), [10, start + 0.002, 20, start + 0.003]]),
+        )
+        time.sleep(0.05)
+        self.session.stop_capture()
+        self.session.save(None, {})
+        path = self.root / "episode_000000.mcap"
+        infos = [
+            m.ros_msg
+            for m in read_ros2_messages(str(path))
+            if m.channel.topic == "/joint_command/info"
+        ]
+        self.assertEqual([i.command_id for i in infos], [1, 2])
+        left, right = (
+            infos[0].application_timestamp[0],
+            infos[0].application_timestamp[8],
+        )
+        self.assertGreater(left.sec, 0)
+        self.assertGreater(right.sec, 0)
+        self.assertNotEqual(left, right)
+        self.assertTrue(
+            all(t.sec == 0 and t.nanosec == 0 for t in infos[1].application_timestamp)
+        )
 
     def test_samples_before_the_start_are_not_recorded(self) -> None:
         n = len(joint_ring_keys())
@@ -1263,7 +1338,7 @@ class CollectDataSetupTest(unittest.TestCase):
             problem = mcap_setup_problem(
                 cfg, dataset_root=Path(directory), dataset_resolution="HD1200"
             )
-            self.assertIn("Streaming resolution", problem or "")
+            self.assertIn("smaller than the Recording resolution", problem or "")
             camera.resolution_name = lambda: "HD1200"
             self.assertIsNone(
                 mcap_setup_problem(
@@ -1324,10 +1399,11 @@ class StateListenerTest(unittest.TestCase):
 
         fake = SimpleNamespace(_state_listeners=[])
         fake.remove_state_listener = lambda fn: Axol.remove_state_listener(fake, fn)
+        fake._applied_targets = lambda: (3.0, 1.25, 4.0, 1.5)
         seen: list[tuple] = []
 
-        def good(ts, positions, velocities, torques) -> None:
-            seen.append((ts, positions, velocities, torques))
+        def good(ts, positions, velocities, torques, applied) -> None:
+            seen.append((ts, positions, velocities, torques, applied))
 
         def bad(*_args) -> None:
             raise ValueError("boom")
@@ -1340,8 +1416,9 @@ class StateListenerTest(unittest.TestCase):
         with self.assertLogs("almond_axol.rt.robot", level="ERROR"):
             Axol._notify_state_listeners(fake, snapshot, left, right)  # type: ignore[arg-type]
         self.assertEqual(fake._state_listeners, [good])
-        ts, positions, velocities, torques = seen[0]
+        ts, positions, velocities, torques, applied = seen[0]
         self.assertEqual(ts, 1.5)
+        self.assertEqual(applied, (3.0, 1.25, 4.0, 1.5))
         self.assertEqual(positions.tolist(), [0.0] * 8 + [1.0] * 8)
         self.assertEqual(velocities.tolist(), [2.0] * 8 + [3.0] * 8)
         self.assertEqual(torques.tolist(), [4.0] * 8 + [5.0] * 8)
@@ -1466,3 +1543,126 @@ class ImuTest(unittest.TestCase):
         self.assertEqual(imu.orientation_covariance[0], -1.0)
         self.assertEqual(imu.angular_velocity.y, 0.2)
         self.assertEqual(imu.linear_acceleration.y, -9.8)
+
+
+class AppliedTargetTest(unittest.TestCase):
+    def test_link_parses_the_applied_trailer(self) -> None:
+        import struct as structlib
+
+        from almond_axol.rt.link import RtLink
+
+        slots = b"".join(structlib.pack("<3dI", 0.0, 0.0, 0.0, 0) for _ in range(8))
+        base = b"F" + bytes([0, 0b1]) + slots
+        self.assertIsNone(RtLink._parse_applied(base))  # no trailer
+        self.assertIsNone(RtLink._parse_applied(base + structlib.pack("<BII", 0, 9, 9)))
+        before = time.time()
+        seq, ts = RtLink._parse_applied(base + structlib.pack("<BII", 1, 77, 2500))
+        self.assertEqual(seq, 77)
+        self.assertLessEqual(before - 0.0025, ts)
+        self.assertLessEqual(ts, time.time() - 0.0025)
+        # The slot parse ignores the trailer.
+        side, parsed = RtLink._parse_feedback(
+            base + structlib.pack("<BII", 1, 77, 2500)
+        )
+        self.assertEqual((side, set(parsed)), (0, {0}))
+
+    def test_robot_reports_applied_targets_on_the_perf_clock(self) -> None:
+        from almond_axol.rt.robot import Axol
+
+        wall = time.time()
+        fake = SimpleNamespace(_link=SimpleNamespace(applied={1: (42, wall - 0.01)}))
+        left_seq, left_t, right_seq, right_t = Axol._applied_targets(fake)  # type: ignore[arg-type]
+        self.assertTrue(math.isnan(left_seq) and math.isnan(left_t))
+        self.assertEqual(right_seq, 42.0)
+        self.assertAlmostEqual(right_t, time.perf_counter() - 0.01, delta=0.005)
+
+    def test_sent_seqs_are_tracked_per_arm(self) -> None:
+        from almond_axol.rt.robot import Axol
+
+        sent = []
+        fake = SimpleNamespace(
+            _seq=0,
+            _sent_seq={},
+            _link=SimpleNamespace(
+                send_target=lambda side, seq, cmds: sent.append((side, seq))
+            ),
+        )
+        left, right = Axol._make_sink(fake, 0), Axol._make_sink(fake, 1)  # type: ignore[arg-type]
+        left([]), right([]), left([])
+        self.assertEqual(sent, [(0, 1), (1, 2), (0, 3)])
+        self.assertEqual(Axol.last_target_seqs.fget(fake), (3, 2))  # type: ignore[union-attr]
+
+
+class StreamResolutionTest(unittest.TestCase):
+    """Collect data captures at the larger resolution and scales the headset."""
+
+    def _merge(self, scaled: bool) -> dict:
+        from almond_axol.serve.runner import OperationRunner
+
+        spec = {
+            "serials": {"overhead": "101", "left_arm": "102", "right_arm": ""},
+            "stream_resolution": "SVGA",
+            "record_resolution": "HD1200",
+        }
+        with mock.patch("almond_axol.serve.runner.stereo_serials", return_value=set()):
+            return OperationRunner()._merge_camera_args(
+                {"repo_id": "a/b", "task": "t"},
+                spec,
+                streams_video=True,
+                scaled_stream=scaled,
+            )
+
+    def test_collect_data_captures_at_the_recording_resolution(self) -> None:
+        args = self._merge(scaled=True)
+        self.assertEqual(args["robot_config.cameras.left_arm.width"], 1920)
+        self.assertEqual(args["robot_config.cameras.left_arm.height"], 1200)
+        self.assertEqual(args["stream_resolution"], "SVGA")
+        self.assertEqual(args["dataset_resolution"], "HD1200")
+
+    def test_other_ops_still_capture_at_the_streaming_resolution(self) -> None:
+        args = self._merge(scaled=False)
+        self.assertEqual(args["robot_config.cameras.left_arm.width"], 960)
+        self.assertNotIn("stream_resolution", args)
+
+    def test_only_collect_data_takes_a_separate_stream_resolution(self) -> None:
+        from almond_axol.serve.runner import _takes_stream_resolution
+
+        self.assertTrue(_takes_stream_resolution("collect-data"))
+        self.assertFalse(_takes_stream_resolution("collect-dagger"))
+        self.assertFalse(_takes_stream_resolution("run-policy"))
+
+    def test_headset_branches_scale_down_on_the_gpu(self) -> None:
+        from almond_axol.video.gst_zed import ZedGstCamera, ZedGstStereoCamera
+
+        mono = ZedGstCamera(302271563, "HD1200", 60, stream_dims=(960, 600))
+        self.assertEqual((mono.stream_width, mono.stream_height), (960, 600))
+        pipe = mono._pipeline_str()
+        self.assertIn(
+            "nvvidconv ! video/x-raw(memory:NVMM),format=NV12,width=960,height=600,"
+            "pixel-aspect-ratio=1/1 ! nvv4l2h264enc name=venc",
+            pipe,
+        )
+        stereo = ZedGstStereoCamera(
+            51617969, "HD1200", 60, encoded_sbs=True, stream_dims=(960, 600)
+        )
+        sbs = stereo._pipeline_str()
+        self.assertIn(
+            "width=1920,height=600,pixel-aspect-ratio=1/1 ! nvv4l2h264enc name=venc_s",
+            sbs,
+        )
+        eyes = ZedGstStereoCamera(
+            51617969, "HD1200", 60, encoded_eyes=["left"], stream_dims=(960, 600)
+        )._pipeline_str()
+        self.assertIn(
+            "width=960,height=600,pixel-aspect-ratio=1/1 ! nvv4l2h264enc name=venc_l",
+            eyes,
+        )
+
+    def test_no_scaling_when_the_stream_is_not_smaller(self) -> None:
+        from almond_axol.video.gst_zed import ZedGstCamera
+
+        for dims in (None, (1920, 1200), (3840, 2400)):
+            cam = ZedGstCamera(302271563, "HD1200", 60, stream_dims=dims)
+            self.assertEqual((cam.stream_width, cam.stream_height), (1920, 1200))
+            # An encoded-only camera has no GPU conversion at all.
+            self.assertNotIn("nvvidconv", cam._pipeline_str())
