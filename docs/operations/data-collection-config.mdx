@@ -45,7 +45,7 @@ axol collect-data --repo_id myorg/pick --task "pick up the cup" \
 | `--task` | required | Task description stored with every frame. |
 | `--format` | `lerobot` | Episode file format: `lerobot` saves a LeRobot dataset, `mcap` saves one MCAP file per episode. See [MCAP Recording](/operations/mcap). |
 | `--operator` | empty | Who is recording. Saved in each MCAP episode. |
-| `--mcap_video_codec` | `h265` | Video codec of MCAP episodes: `h265` or `h264`. |
+| `--mcap_video_codec` | `h264` | Video codec of MCAP episodes: `h264` or `h265`. |
 | `--mcap_topics` | empty | Rename MCAP topics, as `default=new` pairs separated by commas. See [Rename topics](/operations/mcap#rename-topics). |
 | `--fps` | `30` | Recording rate. Cameras capture at 60 and drop frames to match. `60` doubles the recording load on a Jetson. |
 | `--teleop_hz` | `120` | Motor command rate (Hz) while teleoperating, independent of `fps`. |

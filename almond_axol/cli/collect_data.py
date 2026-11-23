@@ -947,15 +947,15 @@ class CollectDataConfig:
     log_level: LogLevel = "INFO"
     # Episode file format: ``lerobot`` (a LeRobot dataset, the default) or
     # ``mcap`` (one MCAP file per episode, see almond_axol.recording.mcap).
-    # MCAP records H.265 video at the Recording resolution and fps, joints at
+    # MCAP records video at the Recording resolution and fps, joints at
     # the realtime core's rate, and the calibration and TF tree. Axol only.
     format: RecordingFormat = "lerobot"
     operator: str = ""
     """Who is recording. Saved in each MCAP episode."""
     mcap_topics: str = ""
     """Rename MCAP topics, as default=new pairs separated by commas."""
-    mcap_video_codec: McapVideoCodec = "h265"
-    """Video codec of MCAP episodes: h265 (smaller files) or h264."""
+    mcap_video_codec: McapVideoCodec = "h264"
+    """Video codec of MCAP episodes: h264, or h265 for smaller files."""
 
 
 # ----------------------------------------------------------------------
@@ -1948,7 +1948,7 @@ def _run_session(
         + ["headset", "ik", "dataset"]
     )
     progress.step("cameras")
-    mcap_codec = getattr(cfg, "mcap_video_codec", "h265")
+    mcap_codec = getattr(cfg, "mcap_video_codec", "h264")
     if mcap_mode:
         from ..video.gst_zed import _element_available
 

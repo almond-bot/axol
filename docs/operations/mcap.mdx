@@ -7,7 +7,7 @@ Collect data saves a LeRobot dataset by default. Set **Recording format** to `mc
 
 Each file holds:
 
-- every camera's video, encoded to H.265 or H.264 once on the robot and stored as is;
+- every camera's video, encoded to H.264 or H.265 once on the robot and stored as is;
 - each camera's calibration, and the head camera's IMU;
 - the joints, commands, headset input and, on Jelly, the base;
 - the full transform tree, from the base to every camera;
@@ -22,7 +22,7 @@ Every sample is stored at its own time, on one clock. Nothing is resampled and n
 3. Set **Streaming resolution** to the **Recording resolution** or higher. Collect data won't start otherwise, because the cameras capture at the streaming size.
 4. In the **Collect data** form, type your name in **Operator**. It is saved in every episode and kept for the next session.
 
-**MCAP video codec**, under **Settings**, then **Recording**, picks the codec: `h265` (the default) makes smaller files, and `h264` plays in a web browser on any computer. On the command line, use `--mcap_video_codec`.
+**MCAP video codec**, under **Settings**, then **Recording**, picks the codec: `h264` (the default) plays in a web browser on any computer, and `h265` makes smaller files. On the command line, use `--mcap_video_codec`.
 
 MCAP recording works with Collect data on Axol. Mantis, Collect DAgger data and Run policy save LeRobot datasets. **Push to HuggingFace Hub** doesn't apply to MCAP episodes.
 
@@ -32,7 +32,7 @@ Episodes are saved in the **Dataset root** folder, in a subfolder named after th
 
 A file appears only when you save the episode. A discarded take leaves nothing behind.
 
-Plan for storage. Every frame is a keyframe, so each 1920x1200 camera at 60 fps records about 40 Mbit/s with H.265, or 50 Mbit/s with H.264. With four cameras and H.265 that is about 20 MB/s, or 72 GB per hour of recording. Collect data won't start an episode with less than 2 GB free.
+Plan for storage. Every frame is a keyframe, so each 1920x1200 camera at 60 fps records about 50 Mbit/s with H.264, or 40 Mbit/s with H.265. With four cameras and H.264 that is about 25 MB/s, or 90 GB per hour of recording (72 GB with H.265). Collect data won't start an episode with less than 2 GB free.
 
 ## Topics
 
@@ -143,7 +143,7 @@ The IMU needs the ZED camera plugins that come with this version of Axol. If the
 
 ## Video
 
-Each frame is one H.265 or H.264 access unit, encoded on the Jetson as the camera captured it. It is stamped with the time the sensor exposed it. Every frame is a keyframe and carries its own parameter sets, so you can decode from any frame.
+Each frame is one H.264 or H.265 access unit, encoded on the Jetson as the camera captured it. It is stamped with the time the sensor exposed it. Every frame is a keyframe and carries its own parameter sets, so you can decode from any frame.
 
 The images are the cameras' raw images, without rectification. Undistort them with the `camera_info` on the same topic.
 

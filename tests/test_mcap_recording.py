@@ -1281,12 +1281,12 @@ class CollectDataSetupTest(unittest.TestCase):
                 values={
                     "recording.format": "mcap",
                     "recording.mcap_topics": "/joint_states=/robot/joints",
-                    "recording.mcap_video_codec": "h264",
+                    "recording.mcap_video_codec": "h265",
                 }
             )
             args = store.merged_args("collect-data", {})
             self.assertEqual(args["format"], "mcap")
-            self.assertEqual(args["mcap_video_codec"], "h264")
+            self.assertEqual(args["mcap_video_codec"], "h265")
             self.assertEqual(args["mcap_topics"], "/joint_states=/robot/joints")
             argv = build_argv("collect-data", {**args, "repo_id": "a/b", "task": "t"})
             self.assertIn("--format", argv)
@@ -1298,11 +1298,19 @@ class CollectDataSetupTest(unittest.TestCase):
         ]
         self.assertEqual(entry["options"], ["lerobot", "mcap"])
         self.assertEqual(entry["default"], "lerobot")
+        (codec,) = [
+            setting
+            for category in settings_schema()
+            for setting in category["settings"]
+            if setting["key"] == "recording.mcap_video_codec"
+        ]
+        self.assertEqual(codec["options"], ["h264", "h265"])
+        self.assertEqual(codec["default"], "h264")
         self.assertIn("operator", COMMANDS["collect-data"].per_run_fields)
         from almond_axol.cli.collect_data import CollectDataConfig
 
         self.assertEqual(
-            CollectDataConfig(repo_id="a/b", task="t").mcap_video_codec, "h265"
+            CollectDataConfig(repo_id="a/b", task="t").mcap_video_codec, "h264"
         )
 
 

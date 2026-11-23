@@ -1087,8 +1087,8 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 options=("lerobot", "mcap"),
                 help=(
                     "lerobot saves a LeRobot dataset. mcap saves one MCAP file per "
-                    "episode, with H.265 video, joints, calibration and the "
-                    "transform tree. mcap works with Collect data on Axol only."
+                    "episode, with video, joints, calibration and the transform "
+                    "tree. mcap works with Collect data on Axol only."
                 ),
                 targets={"collect-data": ("format",)},
             ),
@@ -1108,10 +1108,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="recording.mcap_video_codec",
                 label="MCAP video codec",
                 type="select",
-                options=("h265", "h264"),
+                options=("h264", "h265"),
                 help=(
-                    "Video codec of MCAP episodes. h265 makes smaller files. h264 "
-                    "plays in a web browser on any computer."
+                    "Video codec of MCAP episodes. h264 plays in a web browser on "
+                    "any computer. h265 makes smaller files."
                 ),
                 targets={"collect-data": ("mcap_video_codec",)},
             ),

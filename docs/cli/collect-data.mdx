@@ -17,7 +17,7 @@ This command is configured through draccus. The robot and teleop settings live i
 | `--task TEXT` | Natural language task description (required) |
 | `--format {lerobot,mcap}` | Episode file format (default: `lerobot`). `mcap` saves one MCAP file per episode. See [MCAP Recording](/operations/mcap). |
 | `--operator TEXT` | Who is recording. Saved in each MCAP episode. |
-| `--mcap_video_codec {h265,h264}` | Video codec of MCAP episodes (default: `h265`). |
+| `--mcap_video_codec {h264,h265}` | Video codec of MCAP episodes (default: `h264`). |
 | `--mcap_topics TEXT` | Rename MCAP topics, as `default=new` pairs separated by commas. See [Rename topics](/operations/mcap#rename-topics). |
 | `--fps INT` | Dataset frame rate (default: 30). It can't be higher than the camera capture rate. The headset stream is separate. |
 | `--dataset_resolution {SVGA,HD1080,HD1200}` | Resolution of the dataset video (default: `SVGA`, 960×600). The headset still gets full resolution. A resumed dataset keeps its original resolution. |
