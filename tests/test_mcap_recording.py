@@ -983,7 +983,7 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(metadata["recording"]["wrist_left.gaps"], "1")
         self.assertEqual(metadata["recording"]["wrist_left.missing_frames"], "1")
         self.assertEqual(metadata["recording"]["joint_samples"], "120")
-        self.assertEqual(metadata["calibration"]["calibration_passed"], "not checked")
+        self.assertNotIn("calibration_passed", metadata["calibration"])
         self.assertEqual(len(metadata["calibration"]["calibration_id"]), 16)
         self.assertNotEqual(metadata["calibration"]["calibration_date"], "")
         self.assertEqual(metadata["calibration"]["wrist_right.file"], "missing")

@@ -484,12 +484,11 @@ class McapSession:
 
 
 def calibration_metadata(scene: Scene) -> dict[str, Any]:
-    """Which calibration the episode used, when it is from, and its status.
+    """Which calibration the episode used, and when it is from.
 
-    Camera mounts come from the robot's URDF (CAD), so there is no measured
-    pass/fail result. Intrinsics and the head stereo transform come from each
-    camera's factory calibration file; its date is when the ZED SDK saved that
-    file on this robot.
+    Camera mounts come from the robot's URDF (CAD). Intrinsics and the head
+    stereo transform come from each camera's factory calibration file; its
+    date is when the ZED SDK saved that file on this robot.
     """
     import hashlib
 
@@ -505,7 +504,6 @@ def calibration_metadata(scene: Scene) -> dict[str, Any]:
     out: dict[str, Any] = {
         "calibration_id": digest.hexdigest()[:16],
         "calibration_date": (iso_utc(int(newest * 1e9)) if newest is not None else ""),
-        "calibration_passed": "not checked",
         "camera_mounts": f"CAD positions from {scene.urdf_name}",
         "urdf_sha256": scene.urdf_sha256,
         "intrinsics": "ZED factory calibration",

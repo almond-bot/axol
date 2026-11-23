@@ -168,9 +168,9 @@ Each file has four metadata records.
 | `episode` | `index`, `task`, `operator`, `outcome` (`success` or `failure`), `start_time`, `end_time`, `duration_s`, `end_gesture_time` |
 | `robot` | `serial`, `model`, `gripper`, `jelly`, `software_version`, `hostname` |
 | `recording` | Frame counts, measured frame rate, gaps and missing frames for each camera, joint sample counts, and the clock offset |
-| `calibration` | `calibration_id`, `calibration_date`, `calibration_passed`, the source of each part, and each calibration file's name and SHA-256 |
+| `calibration` | `calibration_id`, `calibration_date`, the source of each part, and each calibration file's name and SHA-256 |
 
-`calibration_id` changes whenever the URDF or a camera's calibration file changes. `calibration_date` is when the ZED SDK saved the newest calibration file on this robot. `calibration_passed` is `not checked`, because the mounts come from CAD.
+`calibration_id` changes whenever the URDF or a camera's calibration file changes. `calibration_date` is when the ZED SDK saved the newest calibration file on this robot.
 
 A camera that drops an exposure leaves a gap, counted in `recording` as `gaps` and `missing_frames`.
 
