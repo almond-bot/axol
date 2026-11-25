@@ -59,7 +59,8 @@
             "root": "operations/data-collection",
             "pages": [
               "operations/data-collection-config",
-              "operations/mcap"
+              "operations/mcap",
+              "operations/camera-calibration"
             ]
           },
           {
@@ -140,7 +141,8 @@
                   "cli/inference-server",
                   "cli/policy-check",
                   "cli/migrate-dataset",
-                  "cli/mcap-check"
+                  "cli/mcap-check",
+                  "cli/calibration-cameras"
                 ]
               },
               {

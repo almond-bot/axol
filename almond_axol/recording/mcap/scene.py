@@ -30,9 +30,9 @@ from typing import Any
 
 import numpy as np
 
-from ...constants import urdf_arm_joint_names
+from ...constants import GRIPPER_TIP_OFFSET, PARCEL_GRIPPERS, urdf_arm_joint_names
 from .rings import JOINT_NAMES, SIDES
-from .urdf_tree import UrdfTree
+from .urdf_tree import UrdfTree, rpy_from_matrix
 from .zed_conf import (
     CalibrationFile,
     Intrinsics,
@@ -65,6 +65,13 @@ def camera_base_topic(camera: str) -> str:
 def imu_topic(camera: str) -> str:
     """The topic a camera's IMU samples go to (``/head/imu``)."""
     return f"{camera_base_topic(camera)}/imu"
+
+
+def imu_frame_id(camera: str) -> str:
+    """A camera IMU's frame (``head_camera_imu`` for the head camera)."""
+    if camera == "overhead":
+        return "head_camera_imu"
+    return f"{camera}_imu"
 
 
 def camera_frame_id(camera: str, eye: str | None) -> str:
@@ -139,6 +146,14 @@ class CameraSource:
         )
 
 
+def _set_origin(joint: ElementTree.Element, transform: np.ndarray) -> None:
+    origin = joint.find("origin")
+    if origin is None:
+        origin = ElementTree.SubElement(joint, "origin")
+    origin.set("xyz", " ".join(repr(float(v)) for v in transform[:3, 3]))
+    origin.set("rpy", " ".join(repr(v) for v in rpy_from_matrix(transform[:3, :3])))
+
+
 def finger_travel(path: Path, tree: UrdfTree) -> tuple[float, float] | None:
     """``(closed, stroke)`` of the left finger joint, or ``None`` without one.
 
@@ -211,6 +226,9 @@ class Scene:
     lift_travel: float = 0.0
     stereo: np.ndarray | None = None
     stereo_source: str = ""
+    # Where each gripper's fingers close, in its mount link (None: no
+    # gripper, or one without a defined tool centre).
+    tool_offset: tuple[float, float, float] | None = None
 
     @classmethod
     def build(
@@ -222,6 +240,7 @@ class Scene:
         jelly_lift: bool,
         cameras: dict[str, CameraSource],
         calibration_dir: Path,
+        gripper: str | None = None,
     ) -> Scene:
         urdf_path = Path(urdf_path)
         raw = urdf_path.read_bytes()
@@ -240,6 +259,8 @@ class Scene:
         }
         if has_gripper:
             scene.finger = finger_travel(urdf_path, tree)
+            if gripper not in PARCEL_GRIPPERS:
+                scene.tool_offset = GRIPPER_TIP_OFFSET
         lift = tree.joints.get(LIFT_JOINT)
         if lift is not None and lift.upper is not None:
             scene.lift_travel = float(lift.upper)
@@ -344,32 +365,71 @@ class Scene:
         return (1.0 - min(max(raised, 0.0), 1.0)) * self.lift_travel
 
     def static_transforms(self) -> list[tuple[str, str, np.ndarray]]:
-        """Every ``/tf_static`` transform: fixed joints and assumed joints.
+        """Every ``/tf_static`` transform without a camera calibration file.
 
-        With a factory stereo calibration, the right head eye is placed from
-        the left one by the measured transform instead of the CAD baseline.
+        See :func:`.mounts.resolve` for the sources (URDF, the ZED factory
+        stereo calibration, tool centres).
         """
-        out: list[tuple[str, str, np.ndarray]] = []
-        tree = self.tree
-        left_eye = tree.parent_joint.get("head_camera_left_optical")
-        right_eye = tree.parent_joint.get("head_camera_right_optical")
-        for parent, child, transform in tree.static_transforms():
-            if (
-                self.stereo is not None
-                and child == "head_camera_right_optical"
-                and left_eye is not None
-                and right_eye is not None
-                and left_eye.parent == parent
-                and not left_eye.moving
-            ):
-                transform = left_eye.origin @ self.stereo
-            out.append((parent, child, transform))
-        for name in self.assumed_joints():
-            joint = tree.joints[name]
-            out.append(
-                (joint.parent, joint.child, joint.transform(tree.value(joint, {})))
-            )
+        from .mounts import resolve
+
+        return [(f.parent, f.child, f.transform) for f in resolve(self).frames]
+
+    def tool_frames(self) -> list[tuple[str, str, np.ndarray]]:
+        """``(<side>_gripper, <side>_tcp, transform)``: where the fingers close."""
+        if self.tool_offset is None:
+            return []
+        out = []
+        for side in SIDES:
+            mount, tcp = f"{side}_gripper", f"{side}_tcp"
+            if self.tree.has_link(mount) and not self.tree.has_link(tcp):
+                transform = np.eye(4)
+                transform[:3, 3] = self.tool_offset
+                out.append((mount, tcp, transform))
         return out
+
+    def imu_camera(self, topic: str) -> CameraSource | None:
+        """The camera whose IMU publishes on ``topic``."""
+        for camera in self.cameras.values():
+            if imu_topic(camera.camera) == topic:
+                return camera
+        return None
+
+    def imu_frame_for(self, topic: str) -> str | None:
+        """The IMU frame of the camera whose IMU publishes on ``topic``."""
+        camera = self.imu_camera(topic)
+        return imu_frame_id(camera.camera) if camera is not None else None
+
+    def imu_parent(self, imu_frame: str) -> str | None:
+        """The optical frame a camera IMU's factory pose is given in."""
+        for camera in self.cameras.values():
+            if imu_frame_id(camera.camera) == imu_frame:
+                return camera_frame_id(camera.camera, "left")
+        return None
+
+    def robot_description(
+        self,
+        edges: dict[str, np.ndarray],
+        added: list[tuple[str, str, np.ndarray]],
+    ) -> str:
+        """The URDF with measured joint origins (``edges``, by child link) and
+        the ``added`` frames, so the robot model matches ``/tf_static``."""
+        if not edges and not added:
+            return self.tree.xml
+        root = ElementTree.fromstring(self.tree.xml)
+        for el in root.findall("joint"):
+            child = el.find("child")
+            link = child.get("link") if child is not None else None
+            if link in edges:
+                _set_origin(el, edges[link])
+        for parent, child, transform in added:
+            ElementTree.SubElement(root, "link", name=child)
+            joint = ElementTree.SubElement(
+                root, "joint", name=f"{child}_joint", type="fixed"
+            )
+            ElementTree.SubElement(joint, "parent", link=parent)
+            ElementTree.SubElement(joint, "child", link=child)
+            _set_origin(joint, transform)
+        return ElementTree.tostring(root, encoding="unicode")
 
     def imus(self) -> dict[str, tuple[str, str]]:
         """``{topic: (socket path, frame_id)}`` for every camera IMU recorded.

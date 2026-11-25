@@ -38,11 +38,14 @@ from .rings import (
     mode_name,
     tick_ring_keys,
 )
+from .mounts import EpisodeFrames, resolve
 from .scene import BASE_JOINTS, LIFT_JOINT, CameraSource, Scene
 from .urdf_tree import pose7, quaternion_xyzw
 from .writer import EpisodeFile
 
 FORMAT_VERSION = "1"
+# The camera calibration file used, attached to the episode under this name.
+CALIBRATION_ATTACHMENT = "camera_calibration.json"
 # A command whose application the realtime core hasn't reported within this
 # long (s, on the joint feed's clock) is written with its application unknown:
 # it was superseded before the core used it, or rejected.
@@ -87,8 +90,12 @@ class EpisodeRecording:
         clock_offset_ns: int,
         wheel_signs: dict[int, float] | None = None,
         topic_names: dict[str, str] | None = None,
+        frames: EpisodeFrames | None = None,
     ) -> None:
         self.scene = scene
+        # The static frames: camera mounts from the calibration file when
+        # there is one (see .mounts), else from the URDF.
+        self.frames = frames if frames is not None else resolve(scene)
         self.start_perf = float(start_perf)
         self.file = EpisodeFile(
             path, clock_offset_ns=clock_offset_ns, topic_names=topic_names
@@ -204,13 +211,14 @@ class EpisodeRecording:
     def _write_static(self) -> None:
         stamp = self.stamp(self.start_perf)
         static = []
-        for parent, child, transform in self.scene.static_transforms():
+        for frame in self.frames.frames:
+            transform = frame.transform
             t = transform[:3, 3]
             static.append(
                 (
                     stamp,
-                    parent,
-                    child,
+                    frame.parent,
+                    frame.child,
                     (float(t[0]), float(t[1]), float(t[2])),
                     quaternion_xyzw(transform[:3, :3]),
                 )
@@ -221,9 +229,17 @@ class EpisodeRecording:
         self.file.write(
             "/robot_description",
             "std_msgs/String",
-            messages.string_message(self.scene.tree.xml),
+            messages.string_message(
+                self.scene.robot_description(self.frames.edges, self.frames.added)
+            ),
             stamp,
         )
+        calibration = self.frames.calibration
+        if calibration is not None:
+            # The file itself, so the measured values can be checked later.
+            self.file.attachment(
+                CALIBRATION_ATTACHMENT, "application/json", calibration.raw, stamp
+            )
 
     # -- video ---------------------------------------------------------------
 

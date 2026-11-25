@@ -38,11 +38,13 @@ import shutil
 import socket
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from ...camera_calibration.file import DEFAULT_PATH as DEFAULT_CALIBRATION_PATH
 from ...video.shm_frames import SnapshotReader, SnapshotWriter
 from .episode import FORMAT_VERSION, EpisodeRecording, iso_utc
 from .rings import (
@@ -52,6 +54,7 @@ from .rings import (
     tick_ring_keys,
 )
 from .imu import ImuReceiver
+from .mounts import EpisodeFrames, episode_frames
 from .scene import CameraSource, Scene
 from .topics import format_topic_names
 
@@ -84,6 +87,19 @@ def episode_indices(root: Path) -> list[int]:
 
 def episode_path(root: Path, index: int) -> Path:
     return Path(root) / f"episode_{index:06d}.mcap"
+
+
+def compute_serial() -> str:
+    """The onboard computer's serial number (a Jetson's), or ``""``."""
+    for path in (
+        "/proc/device-tree/serial-number",
+        "/sys/firmware/devicetree/base/serial-number",
+    ):
+        try:
+            return Path(path).read_bytes().strip(b"\0\n ").decode(errors="replace")
+        except OSError:
+            continue
+    return ""
 
 
 def clock_offset_ns() -> int:
@@ -129,10 +145,22 @@ class McapSession:
         self.wheel_signs: dict[int, float] = dict(config.get("wheel_signs") or {})
         # Renamed topics (default name -> customer's name), see .topics.
         self.topic_names: dict[str, str] = dict(config.get("topic_names") or {})
-        # One receiver per camera IMU: {topic: (receiver, frame_id)}.
+        # One receiver per camera IMU: {topic: (receiver, left optical frame)}.
         self.imus: dict[str, tuple[Any, str]] = {}
+        # The camera calibration file (see almond_axol.camera_calibration),
+        # read again at the start of every episode.
+        self.calibration_path = Path(
+            config.get("camera_calibration_path") or DEFAULT_CALIBRATION_PATH
+        ).expanduser()
+        self.frames: EpisodeFrames | None = None
+        # The frame each IMU topic is written in this episode.
+        self.imu_frames: dict[str, str] = {}
+        self._calibration_note: str | None = None
+        self._imu_pose_warned: set[str] = set()
         self.episode: EpisodeRecording | None = None
         self.episode_index = 0
+        self.episode_uuid = ""
+        self.compute_serial = compute_serial()
         self.task = ""
         self.capture_error: str | None = None
         self.on_error: Any = None
@@ -185,6 +213,7 @@ class McapSession:
                 jelly_lift=bool(config.get("jelly_lift", False)),
                 cameras=sources,
                 calibration_dir=Path(config["calibration_dir"]),
+                gripper=config.get("gripper"),
             )
         except BaseException:
             for reader in readers.values():
@@ -236,6 +265,7 @@ class McapSession:
                 reset()
         indices = episode_indices(self.root)
         self.episode_index = indices[-1] + 1 if indices else 0
+        self.episode_uuid = str(uuid.uuid4())
         self.task = task
         start_perf = time.perf_counter()
         self.capture_error = None
@@ -246,6 +276,7 @@ class McapSession:
         self._joint_after = self.joint_reader.published()
         for receiver, _frame_id in self.imus.values():
             receiver.drain()  # samples from between takes
+        self.frames = self._episode_frames()
         self.episode = EpisodeRecording(
             episode_path(self.root, self.episode_index),
             scene=self.scene,
@@ -253,12 +284,61 @@ class McapSession:
             clock_offset_ns=clock_offset_ns(),
             wheel_signs={int(k): float(v) for k, v in self.wheel_signs.items()},
             topic_names=self.topic_names,
+            frames=self.frames,
         )
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._capture_loop, name="mcap-capture", daemon=True
         )
         self._thread.start()
+
+    def _episode_frames(self) -> EpisodeFrames:
+        """This episode's static frames, from the calibration file if usable."""
+        imu_poses: dict[str, np.ndarray] = {}
+        self.imu_frames = {}
+        for topic, (receiver, optical) in self.imus.items():
+            frame = self.scene.imu_frame_for(topic)
+            pose = getattr(receiver, "pose", None)
+            if frame is not None and pose is not None:
+                imu_poses[frame] = pose
+                self.imu_frames[topic] = frame
+            else:
+                self.imu_frames[topic] = optical
+                if (
+                    getattr(receiver, "received", 0)
+                    and topic not in self._imu_pose_warned
+                ):
+                    self._imu_pose_warned.add(topic)
+                    _logger.warning(
+                        "%s is recorded in %s: the ZED camera plugins don't send "
+                        "the IMU's position. Run `axol gst.build-zed` to update them.",
+                        topic,
+                        optical,
+                    )
+        frames = episode_frames(
+            self.scene,
+            self.calibration_path,
+            self.config.get("robot_serial") or None,
+            imu_poses,
+        )
+        note = frames.problem or None
+        if note != self._calibration_note:
+            self._calibration_note = note
+            if note:
+                _logger.warning(
+                    "Camera calibration not used: %s. Episodes record the camera "
+                    "positions from CAD. Run `axol calibration.cameras` to "
+                    "calibrate.",
+                    note,
+                )
+            elif frames.calibration is not None:
+                _logger.info(
+                    "Camera calibration %s (%s): cameras %s.",
+                    frames.calibration.calibration_id,
+                    frames.calibration.calibrated_at or "undated",
+                    frames.status,
+                )
+        return frames
 
     def _fail(self, message: str) -> None:
         if self.capture_error is None:
@@ -295,12 +375,12 @@ class McapSession:
             moved = True
             if not paused:
                 episode.add_tick_rows(rows)
-        for topic, (receiver, frame_id) in self.imus.items():
+        for topic, (receiver, optical) in self.imus.items():
             samples = receiver.drain()
             if samples:
                 moved = True
                 if not paused:
-                    episode.add_imu(topic, frame_id, samples)
+                    episode.add_imu(topic, self.imu_frames.get(topic, optical), samples)
         return moved
 
     def _capture_loop(self) -> None:
@@ -404,8 +484,10 @@ class McapSession:
             (end if end is not None else end_perf) - begin
             for begin, end in self._pauses
         )
+        custom = {str(k): v for k, v in (config.get("episode_metadata") or {}).items()}
         episode_meta = {
             "index": self.episode_index,
+            "uuid": self.episode_uuid,
             "task": self.task,
             "operator": config.get("operator") or "",
             "outcome": outcome or "success",
@@ -427,6 +509,7 @@ class McapSession:
             "jelly": "yes" if (scene.jelly_wheels or scene.jelly_lift) else "no",
             "software_version": config.get("software_version") or "",
             "hostname": socket.gethostname(),
+            "compute_serial": self.compute_serial,
         }
         recording_meta: dict[str, Any] = {
             "format_version": FORMAT_VERSION,
@@ -466,6 +549,11 @@ class McapSession:
             count = episode.imu_samples.get(topic, 0)
             recording_meta[f"{key}.samples"] = count
             recording_meta[f"{key}.rate_hz"] = f"{count / duration:.1f}"
+            recording_meta[f"{key}.frame_id"] = self.imu_frames.get(topic, "")
+            imu_camera = scene.imu_camera(topic)
+            recording_meta[f"{key}.serial"] = (
+                imu_camera.serial if imu_camera is not None else ""
+            )
         missing_imu = sorted(
             {
                 c.camera
@@ -482,19 +570,28 @@ class McapSession:
             "episode": episode_meta,
             "robot": robot_meta,
             "recording": recording_meta,
-            "calibration": calibration_metadata(scene),
+            "calibration": calibration_metadata(scene, self.frames),
+            **({"custom": custom} if custom else {}),
         }
 
 
-def calibration_metadata(scene: Scene) -> dict[str, Any]:
+def calibration_metadata(
+    scene: Scene, frames: EpisodeFrames | None = None
+) -> dict[str, Any]:
     """Which calibration the episode used, and when it is from.
 
-    Camera mounts come from the robot's URDF (CAD). Intrinsics and the head
-    stereo transform come from each camera's factory calibration file; its
-    date is when the ZED SDK saved that file on this robot.
+    Camera mounts come from the camera calibration file when it was used
+    (``calibration_*``), else from the URDF (CAD); ``tf_sources`` names the
+    source of every static transform. Intrinsics and the head stereo
+    transform come from each camera's ZED factory calibration file; its date
+    is when the ZED SDK saved that file on this robot.
     """
     import hashlib
 
+    from .mounts import resolve
+
+    if frames is None:
+        frames = resolve(scene)
     files = {
         cam.calibration.serial: cam.calibration
         for cam in scene.cameras.values()
@@ -504,16 +601,26 @@ def calibration_metadata(scene: Scene) -> dict[str, Any]:
     for serial in sorted(files):
         digest.update(files[serial].sha256.encode())
     newest = max((f.mtime for f in files.values()), default=None)
+    used = frames.calibration
+    sources = frames.sources()
     out: dict[str, Any] = {
-        "calibration_id": digest.hexdigest()[:16],
-        "calibration_date": (iso_utc(int(newest * 1e9)) if newest is not None else ""),
-        "camera_mounts": f"CAD positions from {scene.urdf_name}",
+        "calibration_status": frames.status,
+        "calibration_id": used.calibration_id if used is not None else "",
+        "calibrated_at": used.calibrated_at if used is not None else "",
+        "calibration_file": used.path.name if used is not None else "",
+        "calibration_file_sha256": used.sha256 if used is not None else "",
+        "calibration_problem": frames.problem,
+        "calibration_skipped": "; ".join(frames.skipped),
+        "tf_sources": ", ".join(f"{child}={src}" for child, src in sources.items()),
         "urdf_sha256": scene.urdf_sha256,
         "intrinsics": "ZED factory calibration",
+        "intrinsics_id": digest.hexdigest()[:16],
+        "intrinsics_date": (iso_utc(int(newest * 1e9)) if newest is not None else ""),
         "head_stereo": scene.stereo_source or "CAD baseline from the URDF",
     }
     for cam in scene.cameras.values():
         prefix = cam.topic.strip("/").replace("/", "_")
+        out[f"{prefix}.extrinsics"] = sources.get(cam.frame_id, "")
         if cam.calibration is None:
             out[f"{prefix}.file"] = "missing"
             continue

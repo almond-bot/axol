@@ -168,6 +168,10 @@ class ZedSdkCameraConfig:
         warmup_s:   Seconds to read frames during connect() before returning.
         stereo:     Open the camera as a stereo ZED X (:class:`ZedSdkStereoCamera`).
                     Default False (mono ZED-X One).
+        unrectified: Deliver the raw sensor image (lens distortion kept, no
+                    stereo rectification) instead of the SDK's rectified one.
+                    Camera calibration uses this so its images match MCAP
+                    recordings and their factory intrinsics.
     """
 
     serial: int = 0
@@ -177,6 +181,7 @@ class ZedSdkCameraConfig:
     color_mode: str = "rgb"
     warmup_s: int = 1
     stereo: bool = False
+    unrectified: bool = False
 
     def __post_init__(self) -> None:
         mode = str(getattr(self.color_mode, "value", self.color_mode)).lower()
@@ -473,7 +478,10 @@ class ZedSdkCamera:
                     )
                     grab_failure_streak = 0
 
-                self.zed.retrieve_image(image)
+                if getattr(self.config, "unrectified", False):
+                    self.zed.retrieve_image(image, sl.VIEW.LEFT_UNRECTIFIED)
+                else:
+                    self.zed.retrieve_image(image)
                 raw = image.get_data()  # BGRA uint8 (height, width, 4)
                 # ``raw`` views the SDK Mat buffer, which is overwritten on the
                 # next grab; copy it (contiguous) so the relay thread can read
@@ -949,8 +957,12 @@ class ZedSdkStereoCamera:
                     )
                     grab_failure_streak = 0
 
-                self.zed.retrieve_image(left_mat, sl.VIEW.LEFT)
-                self.zed.retrieve_image(right_mat, sl.VIEW.RIGHT)
+                if getattr(self.config, "unrectified", False):
+                    self.zed.retrieve_image(left_mat, sl.VIEW.LEFT_UNRECTIFIED)
+                    self.zed.retrieve_image(right_mat, sl.VIEW.RIGHT_UNRECTIFIED)
+                else:
+                    self.zed.retrieve_image(left_mat, sl.VIEW.LEFT)
+                    self.zed.retrieve_image(right_mat, sl.VIEW.RIGHT)
 
                 # One grab → both eyes share the same capture instant.
                 cap_wall = (

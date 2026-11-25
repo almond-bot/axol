@@ -11,6 +11,13 @@ Each datagram is one packed, little-endian sample (:data:`PACKET`): the magic
 acceleration (m/s², gravity included), angular velocity (deg/s) and the IMU
 temperature (°C, NaN when unknown). The camera never waits for this reader:
 a sample sent while nothing is bound, or while the queue is full, is lost.
+
+Once a second the plugin also sends the IMU's pose in the camera's left
+optical frame (:data:`POSE_PACKET`, magic ``AXIP``): the camera's factory
+camera-to-IMU transform, translation in metres and a quaternion ``x, y, z,
+w``. The samples are given in that IMU frame. Plugins built before the pose
+packet send samples only; the recorder then labels them with the left optical
+frame.
 """
 
 from __future__ import annotations
@@ -26,11 +33,17 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+import numpy as np
+
 _logger = logging.getLogger(__name__)
 
 PACKET = struct.Struct("<4sIQ3f3ff")
 MAGIC = b"AXIM"
 VERSION = 1
+POSE_PACKET = struct.Struct("<4sI3f4f")
+POSE_MAGIC = b"AXIP"
+# A camera-to-IMU offset larger than this (m) is not a real one.
+_MAX_IMU_OFFSET_M = 0.2
 # Samples older than this when they arrive are stale (the SDK can hand out an
 # old sample right after the camera opens).
 _STALE_S = 2.0
@@ -67,6 +80,29 @@ def parse_packet(data: bytes, wall_minus_perf: float) -> ImuSample | None:
     )
 
 
+def parse_pose_packet(data: bytes) -> np.ndarray | None:
+    """The IMU's pose in the camera's left optical frame (4x4), or ``None``."""
+    if len(data) != POSE_PACKET.size:
+        return None
+    magic, version, tx, ty, tz, qx, qy, qz, qw = POSE_PACKET.unpack(data)
+    if magic != POSE_MAGIC or version != VERSION:
+        return None
+    values = (tx, ty, tz, qx, qy, qz, qw)
+    if not all(math.isfinite(v) for v in values):
+        return None
+    norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if abs(norm - 1.0) > 1e-3 or math.sqrt(tx * tx + ty * ty + tz * tz) > (
+        _MAX_IMU_OFFSET_M
+    ):
+        return None
+    from ...camera_calibration.file import quaternion_matrix
+
+    out = np.eye(4)
+    out[:3, :3] = quaternion_matrix((qx / norm, qy / norm, qz / norm, qw / norm))
+    out[:3, 3] = (tx, ty, tz)
+    return out
+
+
 class ImuReceiver:
     """Binds ``path`` and collects samples on a thread of its own."""
 
@@ -85,6 +121,9 @@ class ImuReceiver:
         self._samples: deque[ImuSample] = deque(maxlen=_MAX_SAMPLES)
         self.received = 0
         self.rejected = 0
+        # The IMU's pose in the camera's left optical frame, once the plugin
+        # has sent it.
+        self.pose: np.ndarray | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="mcap-imu", daemon=True)
         self._thread.start()
@@ -99,6 +138,13 @@ class ImuReceiver:
                 if not self._stop.is_set():
                     _logger.exception("IMU socket %s failed", self.path)
                 return
+            if data[:4] == POSE_MAGIC:
+                pose = parse_pose_packet(data)
+                if pose is None:
+                    self.rejected += 1
+                else:
+                    self.pose = pose
+                continue
             wall_minus_perf = time.time() - time.perf_counter()
             sample = parse_packet(data, wall_minus_perf)
             if sample is None or time.perf_counter() - sample.perf > _STALE_S:

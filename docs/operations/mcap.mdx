@@ -10,8 +10,8 @@ Each file holds:
 - every camera's video, encoded to H.264 or H.265 once on the robot and stored as is;
 - each camera's calibration, and the head camera's IMU;
 - the joints, commands, headset input and, on Jelly, the base;
-- the full transform tree, from the base to every camera;
-- the episode's task, operator, robot, software version, outcome and calibration ID.
+- the full transform tree, from the base to every camera, with the camera mounts measured on your Axol when it has a [camera calibration](/operations/camera-calibration);
+- the episode's ID, task, operator, robot, software version, outcome and calibration.
 
 Every sample is stored at its own time, on one clock. Nothing is resampled and no frame is repeated to fill a gap.
 
@@ -19,7 +19,9 @@ Every sample is stored at its own time, on one clock. Nothing is resampled and n
 
 1. In the control panel, open **Settings**, then **Recording**, and set **Recording format** to `mcap`. On the command line, add `--format mcap`.
 2. Choose the video size and rate. In **Axol settings**, open **Cameras** and set **Recording resolution**. Set **Recording fps** under **Settings**, then **Recording**. For 1920x1200 at 60 fps, choose `HD1200` and `60`.
-3. In the **Collect data** form, type your name in **Operator**. It is saved in every episode and kept for the next session.
+3. In the **Collect data** form, type your name or ID in **Operator**. It is saved in every episode and kept for the next session.
+4. To save more details with every episode, fill in **Episode metadata** in the same form, as `key=value` pairs separated by commas. For example: `task_id=pick-12, site=lab-2`. On the command line, use `--episode_metadata`.
+5. [Calibrate the cameras](/operations/camera-calibration), so episodes place them from measurements.
 
 **Streaming resolution** only sets the headset's picture. Collect data captures at the larger of the two resolutions, so you can record at `HD1200` and stream `SVGA` to keep the headset and the Jetson's encoders lighter.
 
@@ -56,8 +58,8 @@ Plan for storage. Every frame is a keyframe, so each 1920x1200 camera at 60 fps 
 | `/base/command` | `almond_msgs/BaseCommand` | Each command | The drive and lift command sent to Jelly. See [Commands](#commands). |
 | `/base/cmd_vel` | `geometry_msgs/TwistStamped` | On change | The speed Jelly's wheels are driven at, in m/s and rad/s. |
 | `/tf` | `tf2_msgs/TFMessage` | As measured | Every moving joint: the arms and grippers at 240 Hz, Jelly's base at 50 Hz, the lift when it moves. |
-| `/tf_static` | `tf2_msgs/TFMessage` | Once | Every fixed joint, including the camera mounts. |
-| `/robot_description` | `std_msgs/String` | Once | The robot's URDF. |
+| `/tf_static` | `tf2_msgs/TFMessage` | Once, at the start | Every fixed frame: the camera mounts, each gripper's tool centre and the head camera's IMU. See [Frames](#frames). |
+| `/robot_description` | `std_msgs/String` | Once, at the start | The robot's URDF, with the same camera mounts as `/tf_static`. |
 
 The `/base` topics appear on Axol on Jelly only. Time stamps are Unix time. Each message's log time is its header stamp.
 
@@ -139,7 +141,9 @@ Only the names change. The message types stay the same. Collect data won't start
 - `angular_velocity` in rad/s;
 - no orientation (`orientation_covariance[0]` is `-1`).
 
-The axes are those of the left head camera's optical frame, `head_camera_left_optical`: x to the right, y down and z forward.
+The samples are in the IMU's own frame, `head_camera_imu`. `/tf_static` places it in `head_camera_left_optical` with the camera's factory camera-to-IMU transform.
+
+If the episode's `recording` metadata gives `head_imu.frame_id` as `head_camera_left_optical`, the ZED camera plugins need updating. The samples are then labelled with the optical frame. Run [`axol gst.build-zed`](/cli/gst-build-zed) once to fix it.
 
 The IMU needs the ZED camera plugins that come with this version of Axol. If the episode's `recording` metadata has `imu_missing`, run [`axol gst.build-zed`](/cli/gst-build-zed) once, then record again. With a ZED SDK older than 5.1 the IMU is recorded once per video frame instead.
 
@@ -156,23 +160,58 @@ Browser versions of Foxglove play H.265 only on computers with hardware H.265 de
 | What | Source |
 |---|---|
 | Intrinsics (`camera_info`) | Each camera's ZED factory calibration, scaled to the recorded size. The head camera uses `plumb_bob`. A fisheye calibration, as on the wrist cameras, uses `equidistant`. |
-| Head stereo baseline | The head camera's factory calibration. It places `head_camera_right_optical` in `/tf_static`. |
-| Camera mounts | The URDF's camera frames, from the CAD of the mounts and the cameras. |
+| Head stereo baseline | The head camera's factory calibration. It places `head_camera_right_optical` relative to `head_camera_left_optical`. |
+| Camera mounts | The robot's [camera calibration](/operations/camera-calibration) when it has one. Otherwise the URDF's camera frames, from the CAD of the mounts and the cameras. |
+| Head camera IMU | The head camera's factory camera-to-IMU transform. |
 
-The camera mounts are not measured on each robot. The episode's `calibration` metadata records this. If a camera has no factory calibration file on the robot, its `camera_info` is left out and the metadata says `missing`. Open each camera once with the ZED SDK to fetch its file.
+If a camera has no factory calibration file on the robot, its `camera_info` is left out and the metadata says `missing`. Open each camera once with the ZED SDK to fetch its file.
+
+### Camera mounts
+
+At the start of each episode, Collect data reads the robot's camera calibration file. It uses the file when the file passed and names this robot.
+
+- The tree keeps the URDF's shape. Each measured camera's own fixed joint is set so the camera lands where the file says. A TF lookup between a transform's two frames in the file returns the file's values.
+- `/robot_description` carries the same measured joints, so the robot model and `/tf_static` agree.
+- The file itself is attached to the episode as `camera_calibration.json`.
+
+The `calibration` metadata says what was used:
+
+| Key | Contents |
+|---|---|
+| `calibration_status` | `calibrated` when every recorded camera is placed from the file, `partial` when some are, `uncalibrated` when none are. |
+| `calibration_id`, `calibrated_at` | The file's ID and date. Empty when no file was used. |
+| `calibration_file`, `calibration_file_sha256` | The file's name and SHA-256. |
+| `calibration_problem` | Why no file was used, such as no file or a file for another robot. |
+| `calibration_skipped` | Transforms in the file that were not used, and why. |
+| `tf_sources` | The source of every `/tf_static` transform: `calibration`, `zed_factory`, `urdf`, `gripper_model`, or `urdf_at_zero` for a moving joint nothing measures. |
+| `<camera>.extrinsics` | The source of each camera's mount. |
+
+### Frames
+
+| Frame | What it is |
+|---|---|
+| `world` | Where Jelly started the episode (Axol on Jelly). |
+| `jelly` | Jelly's base. It moves in `/tf`. |
+| `root` | Axol's torso, above the lift. The head camera is fixed to it. |
+| `left_w2`, `right_w2` | Each arm's last link. The wrist camera and gripper are fixed to it. |
+| `head_camera_left_optical`, `head_camera_right_optical` | The head camera's eyes. |
+| `left_wrist_camera_optical`, `right_wrist_camera_optical` | The wrist cameras. |
+| `head_camera_imu` | The head camera's IMU. |
+| `left_tcp`, `right_tcp` | Where each gripper's fingers close, 145 mm out from the gripper mount (`left_gripper`). |
+
+Optical frames have z forward out of the lens, x to the right and y down in the image. Each optical frame is the `frame_id` of its camera's video and `camera_info`.
 
 ## Metadata
 
-Each file has four metadata records.
+Each file has these metadata records.
 
 | Record | Keys |
 |---|---|
-| `episode` | `index`, `task`, `operator`, `outcome` (`success` or `failure`), `start_time`, `end_time`, `duration_s`, `end_gesture_time` |
-| `robot` | `serial`, `model`, `gripper`, `jelly`, `software_version`, `hostname` |
-| `recording` | Frame counts, measured frame rate, gaps and missing frames for each camera, joint sample counts, and the clock offset |
-| `calibration` | `calibration_id`, `calibration_date`, the source of each part, and each calibration file's name and SHA-256 |
-
-`calibration_id` changes whenever the URDF or a camera's calibration file changes. `calibration_date` is when the ZED SDK saved the newest calibration file on this robot.
+| `episode` | `index`, `uuid` (unique to each episode), `task`, `operator`, `outcome` (`success` or `failure`), `start_time`, `end_time`, `duration_s`, `paused_s`, `end_gesture_time` |
+| `robot` | `serial` (the Axol hub serial), `model`, `gripper`, `jelly`, `software_version`, `hostname`, `compute_serial` (the Jetson's serial) |
+| `recording` | Frame counts, measured frame rate, gaps and missing frames for each camera with its serial and frame, joint sample counts, the IMU's frame and serial, and the clock offset |
+| `calibration` | The camera calibration used (see [Camera mounts](#camera-mounts)), and each camera's factory calibration file with its name, SHA-256 and date (`intrinsics_id`, `intrinsics_date`) |
+| `custom` | The **Episode metadata** pairs, when there are any |
 
 A camera that drops an exposure leaves a gap, counted in `recording` as `gaps` and `missing_frames`.
 
@@ -182,7 +221,7 @@ On Axol on Jelly, `/base/odom` gives Jelly's position and heading relative to wh
 
 ## Check an episode
 
-Run [`axol mcap.check`](/cli/mcap-check) on a file to confirm it has every topic, its frame rates and gaps, and its calibration:
+Run [`axol mcap.check`](/cli/mcap-check) on a file to confirm it has every topic, its frame rates and gaps, a sound transform tree, and its calibration:
 
 ```bash
 axol mcap.check ~/.cache/huggingface/lerobot/myorg/pick/episode_000000.mcap

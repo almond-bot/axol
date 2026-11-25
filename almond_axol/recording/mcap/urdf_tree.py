@@ -33,6 +33,22 @@ def rpy_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
     )
 
 
+def rpy_from_matrix(rotation: np.ndarray) -> tuple[float, float, float]:
+    """URDF ``(roll, pitch, yaw)`` of a rotation matrix (inverse of
+    :func:`rpy_matrix`)."""
+    m = rotation
+    sp = -float(m[2, 0])
+    if abs(sp) < 1.0 - 1e-12:
+        pitch = math.asin(sp)
+        roll = math.atan2(float(m[2, 1]), float(m[2, 2]))
+        yaw = math.atan2(float(m[1, 0]), float(m[0, 0]))
+    else:  # pitch at +-90 degrees: only roll - yaw (or + yaw) is defined
+        pitch = math.copysign(math.pi / 2, sp)
+        roll = 0.0
+        yaw = math.atan2(-float(m[0, 1]), float(m[1, 1]))
+    return roll, pitch, yaw
+
+
 def axis_angle_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
     x, y, z = axis
     c, s = math.cos(angle), math.sin(angle)

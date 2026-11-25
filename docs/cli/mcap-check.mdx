@@ -14,7 +14,7 @@ Pass several files to check them all. Each line starts with one of these:
 | Status | Meaning |
 |---|---|
 | `PASS` | The part is there and looks right. |
-| `WARN` | An optional part is missing. For example, a camera with no factory calibration file, or no headset input. |
+| `WARN` | An optional part is missing. For example, a camera with no factory calibration file, camera mounts from CAD, or no headset input. |
 | `FAIL` | The file is broken or contradicts itself. |
 
 The command exits with status 1 if any line is `FAIL`.
@@ -23,6 +23,8 @@ The checks follow what the file says it recorded, so any set of cameras can pass
 
 - each recorded camera's video: one codec, a keyframe on every frame, increasing timestamps, no repeated frames, and the measured frame rate;
 - a transform path from the root of the tree to each recorded camera;
+- one `/tf_static` message before the first camera frame, with unit quaternions, one root, and each frame placed once;
+- the camera mounts: measured or from CAD, and, with a camera calibration, that each measured mount matches the file attached to the episode to within 1e-6;
 - each camera's `camera_info`, and that it matches the recorded image size;
 - the head camera's IMU, and whether it was left out;
 - the head stereo transform, when both head eyes are recorded;
@@ -30,6 +32,6 @@ The checks follow what the file says it recorded, so any set of cameras can pass
 - `/joint_command` and its `/joint_command/info`, with increasing `command_id` and the time the robot applied each command, and the end-effector targets;
 - renamed topics, read back through the file's `topic_names` metadata;
 - the headset input, and the base topics on Axol on Jelly;
-- the episode, robot and calibration metadata.
+- the episode and robot metadata.
 
 The checker needs only the `mcap` and `mcap-ros2-support` Python packages. To run it on another computer, install them and run its source file, `almond_axol/recording/mcap/check.py`, with Python.

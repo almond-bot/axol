@@ -12,10 +12,11 @@ codec, whether Axol was on Jelly), so any camera setup can pass. Each line is
 
 - ``FAIL``: the file is broken or contradicts itself (no video, a frame that
   is not a keyframe, timestamps out of order, a repeated frame, calibration
-  for the wrong image size, a camera the transform tree can't reach, missing
-  joint states or metadata).
+  for the wrong image size, a camera the transform tree can't reach, a broken
+  transform tree, camera mounts that differ from the attached calibration
+  file, missing joint states or metadata).
 - ``WARN``: something optional is absent, such as a camera with no factory
-  calibration file or no headset input.
+  calibration file, camera mounts from CAD, or no headset input.
 
 The exit status is 1 when any check fails.
 """
@@ -23,6 +24,9 @@ The exit status is 1 when any check fails.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import math
 import statistics
 import sys
 from collections import defaultdict
@@ -33,6 +37,12 @@ from typing import Any
 
 # NAL unit types of keyframes: H.264 IDR, H.265 BLA, IDR and CRA.
 _KEYFRAME_NALS = {"h264": (5,), "h265": tuple(range(16, 22))}
+# How close a recorded camera mount must be to its calibration file entry
+# (metres, and quaternion components).
+_MOUNT_TOLERANCE = 1e-6
+_CALIBRATION_ATTACHMENT = "camera_calibration.json"
+
+Pose = tuple[tuple[float, float, float], tuple[float, float, float, float]]
 
 
 @dataclass
@@ -53,6 +63,7 @@ class EpisodeSummary:
     video_frames: dict[str, str] = field(default_factory=dict)
     non_keyframes: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     repeated_frames: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    attachments: dict[str, bytes] = field(default_factory=dict)
 
 
 def _video_parts(data: bytes) -> tuple[str, bytes, str]:
@@ -103,6 +114,8 @@ def summarize(path: Path) -> EpisodeSummary:
         reader = make_reader(f)
         for record in reader.iter_metadata():
             out.metadata[record.name] = dict(record.metadata)
+        for attachment in reader.iter_attachments():
+            out.attachments[attachment.name] = bytes(attachment.data)
         # Renamed topics are checked under their default names.
         default_name = {
             new: old
@@ -142,6 +155,69 @@ def _topic_names(text: str) -> dict[str, str]:
     return out
 
 
+def _quat_mul(a: tuple[float, ...], b: tuple[float, ...]) -> tuple[float, ...]:
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+def _rotate(q: tuple[float, ...], v: tuple[float, ...]) -> tuple[float, ...]:
+    x, y, z, w = q
+    p = _quat_mul(_quat_mul(q, (v[0], v[1], v[2], 0.0)), (-x, -y, -z, w))
+    return p[:3]
+
+
+def _compose(a: Pose, b: Pose) -> Pose:
+    """``a`` then ``b`` (b given in a's child frame)."""
+    t = _rotate(a[1], b[0])
+    return (
+        (a[0][0] + t[0], a[0][1] + t[1], a[0][2] + t[2]),
+        _quat_mul(a[1], b[1]),  # type: ignore[return-value]
+    )
+
+
+def _inverse(a: Pose) -> Pose:
+    x, y, z, w = a[1]
+    q = (-x, -y, -z, w)
+    t = _rotate(q, a[0])
+    return ((-t[0], -t[1], -t[2]), q)
+
+
+def _static_lookup(
+    static: dict[str, tuple[str, Pose]], parent: str, child: str
+) -> Pose | None:
+    """``child``'s pose in ``parent`` through /tf_static alone, if connected."""
+
+    def to_top(frame: str) -> tuple[str, Pose]:
+        pose: Pose = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        seen = 0
+        while frame in static and seen < 1000:
+            up, step = static[frame]
+            pose = _compose(step, pose)
+            frame = up
+            seen += 1
+        return frame, pose
+
+    top_p, pose_p = to_top(parent)
+    top_c, pose_c = to_top(child)
+    if top_p != top_c:
+        return None
+    return _compose(_inverse(pose_p), pose_c)
+
+
+def _same_pose(a: Pose, b: Pose, tolerance: float) -> bool:
+    dt = max(abs(x - y) for x, y in zip(a[0], b[0], strict=True))
+    qa, qb = a[1], b[1]
+    sign = 1.0 if sum(x * y for x, y in zip(qa, qb, strict=True)) >= 0 else -1.0
+    dq = max(abs(x - sign * y) for x, y in zip(qa, qb, strict=True))
+    return dt <= tolerance and dq <= tolerance
+
+
 def _rate(times: list[int]) -> float:
     if len(times) < 2:
         return 0.0
@@ -172,6 +248,26 @@ def check(path: Path) -> list[Result]:
     dynamic = [t for m in s.decoded.get("/tf", []) for t in m.transforms]
     parents = {t.child_frame_id: t.header.frame_id for t in [*static, *dynamic]}
     roots = {p for p in parents.values() if p not in parents}
+    static_poses: dict[str, tuple[str, Pose]] = {
+        t.child_frame_id: (
+            t.header.frame_id,
+            (
+                (
+                    t.transform.translation.x,
+                    t.transform.translation.y,
+                    t.transform.translation.z,
+                ),
+                (
+                    t.transform.rotation.x,
+                    t.transform.rotation.y,
+                    t.transform.rotation.z,
+                    t.transform.rotation.w,
+                ),
+            ),
+        )
+        for t in static
+    }
+    _check_tf(s, add, static, dynamic, roots)
 
     # Video and calibration, for every camera the file has.
     cameras = sorted(topic[: -len("/video")] for topic in s.video_frames)
@@ -307,14 +403,137 @@ def check(path: Path) -> list[Result]:
     for record, key in (("robot", "serial"), ("episode", "operator")):
         value = meta.get(record, {}).get(key, "")
         add(True if value else None, f"{record}.{key}", value or "empty")
-    add(
-        bool(calibration.get("calibration_id")),
-        "calibration",
-        f"id {calibration.get('calibration_id', 'missing')}, "
-        f"date {calibration.get('calibration_date') or 'unknown'}, "
-        f"mounts: {calibration.get('camera_mounts', '?')}",
-    )
+    _check_calibration(s, add, calibration, static_poses)
     return results
+
+
+def _check_tf(
+    s: EpisodeSummary, add: Any, static: list[Any], dynamic: list[Any], roots: set[str]
+) -> None:
+    """One /tf_static message before the first frame, and a sound tree."""
+    times = s.times.get("/tf_static", [])
+    first_frame = min(
+        (t[0] for k, t in s.times.items() if k.endswith("/video") and t), default=None
+    )
+    early = bool(times) and (first_frame is None or times[0] <= first_frame)
+    if not times:
+        when = "missing"
+    elif first_frame is None:
+        when = "no camera frames to compare with"
+    else:
+        when = "before the first camera frame" if early else "after the first frame"
+    add(
+        len(times) == 1 and early,
+        "/tf_static",
+        f"{len(times)} message(s), {when}, {len(static)} transforms",
+    )
+    lengths = [
+        math.sqrt(
+            t.transform.rotation.x**2
+            + t.transform.rotation.y**2
+            + t.transform.rotation.z**2
+            + t.transform.rotation.w**2
+        )
+        for t in static
+    ]
+    worst = max((abs(n - 1.0) for n in lengths), default=0.0)
+    add(
+        worst <= _MOUNT_TOLERANCE,
+        "/tf_static rotations",
+        f"unit quaternions (worst {worst:.1e})",
+    )
+    children = [t.child_frame_id for t in static]
+    repeated = sorted({c for c in children if children.count(c) > 1})
+    moving = {t.child_frame_id for t in dynamic}
+    both = sorted(set(children) & moving)
+    add(
+        not repeated and not both,
+        "TF children",
+        "each frame has one parent"
+        if not repeated and not both
+        else "placed twice: " + ", ".join(repeated + both),
+    )
+    add(len(roots) == 1, "TF root", ", ".join(sorted(roots)) or "none")
+
+
+def _check_calibration(
+    s: EpisodeSummary,
+    add: Any,
+    calibration: dict[str, str],
+    static_poses: dict[str, tuple[str, Pose]],
+) -> None:
+    """The camera mounts: measured (and equal to the attached file) or CAD."""
+    if not calibration:
+        add(False, "calibration", "no calibration metadata")
+        return
+    status = calibration.get("calibration_status", "")
+    detail = {
+        "calibrated": "camera mounts measured",
+        "partial": "some camera mounts measured, the rest from CAD",
+        "uncalibrated": "camera mounts from CAD",
+    }.get(status, f"unknown status {status!r}")
+    if calibration.get("calibration_id"):
+        detail += (
+            f", calibration {calibration['calibration_id']} from "
+            f"{calibration.get('calibrated_at') or 'an unknown date'}"
+        )
+    if calibration.get("calibration_problem"):
+        detail += f" ({calibration['calibration_problem']})"
+    add(
+        True
+        if status == "calibrated"
+        else (None if status in ("partial", "uncalibrated") else False),
+        "calibration",
+        detail,
+    )
+    add(
+        bool(calibration.get("tf_sources")),
+        "calibration tf_sources",
+        "the source of every static transform"
+        if calibration.get("tf_sources")
+        else "missing",
+    )
+    raw = s.attachments.get(_CALIBRATION_ATTACHMENT)
+    if raw is None:
+        if status in ("calibrated", "partial"):
+            add(False, "calibration file", f"{_CALIBRATION_ATTACHMENT} is not attached")
+        return
+    digest = hashlib.sha256(raw).hexdigest()
+    add(
+        digest == calibration.get("calibration_file_sha256"),
+        "calibration file",
+        f"attached, SHA-256 {digest[:16]}",
+    )
+    try:
+        doc = json.loads(raw.decode())
+        entries = list(doc["transforms"])
+    except (ValueError, KeyError, TypeError):
+        add(False, "calibration file", "the attached file is not readable")
+        return
+    sources = dict(
+        pair.strip().split("=", 1)
+        for pair in calibration.get("tf_sources", "").split(",")
+        if "=" in pair
+    )
+    for entry in entries:
+        parent, child = str(entry.get("parent")), str(entry.get("child"))
+        if sources.get(child) != "calibration":
+            add(None, f"mount of {child}", "in the calibration file but not used")
+            continue
+        q = [float(v) for v in entry["rotation_xyzw"]]
+        n = math.sqrt(sum(v * v for v in q))
+        want: Pose = (
+            tuple(float(v) for v in entry["translation_m"]),  # type: ignore[assignment]
+            tuple(v / n for v in q),  # type: ignore[assignment]
+        )
+        got = _static_lookup(static_poses, parent, child)
+        add(
+            got is not None and _same_pose(got, want, _MOUNT_TOLERANCE),
+            f"mount of {child}",
+            f"{parent} to {child} matches the calibration file"
+            if got is not None and _same_pose(got, want, _MOUNT_TOLERANCE)
+            else f"{parent} to {child} differs from the calibration file",
+        )
 
 
 def main(argv: Iterable[str] | None = None) -> int:

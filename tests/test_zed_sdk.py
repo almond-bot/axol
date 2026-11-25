@@ -140,7 +140,12 @@ class ImportIsolationTests(unittest.TestCase):
 
         sdk_fields = {f.name: f.default for f in fields(zed_sdk.ZedSdkCameraConfig)}
         lerobot_fields = {f.name: f.default for f in fields(ZedCameraConfig)}
+        # Camera calibration's raw-image switch is SDK-only; the cameras read
+        # it with getattr, so a LeRobot config without it still works.
+        sdk_only = {"unrectified"}
         for name, default in sdk_fields.items():
+            if name in sdk_only:
+                continue
             self.assertIn(name, lerobot_fields)
             if name == "color_mode":
                 continue  # str vs. lerobot ColorMode enum with the same value

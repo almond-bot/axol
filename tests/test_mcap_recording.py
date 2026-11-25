@@ -783,6 +783,9 @@ class SessionTest(unittest.TestCase):
                 "software_version": "9.9.9",
                 "wheel_signs": dict(WHEEL_SIGNS),
                 "topic_names": getattr(self, "topic_names", {}),
+                "camera_calibration_path": str(
+                    Path(self._tmp.name) / "camera_calibration.json"
+                ),
             },
             cameras=self.readers,
             scene=self.scene,
@@ -1016,8 +1019,18 @@ class SessionTest(unittest.TestCase):
             metadata["recording"]["commands_without_application_time"], "0"
         )
         self.assertNotIn("calibration_passed", metadata["calibration"])
-        self.assertEqual(len(metadata["calibration"]["calibration_id"]), 16)
-        self.assertNotEqual(metadata["calibration"]["calibration_date"], "")
+        self.assertEqual(metadata["calibration"]["calibration_status"], "uncalibrated")
+        self.assertEqual(metadata["calibration"]["calibration_id"], "")
+        self.assertIn(
+            "no camera calibration", metadata["calibration"]["calibration_problem"]
+        )
+        self.assertEqual(len(metadata["calibration"]["intrinsics_id"]), 16)
+        self.assertNotEqual(metadata["calibration"]["intrinsics_date"], "")
+        self.assertIn(
+            "head_camera_right_optical=zed_factory",
+            metadata["calibration"]["tf_sources"],
+        )
+        self.assertEqual(len(metadata["episode"]["uuid"]), 36)
         self.assertEqual(metadata["calibration"]["wrist_right.file"], "missing")
 
         from almond_axol.recording.mcap.check import check
@@ -1041,7 +1054,10 @@ class SessionTest(unittest.TestCase):
         # 120 samples over half a second is 240 Hz.
         self.assertEqual(results["/joint_states"].status, "PASS")
         self.assertEqual(results["/wrist/right/camera_info"].status, "WARN")
-        self.assertEqual(results["calibration"].status, "PASS")
+        # Without a camera calibration file the mounts are CAD: a warning.
+        self.assertEqual(results["calibration"].status, "WARN")
+        for item in ("/tf_static", "/tf_static rotations", "TF children", "TF root"):
+            self.assertEqual(results[item].status, "PASS", (item, results[item]))
         self.assertFalse([r for r in results.values() if r.status == "FAIL"])
 
     def _record_and_check(
@@ -1666,3 +1682,353 @@ class StreamResolutionTest(unittest.TestCase):
             self.assertEqual((cam.stream_width, cam.stream_height), (1920, 1200))
             # An encoded-only camera has no GPU conversion at all.
             self.assertNotIn("nvvidconv", cam._pipeline_str())
+
+
+def _jelly_scene(directory: Path, gripper: str | None = None) -> Scene:
+    (directory / f"SN{HEAD_SERIAL}.conf").write_text(HEAD_CONF)
+    (directory / f"SN{LEFT_WRIST_SERIAL}.conf").write_text(FISHEYE_CONF)
+    raw_meta = {
+        "overhead_left": _meta("overhead", "left", HEAD_SERIAL, True),
+        "overhead_right": _meta("overhead", "right", HEAD_SERIAL, True),
+        "left_arm": _meta("left_arm", None, LEFT_WRIST_SERIAL, False),
+        "right_arm": _meta("right_arm", None, RIGHT_WRIST_SERIAL, False),
+    }
+    cameras = {src: CameraSource.from_meta(src, m) for src, m in raw_meta.items()}
+    return Scene.build(
+        urdf_path(AxolModel.MOBILE),
+        has_gripper=True,
+        jelly_wheels=True,
+        jelly_lift=True,
+        cameras=cameras,
+        calibration_dir=directory,
+        gripper=gripper,
+    )
+
+
+def _nudge(transform: np.ndarray, mm: float, deg: float) -> np.ndarray:
+    out = transform.copy()
+    out[:3, :3] = (
+        out[:3, :3]
+        @ Rotation.from_euler("xyz", [deg, -deg, deg / 2], degrees=True).as_matrix()
+    )
+    out[:3, 3] += np.array([mm, -mm, mm / 2]) / 1000.0
+    return out
+
+
+def _calibration_doc(scene: Scene, **overrides) -> dict:
+    from almond_axol.camera_calibration.file import document, transform_entry
+
+    tree = scene.tree
+    entries = [
+        transform_entry(
+            "root",
+            "head_camera_left_optical",
+            _nudge(tree.fk("root", "head_camera_left_optical", {}), 4, 0.5),
+            camera_serial=HEAD_SERIAL,
+        ),
+        transform_entry(
+            "left_w2",
+            "left_wrist_camera_optical",
+            _nudge(tree.fk("left_w2", "left_wrist_camera_optical", {}), 3, 1.0),
+            camera_serial=LEFT_WRIST_SERIAL,
+        ),
+        transform_entry(
+            "right_w2",
+            "right_wrist_camera_optical",
+            _nudge(tree.fk("right_w2", "right_wrist_camera_optical", {}), -2, 0.7),
+            camera_serial=RIGHT_WRIST_SERIAL,
+        ),
+    ]
+    doc = document(
+        robot_serial="HUB123",
+        calibration_id="cam-test-1",
+        calibrated_at="2026-11-24T18:15:00Z",
+        status="pass",
+        transforms=entries,
+    )
+    doc.update(overrides)
+    return doc
+
+
+class CameraMountsTest(unittest.TestCase):
+    """The calibration file placing the cameras in /tf_static."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.scene = _jelly_scene(self.dir)
+        self.path = self.dir / "camera_calibration.json"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _frames(self, doc: dict | None, serial: str | None = "HUB123", imu=None):
+        from almond_axol.camera_calibration.file import write
+        from almond_axol.recording.mcap.mounts import episode_frames
+
+        if doc is not None:
+            write(doc, self.path)
+        return episode_frames(self.scene, self.path, serial, imu)
+
+    @staticmethod
+    def _lookup(frames, parent: str, child: str) -> np.ndarray:
+        """``child`` in ``parent`` through the static frames (shared ancestor)."""
+        edges = {f.child: (f.parent, f.transform) for f in frames.frames}
+
+        def up(frame: str) -> list[tuple[str, np.ndarray]]:
+            chain = [(frame, np.eye(4))]
+            while frame in edges:
+                parent_, transform = edges[frame]
+                chain.append((parent_, transform @ chain[-1][1]))
+                frame = parent_
+            return chain
+
+        pc, cc = dict(up(parent)), up(child)
+        for link, pose in cc:
+            if link in pc:
+                return np.linalg.inv(pc[link]) @ pose
+        raise AssertionError(f"{parent} and {child} are not connected")
+
+    def test_file_places_every_camera_and_keeps_the_tree_shape(self) -> None:
+        from almond_axol.camera_calibration.file import load
+
+        doc = _calibration_doc(self.scene)
+        frames = self._frames(doc)
+        self.assertEqual(frames.status, "calibrated")
+        self.assertEqual(frames.problem, "")
+        self.assertEqual(frames.calibration.calibration_id, "cam-test-1")
+        sources = frames.sources()
+        for frame in (
+            "head_camera_left_optical",
+            "left_wrist_camera_optical",
+            "right_wrist_camera_optical",
+        ):
+            self.assertEqual(sources[frame], "calibration")
+        self.assertEqual(sources["head_camera_right_optical"], "zed_factory")
+        # Same parents as the URDF; each child once.
+        parents = {f.child: f.parent for f in frames.frames}
+        self.assertEqual(parents["head_camera_left_optical"], "head")
+        children = [f.child for f in frames.frames]
+        self.assertEqual(len(children), len(set(children)))
+        for entry in load(self.path).transforms:
+            np.testing.assert_allclose(
+                self._lookup(frames, entry.parent, entry.child),
+                entry.matrix(),
+                atol=1e-9,
+            )
+        # The right eye follows the measured left eye by the factory baseline.
+        baseline = np.linalg.inv(
+            self._lookup(frames, "head", "head_camera_left_optical")
+        ) @ self._lookup(frames, "head", "head_camera_right_optical")
+        np.testing.assert_allclose(baseline, self.scene.stereo, atol=1e-12)
+
+    def test_robot_description_matches_tf_static(self) -> None:
+        frames = self._frames(_calibration_doc(self.scene))
+        urdf = UrdfTree(self.scene.robot_description(frames.edges, frames.added))
+        for parent, child in (
+            ("root", "head_camera_left_optical"),
+            ("left_w2", "left_wrist_camera_optical"),
+            ("head", "head_camera_right_optical"),
+            ("left_gripper", "left_tcp"),
+        ):
+            np.testing.assert_allclose(
+                urdf.fk(parent, child, {}),
+                self._lookup(frames, parent, child),
+                atol=1e-9,
+                err_msg=child,
+            )
+
+    def test_tool_centres_follow_the_gripper(self) -> None:
+        from almond_axol.constants import GRIPPER_TIP_OFFSET
+
+        frames = self._frames(None)
+        tcp = {f.child: f for f in frames.frames if f.child.endswith("_tcp")}
+        self.assertEqual(set(tcp), {"left_tcp", "right_tcp"})
+        self.assertEqual(tcp["left_tcp"].parent, "left_gripper")
+        self.assertEqual(tcp["left_tcp"].source, "gripper_model")
+        np.testing.assert_allclose(tcp["left_tcp"].transform[:3, 3], GRIPPER_TIP_OFFSET)
+        parcel = _jelly_scene(self.dir, gripper="parcel_v1")
+        self.assertEqual(parcel.tool_frames(), [])
+
+    def test_head_imu_frame_from_the_camera(self) -> None:
+        pose = np.eye(4)
+        pose[:3, 3] = (0.01, -0.005, 0.002)
+        frames = self._frames(None, imu={"head_camera_imu": pose})
+        imu = next(f for f in frames.frames if f.child == "head_camera_imu")
+        self.assertEqual(imu.parent, "head_camera_left_optical")
+        self.assertEqual(imu.source, "zed_factory")
+        np.testing.assert_allclose(imu.transform, pose)
+
+    def test_missing_or_wrong_files_record_cad(self) -> None:
+        frames = self._frames(None)
+        self.assertEqual(frames.status, "uncalibrated")
+        self.assertIn("no camera calibration file", frames.problem)
+        self.assertEqual(frames.sources()["head_camera_left_optical"], "urdf")
+
+        frames = self._frames(_calibration_doc(self.scene), serial="OTHER")
+        self.assertEqual(frames.status, "uncalibrated")
+        self.assertIn("not this robot", frames.problem)
+
+        frames = self._frames(_calibration_doc(self.scene, status="fail"))
+        self.assertIn("failed calibration", frames.problem)
+
+        self.path.write_text("{not json")
+        frames = self._frames(None)
+        self.assertIn("not valid JSON", frames.problem)
+        self.assertIsNone(frames.calibration)
+
+    def test_swapped_camera_and_impossible_frames_are_skipped(self) -> None:
+        from almond_axol.camera_calibration.file import transform_entry
+
+        doc = _calibration_doc(self.scene)
+        doc["transforms"][1]["camera_serial"] = 999
+        # A wrist camera can't be placed in root: the arm moves in between.
+        doc["transforms"].append(transform_entry("root", "right_finger_1", np.eye(4)))
+        frames = self._frames(doc)
+        self.assertEqual(frames.status, "partial")
+        self.assertEqual(frames.sources()["left_wrist_camera_optical"], "urdf")
+        reasons = " ".join(frames.skipped)
+        self.assertIn("SN999", reasons)
+        self.assertIn("right_finger_1", reasons)
+
+
+class CalibratedSessionTest(unittest.TestCase):
+    """A recorded episode with a camera calibration file in use."""
+
+    tearDown = SessionTest.tearDown
+    _record = SessionTest._record
+    _record_and_check = SessionTest._record_and_check
+
+    def setUp(self) -> None:
+        SessionTest.setUp(self)  # type: ignore[arg-type]
+        from almond_axol.camera_calibration.file import write
+
+        write(
+            _calibration_doc(self.scene),
+            Path(self._tmp.name) / "camera_calibration.json",
+        )
+
+    def test_checker_passes_the_measured_mounts(self) -> None:
+        results = self._record_and_check(set(self.readers))
+        self.assertEqual(results["calibration"].status, "PASS", results["calibration"])
+        for frame in (
+            "head_camera_left_optical",
+            "left_wrist_camera_optical",
+            "right_wrist_camera_optical",
+        ):
+            item = f"mount of {frame}"
+            self.assertEqual(results[item].status, "PASS", results[item])
+        self.assertEqual(results["calibration file"].status, "PASS")
+        self.assertFalse([r for r in results.values() if r.status == "FAIL"])
+
+    def test_metadata_and_attachment(self) -> None:
+        self._record_and_check(set(self.readers))
+        path = self.root / "episode_000000.mcap"
+        with open(path, "rb") as f:
+            reader = make_reader(f)
+            meta = {m.name: dict(m.metadata) for m in reader.iter_metadata()}
+            attachments = {a.name: bytes(a.data) for a in reader.iter_attachments()}
+        calibration = meta["calibration"]
+        self.assertEqual(calibration["calibration_status"], "calibrated")
+        self.assertEqual(calibration["calibration_id"], "cam-test-1")
+        self.assertEqual(calibration["calibrated_at"], "2026-11-24T18:15:00Z")
+        self.assertEqual(calibration["head_left.extrinsics"], "calibration")
+        self.assertEqual(calibration["head_right.extrinsics"], "zed_factory")
+        import hashlib
+
+        raw = attachments["camera_calibration.json"]
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(), calibration["calibration_file_sha256"]
+        )
+
+
+class EpisodeMetadataTest(unittest.TestCase):
+    def test_pairs(self) -> None:
+        from almond_axol.recording.mcap.custom_metadata import parse_episode_metadata
+
+        self.assertEqual(
+            parse_episode_metadata("task_id=pick-12, site = lab 2\ndifficulty=3"),
+            {"task_id": "pick-12", "site": "lab 2", "difficulty": "3"},
+        )
+        self.assertEqual(parse_episode_metadata("  "), {})
+        self.assertEqual(parse_episode_metadata("note=a=b"), {"note": "a=b"})
+        for bad, message in (
+            ("site", "key=value"),
+            ("bad key=1", "not a key"),
+            ("a=1, a=2", "twice"),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                parse_episode_metadata(bad)
+            self.assertIn(message, str(ctx.exception))
+
+    def test_setup_refuses_bad_pairs(self) -> None:
+        from almond_axol.cli.collect_data import CollectDataConfig, mcap_setup_problem
+
+        cfg = CollectDataConfig(repo_id="me/data", task="t", format="mcap")
+        cfg.episode_metadata = "site"
+        with tempfile.TemporaryDirectory() as directory:
+            problem = mcap_setup_problem(
+                cfg, dataset_root=Path(directory), dataset_resolution="SVGA"
+            )
+        self.assertIn("Episode metadata", problem or "")
+
+    def test_per_run_field(self) -> None:
+        from almond_axol.serve.commands import COMMANDS
+
+        self.assertIn("episode_metadata", COMMANDS["collect-data"].per_run_fields)
+
+
+class ImuPoseTest(unittest.TestCase):
+    def test_pose_packet(self) -> None:
+        from almond_axol.recording.mcap.imu import POSE_PACKET, parse_pose_packet
+
+        pose = parse_pose_packet(
+            POSE_PACKET.pack(b"AXIP", 1, 0.01, -0.005, 0.002, 0, 0, 0, 1)
+        )
+        np.testing.assert_allclose(pose[:3, 3], [0.01, -0.005, 0.002], atol=1e-7)
+        np.testing.assert_allclose(pose[:3, :3], np.eye(3))
+        # Not a pose: wrong magic, a non-unit quaternion, an implausible offset.
+        self.assertIsNone(
+            parse_pose_packet(POSE_PACKET.pack(b"AXIM", 1, 0, 0, 0, 0, 0, 0, 1))
+        )
+        self.assertIsNone(
+            parse_pose_packet(POSE_PACKET.pack(b"AXIP", 1, 0, 0, 0, 0, 0, 0, 2))
+        )
+        self.assertIsNone(
+            parse_pose_packet(POSE_PACKET.pack(b"AXIP", 1, 1, 0, 0, 0, 0, 0, 1))
+        )
+
+    def test_receiver_keeps_the_latest_pose(self) -> None:
+        import socket as socketlib
+
+        from almond_axol.recording.mcap.imu import POSE_PACKET, ImuReceiver
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "imu.sock")
+            receiver = ImuReceiver(path)
+            try:
+                sender = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_DGRAM)
+                sender.sendto(
+                    POSE_PACKET.pack(b"AXIP", 1, 0.0, 0.01, 0.0, 0, 0, 0, 1), path
+                )
+                deadline = time.time() + 2.0
+                while receiver.pose is None and time.time() < deadline:
+                    time.sleep(0.01)
+                sender.close()
+                self.assertIsNotNone(receiver.pose)
+                self.assertAlmostEqual(float(receiver.pose[1, 3]), 0.01, places=6)
+                self.assertEqual(receiver.drain(), [])
+            finally:
+                receiver.close()
+
+
+class RpyTest(unittest.TestCase):
+    def test_round_trip_including_gimbal_lock(self) -> None:
+        from almond_axol.recording.mcap.urdf_tree import rpy_from_matrix, rpy_matrix
+
+        rng = np.random.default_rng(3)
+        cases = [tuple(rng.uniform(-3, 3, 3)) for _ in range(50)]
+        cases += [(0.3, math.pi / 2, -0.4), (0.3, -math.pi / 2, 1.2)]
+        for rpy in cases:
+            m = rpy_matrix(*rpy)
+            np.testing.assert_allclose(rpy_matrix(*rpy_from_matrix(m)), m, atol=1e-9)

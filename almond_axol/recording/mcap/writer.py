@@ -135,6 +135,20 @@ class EpisodeFile:
             name, {str(k): "" if v is None else str(v) for k, v in values.items()}
         )
 
+    def attachment(
+        self, name: str, media_type: str, data: bytes, stamp_ns: int
+    ) -> None:
+        """Attach a file (stored whole, outside the message stream)."""
+        if self._file is None:
+            raise RuntimeError(f"{self.final_path.name} is already closed")
+        self._writer.add_attachment(
+            create_time=stamp_ns,
+            log_time=stamp_ns,
+            name=name,
+            media_type=media_type,
+            data=data,
+        )
+
     def finish(self) -> Path:
         """Write the summary, flush to disk, and move into place."""
         if self._file is None:

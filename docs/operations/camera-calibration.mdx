@@ -1,0 +1,124 @@
+---
+title: "Calibrating the Cameras"
+description: "Measure where the cameras sit on your Axol so MCAP episodes place them from measurements, not CAD."
+---
+
+MCAP episodes place each camera in the transform tree. Without a camera calibration, those positions come from CAD. `axol calibration.cameras` measures where the head camera and each wrist camera sit on your Axol and saves the result. Episodes use it from the next episode on.
+
+Calibrate after you fit the Camera Kit. Calibrate again after you move, remount or replace a camera, or after an arm is re-zeroed.
+
+## What you need
+
+- Axol with the Camera Kit, with the head and wrist cameras assigned in the control panel's camera layout.
+- A printer, and something rigid and flat to mount the board on, such as foam board.
+- A clear table in front of Axol, in view of the head camera.
+- About 15 minutes.
+
+## Print the board
+
+```bash
+axol calibration.cameras --print_board ~/calibration_board.pdf
+```
+
+1. Print the page at 100% (actual size). For A4 paper, add `--board.paper a4`.
+2. Tape it flat to the rigid board. Bumps and curls make the result worse.
+3. Measure one square with a ruler. It should be 40 mm. If it isn't, give the size you measured when you calibrate, for example `--board.square_mm 39.5`.
+
+## Calibrate
+
+The arms go limp in gravity compensation while the tool runs, so you can move them by hand.
+
+1. Run `axol calibration.cameras` on the robot.
+2. Lay the board flat on the table where the head camera sees it. Press Enter.
+3. Move the left arm by hand until its wrist camera points at the board, 20 to 40 cm away, then let go. When the arm is still, the tool takes a view and prints it.
+4. Take about four views from different angles. Between views, tilt the camera toward the board from another side, and turn it about its own axis.
+5. Do the same with the right arm.
+6. Press Enter, move the board to another spot on the table, and press Enter again. Views pause while you move it.
+7. Repeat steps 3 to 6 until the board has been in at least three places, spread across the table. Four places is better.
+8. Type `done` and press Enter. The tool solves and prints a result for each camera.
+9. Rest both arms on something, then press Enter to stop. The arms go limp when the tool stops.
+
+Keep your hands and body out of the head camera's view of the board when you can. Each wrist camera needs at least 10 views in total.
+
+## Read the result
+
+Each camera gets `PASS` or `FAIL`, with what the tool measured:
+
+```
+Head camera: PASS. 24 views, error 0.62 px, 3.8 mm and 0.41 degrees from CAD.
+Left wrist camera: PASS. 14 views, error 1.10 px, 2.1 mm and 0.93 degrees from CAD, wrist turned 34 and 15 degrees.
+```
+
+A camera passes when all of these hold:
+
+| Check | Passes when |
+|---|---|
+| Views | A wrist camera has at least 10 views. The head camera saw the board in at least 3 places. |
+| Error | The board corners land within 3 px, on average, of where the calibration puts them. |
+| Wrist turn | The wrist turned about at least two different axes between views. |
+| Distance from CAD | The camera is within 25 mm and 6 degrees of its CAD position. |
+
+When every camera passes, the tool saves the calibration to `~/.almond/camera_calibration.json`.
+
+When a camera fails, nothing is saved, and the previous calibration stays in use. Fix the problem and run the tool again:
+
+| Message | What to do |
+|---|---|
+| `capture at least 10` | Take more views with that arm. |
+| `move it to at least 3 places` | Move the board to more spots, each one seen by the head camera and a wrist camera. |
+| `turned too little` | Tilt the wrist camera toward the board from more sides, not only from above. |
+| `from CAD` | Check the camera mount is tight, then calibrate again. |
+| `reprojection error` | Check the board is flat and the square size is right. Hold the arm still for each view. |
+
+Every run keeps a report folder, `~/.almond/camera_calibration/run-<time>/`. Its `checked` folder has each view with green circles where the tool found the board corners and red crosses where the calibration puts them. On a good calibration they overlap.
+
+## How episodes use the calibration
+
+At the start of every episode, Collect data reads `~/.almond/camera_calibration.json`. It uses the file only when it passed and names this robot. The robot is named by its Axol hub serial.
+
+- Each measured camera is placed from the file. A lookup between the two frames in the file gives the file's values.
+- A camera that was swapped after calibrating keeps its CAD position until you calibrate again.
+- Without a usable file, episodes use the CAD positions. When you start Collect data, it says why the file isn't used.
+
+The episode's `calibration` metadata says which calibration was used and where each transform came from. See [Camera mounts](/operations/mcap#camera-mounts).
+
+## Solve again from a report
+
+To solve a saved run again without the robot, for example with different limits:
+
+```bash
+axol calibration.cameras --from_report ~/.almond/camera_calibration/run-20261124T181500Z
+```
+
+It prints the result and writes it to a `resolved` folder inside the report. Add `--save_from_report true` to save the calibration file when every camera passes.
+
+## Use your own calibration
+
+You can measure the cameras another way, for example with motion capture, and write the file yourself. Collect data reads any file in this form:
+
+```json
+{
+  "robot_serial": "E66138528F2B3F2A",
+  "calibration_id": "lab-2026-11-24",
+  "calibrated_at": "2026-11-24T18:15:00Z",
+  "status": "pass",
+  "transforms": [
+    {"parent": "root", "child": "head_camera_left_optical",
+     "translation_m": [0.07, 0.03, 0.41], "rotation_xyzw": [-0.61, 0.61, -0.36, 0.36]}
+  ]
+}
+```
+
+- `robot_serial` is the robot's Axol hub serial, the `robot.serial` value in any MCAP episode it recorded.
+- Each transform gives the child frame's pose in the parent frame: the translation in metres and a unit quaternion in `x, y, z, w` order.
+- The parent must be fixed to the child, with no moving joint between them.
+- `camera_serial` is optional. When it is set, the transform applies only while that camera is fitted.
+- List only the frames you measured. Every other frame comes from the URDF.
+
+| Camera | Child frame | Parent frame |
+|---|---|---|
+| Head camera, left eye | `head_camera_left_optical` | `root` |
+| Left wrist camera | `left_wrist_camera_optical` | `left_w2` |
+| Right wrist camera | `right_wrist_camera_optical` | `right_w2` |
+
+Optical frames have z forward out of the lens, x to the right and y down in the image. The right head eye follows the left eye by the head camera's factory stereo calibration, unless the file also lists `head_camera_right_optical`.

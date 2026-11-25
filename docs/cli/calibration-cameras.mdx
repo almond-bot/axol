@@ -1,0 +1,38 @@
+---
+title: "calibration.cameras"
+description: "Measure where the head and wrist cameras sit on Axol, for MCAP episodes."
+---
+
+`axol calibration.cameras` measures where the head camera and each wrist camera sit on this robot, using a printed board and the arms' joint readings. It saves the result to `~/.almond/camera_calibration.json`, which MCAP episodes use to place the cameras. See [Calibrating the Cameras](/operations/camera-calibration) for the steps.
+
+```bash
+axol calibration.cameras --print_board ~/calibration_board.pdf
+axol calibration.cameras
+```
+
+The cameras and arm settings come from the control panel's settings, the same ones teleop uses. The arms are in gravity compensation while it runs.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--print_board PATH` | | Write the printable board (PDF, or PNG by file name) and exit. |
+| `--board.square_mm` | `40` | The size of one printed square, in mm. Measure it after printing. |
+| `--board.paper {letter,a4}` | `letter` | Paper size of the printable board. |
+| `--board.squares_x`, `--board.squares_y` | `6`, `4` | Squares across and down. |
+| `--cameras "{slot: serial}"` | Panel settings | Cameras to calibrate: `overhead`, `left_arm`, `right_arm`. |
+| `--output PATH` | `~/.almond/camera_calibration.json` | Where to save the calibration. |
+| `--from_report DIR` | | Solve a saved run again, without the robot. |
+| `--save_from_report` | `false` | With `--from_report`: save the calibration when every camera passes. |
+| `--limits.min_wrist_views` | `10` | Views each wrist camera needs. |
+| `--limits.min_head_placements` | `3` | Board places the head camera must see. |
+| `--limits.max_rms_px` | `3.0` | Largest average error allowed, in pixels. |
+| `--limits.max_change_mm`, `--limits.max_change_deg` | `25`, `6` | Largest distance allowed from the CAD position. |
+| `--kd` | `0.5` | Gravity compensation damping, in N·m·s/rad. |
+| `--left_channel`, `--right_channel` | Panel settings | CAN interfaces of the arms. |
+
+While it runs:
+
+| Input | Effect |
+|---|---|
+| Enter | Starts taking views at a board place, or pauses them so you can move the board. |
+| `done`, then Enter | Solves, prints the result and saves the calibration when every camera passes. |
+| `quit`, then Enter | Stops without solving. |

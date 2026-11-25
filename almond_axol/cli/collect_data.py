@@ -763,10 +763,12 @@ def mcap_setup_problem(
             f"{dataset_root} holds a LeRobot dataset. Choose another dataset "
             "name for MCAP recording."
         )
+    from ..recording.mcap.custom_metadata import parse_episode_metadata
     from ..recording.mcap.topics import parse_topic_names
 
     try:
         parse_topic_names(getattr(cfg, "mcap_topics", ""))
+        parse_episode_metadata(getattr(cfg, "episode_metadata", ""))
     except ValueError as exc:
         return str(exc)
     rec_w, rec_h = ZED_RESOLUTION_DIMS[dataset_resolution]
@@ -798,7 +800,10 @@ def _start_mcap_recorder(
     teleop_hz: int,
 ) -> Any:
     """Spawn the MCAP recorder and feed it the Rust core's 240 Hz joint states."""
+    from ..camera_calibration.file import DEFAULT_PATH as CALIBRATION_PATH
     from ..constants import AxolModel, urdf_path
+    from ..recording.mcap.custom_metadata import parse_episode_metadata
+    from ..recording.mcap.mounts import read_calibration
     from ..recording.mcap.recorder import McapRecorderProcess
     from ..recording.mcap.topics import parse_topic_names
     from ..robot.identity import hub_serial
@@ -827,6 +832,20 @@ def _start_mcap_recorder(
         software_version = version("almond-axol")
     except Exception:  # noqa: BLE001 - informational
         software_version = ""
+    robot_serial = hub_serial() or ""
+    calibration, problem = read_calibration(CALIBRATION_PATH, robot_serial or None)
+    if calibration is None:
+        _logger.warning(
+            "Camera calibration not used: %s. Episodes record the camera positions "
+            "from CAD. Run `axol calibration.cameras` to calibrate.",
+            problem,
+        )
+    else:
+        _logger.info(
+            "Camera calibration %s from %s.",
+            calibration.calibration_id,
+            calibration.calibrated_at or "an unknown date",
+        )
     recorder = McapRecorderProcess(
         raw_meta={src: m for src, m in relay.raw_meta.items() if src in expected},
         config={
@@ -843,7 +862,9 @@ def _start_mcap_recorder(
             "wheel_signs": dict(WHEEL_SIGNS),
             "topic_names": parse_topic_names(cfg.mcap_topics),
             "operator": cfg.operator,
-            "robot_serial": hub_serial() or "",
+            "episode_metadata": parse_episode_metadata(cfg.episode_metadata),
+            "camera_calibration_path": str(CALIBRATION_PATH),
+            "robot_serial": robot_serial,
             "robot_model": model.value,
             "gripper": gripper,
             "software_version": software_version,
@@ -959,6 +980,8 @@ class CollectDataConfig:
     format: RecordingFormat = "lerobot"
     operator: str = ""
     """Who is recording. Saved in each MCAP episode."""
+    episode_metadata: str = ""
+    """Extra key=value pairs saved in each MCAP episode, separated by commas."""
     mcap_topics: str = ""
     """Rename MCAP topics, as default=new pairs separated by commas."""
     mcap_video_codec: McapVideoCodec = "h264"
