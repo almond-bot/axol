@@ -146,7 +146,7 @@ def summarize(path: Path) -> EpisodeSummary:
 
 
 def _topic_names(text: str) -> dict[str, str]:
-    """The file's ``default=new`` topic renames."""
+    """The file's ``default=new`` topic (or frame) renames."""
     out = {}
     for pair in text.split(","):
         old, sep, new = (part.strip() for part in pair.partition("="))
@@ -515,8 +515,11 @@ def _check_calibration(
         for pair in calibration.get("tf_sources", "").split(",")
         if "=" in pair
     )
+    # The file may name frames by their defaults; the episode by its renames.
+    renamed = _topic_names(s.metadata.get("recording", {}).get("frame_names", ""))
     for entry in entries:
-        parent, child = str(entry.get("parent")), str(entry.get("child"))
+        parent = renamed.get(str(entry.get("parent")), str(entry.get("parent")))
+        child = renamed.get(str(entry.get("child")), str(entry.get("child")))
         if sources.get(child) != "calibration":
             add(None, f"mount of {child}", "in the calibration file but not used")
             continue

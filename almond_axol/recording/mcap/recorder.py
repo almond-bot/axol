@@ -56,7 +56,7 @@ from .rings import (
 from .imu import ImuReceiver
 from .mounts import EpisodeFrames, episode_frames
 from .scene import CameraSource, Scene
-from .topics import format_topic_names
+from .topics import format_topic_names, frame_names_problem
 
 _logger = logging.getLogger(__name__)
 
@@ -145,6 +145,11 @@ class McapSession:
         self.wheel_signs: dict[int, float] = dict(config.get("wheel_signs") or {})
         # Renamed topics (default name -> customer's name), see .topics.
         self.topic_names: dict[str, str] = dict(config.get("topic_names") or {})
+        # Renamed frames (default name -> customer's name), see .topics.
+        self.frame_names: dict[str, str] = dict(config.get("frame_names") or {})
+        problem = frame_names_problem(self.frame_names, scene.frame_ids())
+        if problem is not None:
+            raise ValueError(problem)
         # One receiver per camera IMU: {topic: (receiver, left optical frame)}.
         self.imus: dict[str, tuple[Any, str]] = {}
         # The camera calibration file (see almond_axol.camera_calibration),
@@ -285,6 +290,7 @@ class McapSession:
             wheel_signs={int(k): float(v) for k, v in self.wheel_signs.items()},
             topic_names=self.topic_names,
             frames=self.frames,
+            frame_names=self.frame_names,
         )
         self._stop.clear()
         self._thread = threading.Thread(
@@ -320,6 +326,7 @@ class McapSession:
             self.calibration_path,
             self.config.get("robot_serial") or None,
             imu_poses,
+            frame_names=self.frame_names,
         )
         note = frames.problem or None
         if note != self._calibration_note:
@@ -520,6 +527,9 @@ class McapSession:
             "images": "unrectified sensor images",
             "joint_rate_hz": 240,
             "command_rate_hz": config.get("teleop_hz", 120),
+            "ee_frames": ",".join(
+                episode.ee_frames[side] for side in sorted(episode.ee_frames)
+            ),
             "joint_samples": episode.joint_samples,
             "joint_samples_lost": episode.joint_lost,
             "control_ticks": episode.tick_samples,
@@ -536,6 +546,7 @@ class McapSession:
             ),
             "assumed_joints": ",".join(scene.assumed_joints()),
             "topic_names": format_topic_names(self.topic_names),
+            "frame_names": format_topic_names(self.frame_names),
             **episode.camera_metadata(),
         }
         for source, camera in scene.cameras.items():
@@ -549,7 +560,8 @@ class McapSession:
             count = episode.imu_samples.get(topic, 0)
             recording_meta[f"{key}.samples"] = count
             recording_meta[f"{key}.rate_hz"] = f"{count / duration:.1f}"
-            recording_meta[f"{key}.frame_id"] = self.imu_frames.get(topic, "")
+            frame = self.imu_frames.get(topic, "")
+            recording_meta[f"{key}.frame_id"] = episode.frame(frame) if frame else ""
             imu_camera = scene.imu_camera(topic)
             recording_meta[f"{key}.serial"] = (
                 imu_camera.serial if imu_camera is not None else ""
@@ -570,13 +582,15 @@ class McapSession:
             "episode": episode_meta,
             "robot": robot_meta,
             "recording": recording_meta,
-            "calibration": calibration_metadata(scene, self.frames),
+            "calibration": calibration_metadata(scene, self.frames, self.frame_names),
             **({"custom": custom} if custom else {}),
         }
 
 
 def calibration_metadata(
-    scene: Scene, frames: EpisodeFrames | None = None
+    scene: Scene,
+    frames: EpisodeFrames | None = None,
+    frame_names: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Which calibration the episode used, and when it is from.
 
@@ -603,6 +617,7 @@ def calibration_metadata(
     newest = max((f.mtime for f in files.values()), default=None)
     used = frames.calibration
     sources = frames.sources()
+    renamed = frame_names or {}
     out: dict[str, Any] = {
         "calibration_status": frames.status,
         "calibration_id": used.calibration_id if used is not None else "",
@@ -611,7 +626,9 @@ def calibration_metadata(
         "calibration_file_sha256": used.sha256 if used is not None else "",
         "calibration_problem": frames.problem,
         "calibration_skipped": "; ".join(frames.skipped),
-        "tf_sources": ", ".join(f"{child}={src}" for child, src in sources.items()),
+        "tf_sources": ", ".join(
+            f"{renamed.get(child, child)}={src}" for child, src in sources.items()
+        ),
         "urdf_sha256": scene.urdf_sha256,
         "intrinsics": "ZED factory calibration",
         "intrinsics_id": digest.hexdigest()[:16],

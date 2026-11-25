@@ -48,8 +48,8 @@ Plan for storage. Every frame is a keyframe, so each 1920x1200 camera at 60 fps 
 | `/joint_states` | `sensor_msgs/JointState` | 240 Hz | Measured position, velocity and torque of every joint. |
 | `/joint_command` | `sensor_msgs/JointState` | 120 Hz | Joint and gripper targets sent to the arms. |
 | `/joint_command/info` | `almond_msgs/CommandInfo` | 120 Hz | When each `/joint_command` was sent and how each device follows it. See [Commands](#commands). |
-| `/ee_pose/left`, `/ee_pose/right` | `geometry_msgs/PoseStamped` | 240 Hz | Measured gripper pose, in the `root` frame. |
-| `/ee_target/left`, `/ee_target/right` | `geometry_msgs/PoseStamped` | 120 Hz | Commanded gripper pose, in the `root` frame. |
+| `/ee_pose/left`, `/ee_pose/right` | `geometry_msgs/PoseStamped` | 240 Hz | Measured pose of `left_tcp` / `right_tcp`, in the `root` frame. |
+| `/ee_target/left`, `/ee_target/right` | `geometry_msgs/PoseStamped` | 120 Hz | Commanded pose of `left_tcp` / `right_tcp`, in the `root` frame. |
 | `/teleop/left/pose`, `/teleop/right/pose` | `geometry_msgs/PoseStamped` | Headset rate | Controller poses as the headset sent them, in the headset's tracking space (`vr_world`). |
 | `/teleop/joy` | `sensor_msgs/Joy` | Headset rate | Grips, thumbsticks and buttons. See [Teleop input](#teleop-input). |
 | `/base/odom` | `nav_msgs/Odometry` | 50 Hz | Jelly's pose and velocity, worked out from its wheels. |
@@ -197,9 +197,24 @@ The `calibration` metadata says what was used:
 | `head_camera_left_optical`, `head_camera_right_optical` | The head camera's eyes. |
 | `left_wrist_camera_optical`, `right_wrist_camera_optical` | The wrist cameras. |
 | `head_camera_imu` | The head camera's IMU. |
-| `left_tcp`, `right_tcp` | Where each gripper's fingers close, 145 mm out from the gripper mount (`left_gripper`). |
+| `left_tcp`, `right_tcp` | Where each gripper's fingers close, 145 mm out from the gripper mount (`left_gripper`). This is the tool point the Axol SDK uses. A parcel gripper has no TCP, so its `/ee_pose` and `/ee_target` give the gripper mount. |
 
 Optical frames have z forward out of the lens, x to the right and y down in the image. Each optical frame is the `frame_id` of its camera's video and `camera_info`.
+
+### Rename frames
+
+To use your own frame names, set **MCAP frame names** under **Settings**, then **Recording**. Write `default=new` pairs, separated by commas:
+
+```
+root=lift_link, jelly=base_link, head_camera_left_optical=head_left_optical
+```
+
+A renamed frame is renamed everywhere the episode names it:
+- `/tf` and `/tf_static`;
+- the links in `/robot_description`;
+- the `frame_id` of every message, such as video, `camera_info`, the IMU and `/ee_pose`.
+
+A calibration file can use either the default names or your names. The recorder won't start if a name is misspelled or would clash with another frame. Each file lists its renames in the `recording` metadata as `frame_names`. On the command line, use `--mcap_frames`.
 
 ## Metadata
 
@@ -209,7 +224,7 @@ Each file has these metadata records.
 |---|---|
 | `episode` | `index`, `uuid` (unique to each episode), `task`, `operator`, `outcome` (`success` or `failure`), `start_time`, `end_time`, `duration_s`, `paused_s`, `end_gesture_time` |
 | `robot` | `serial` (the Axol hub serial), `model`, `gripper`, `jelly`, `software_version`, `hostname`, `compute_serial` (the Jetson's serial) |
-| `recording` | Frame counts, measured frame rate, gaps and missing frames for each camera with its serial and frame, joint sample counts, the IMU's frame and serial, and the clock offset |
+| `recording` | Frame counts, measured frame rate, gaps and missing frames for each camera with its serial and frame, joint sample counts, the IMU's frame and serial, the frames `/ee_pose` and `/ee_target` are for (`ee_frames`), and the clock offset |
 | `calibration` | The camera calibration used (see [Camera mounts](#camera-mounts)), and each camera's factory calibration file with its name, SHA-256 and date (`intrinsics_id`, `intrinsics_date`) |
 | `custom` | The **Episode metadata** pairs, when there are any |
 

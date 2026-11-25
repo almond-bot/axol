@@ -48,6 +48,7 @@ axol collect-data --repo_id myorg/pick --task "pick up the cup" \
 | `--episode_metadata` | empty | Extra `key=value` pairs saved in each MCAP episode, separated by commas. |
 | `--mcap_video_codec` | `h264` | Video codec of MCAP episodes: `h264` or `h265`. |
 | `--mcap_topics` | empty | Rename MCAP topics, as `default=new` pairs separated by commas. See [Rename topics](/operations/mcap#rename-topics). |
+| `--mcap_frames` | empty | Rename MCAP transform frames, as `default=new` pairs separated by commas. See [Rename frames](/operations/mcap#rename-frames). |
 | `--fps` | `30` | Recording rate. Cameras capture at 60 and drop frames to match. `60` doubles the recording load on a Jetson. |
 | `--teleop_hz` | `120` | Motor command rate (Hz) while teleoperating, independent of `fps`. |
 | `--dataset_resolution` | `SVGA` | Resolution of the recorded video: `SVGA`, `HD1080` or `HD1200`. It can't be larger than the cameras' capture resolution. |

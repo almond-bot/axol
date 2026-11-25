@@ -22,7 +22,7 @@ Moving joints nothing measures are written once at zero, as before.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -175,13 +175,27 @@ def _camera_serials(scene: Scene) -> dict[str, int]:
 
 
 def _apply_file(
-    scene: Scene, calibration: CameraCalibration, edges: dict[str, np.ndarray]
+    scene: Scene,
+    calibration: CameraCalibration,
+    edges: dict[str, np.ndarray],
+    frame_names: dict[str, str] | None = None,
 ) -> tuple[set[str], list[str]]:
-    """Put the file's frames into ``edges``. Returns (frames placed, skipped)."""
+    """Put the file's frames into ``edges``. Returns (frames placed, skipped).
+
+    The file may name frames by their defaults or by their ``frame_names``
+    renames; renamed names are read back to the defaults.
+    """
     serials = _camera_serials(scene)
     pending: list[FrameTransform] = []
     skipped: list[str] = []
+    default = {new: old for old, new in (frame_names or {}).items()}
     for entry in calibration.transforms:
+        if entry.parent in default or entry.child in default:
+            entry = replace(
+                entry,
+                parent=default.get(entry.parent, entry.parent),
+                child=default.get(entry.child, entry.child),
+            )
         fitted = serials.get(entry.child)
         if (
             entry.camera_serial is not None
@@ -226,18 +240,20 @@ def resolve(
     calibration: CameraCalibration | None = None,
     problem: str = "",
     imu_poses: dict[str, np.ndarray] | None = None,
+    frame_names: dict[str, str] | None = None,
 ) -> EpisodeFrames:
     """Every static frame of an episode.
 
     ``imu_poses`` maps a camera IMU's frame to its pose in the camera's left
-    optical frame (the camera's factory value).
+    optical frame (the camera's factory value). ``frame_names`` are the
+    episode's frame renames, which the calibration file may use.
     """
     tree = scene.tree
     edges: dict[str, np.ndarray] = {}
     sources: dict[str, str] = {}
     skipped: list[str] = []
     if calibration is not None:
-        placed, skipped = _apply_file(scene, calibration, edges)
+        placed, skipped = _apply_file(scene, calibration, edges, frame_names)
         for child in placed:
             sources[child] = CALIBRATION
         if not placed:
@@ -323,10 +339,11 @@ def episode_frames(
     calibration_path: Path,
     robot_serial: str | None,
     imu_poses: dict[str, np.ndarray] | None = None,
+    frame_names: dict[str, str] | None = None,
 ) -> EpisodeFrames:
     """Read the calibration file and resolve the episode's static frames."""
     calibration, problem = read_calibration(calibration_path, robot_serial)
-    frames = resolve(scene, calibration, problem, imu_poses)
+    frames = resolve(scene, calibration, problem, imu_poses, frame_names)
     for reason in frames.skipped:
         _logger.warning("Camera calibration: %s", reason)
     return frames

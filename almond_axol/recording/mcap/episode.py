@@ -39,7 +39,7 @@ from .rings import (
     tick_ring_keys,
 )
 from .mounts import EpisodeFrames, resolve
-from .scene import BASE_JOINTS, LIFT_JOINT, CameraSource, Scene
+from .scene import BASE_JOINTS, LIFT_JOINT, VR_FRAME, CameraSource, Scene
 from .urdf_tree import pose7, quaternion_xyzw
 from .writer import EpisodeFile
 
@@ -52,7 +52,6 @@ CALIBRATION_ATTACHMENT = "camera_calibration.json"
 _APPLY_WAIT_S = 0.5
 # Application times remembered per arm (by target seq).
 _APPLIED_MEMORY = 4096
-VR_FRAME = "vr_world"
 # Re-publish an unchanged lift height this often (s), so a reader starting
 # anywhere in the file finds a recent value.
 _LIFT_REFRESH_S = 1.0
@@ -91,8 +90,11 @@ class EpisodeRecording:
         wheel_signs: dict[int, float] | None = None,
         topic_names: dict[str, str] | None = None,
         frames: EpisodeFrames | None = None,
+        frame_names: dict[str, str] | None = None,
     ) -> None:
         self.scene = scene
+        # Renamed frames (default name -> customer's name), see .topics.
+        self.frame_names: dict[str, str] = dict(frame_names or {})
         # The static frames: camera mounts from the calibration file when
         # there is one (see .mounts), else from the URDF.
         self.frames = frames if frames is not None else resolve(scene)
@@ -117,6 +119,16 @@ class EpisodeRecording:
             side: scene.tree.path(self._ee_base, link)
             for side, link in self._ee_links.items()
         }
+        # /ee_pose and /ee_target are at the TCP (the SDK's tool point), not
+        # the gripper mount the URDF chain ends at.
+        tools = {mount: transform for mount, _, transform in scene.tool_frames()}
+        self._ee_tool = {
+            side: tools[link] for side, link in self._ee_links.items() if link in tools
+        }
+        self.ee_frames = {
+            side: self.frame(name) for side, name in scene.ee_frames().items()
+        }
+        self._ee_frame = self.frame(self._ee_base)
         jk = column_index(joint_ring_keys())
         self._pos0 = jk[f"pos.left_{JOINT_NAMES[0]}"]
         self._vel0 = jk[f"vel.left_{JOINT_NAMES[0]}"]
@@ -162,6 +174,10 @@ class EpisodeRecording:
     def stamp(self, perf_s: float) -> int:
         return self.file.stamp(perf_s)
 
+    def frame(self, name: str) -> str:
+        """A frame's name as this episode writes it (after any rename)."""
+        return self.frame_names.get(name, name)
+
     def _matrices(self, joints: list[Any], values: dict[str, float]) -> dict[str, Any]:
         tree = self.scene.tree
         return {j.name: j.transform(tree.value(j, values)) for j in joints}
@@ -182,8 +198,8 @@ class EpisodeRecording:
             out.append(
                 (
                     stamp,
-                    joint.parent,
-                    joint.child,
+                    self.frame(joint.parent),
+                    self.frame(joint.child),
                     (float(t[0]), float(t[1]), float(t[2])),
                     quaternion_xyzw(transform[:3, :3]),
                 )
@@ -204,7 +220,12 @@ class EpisodeRecording:
             else:
                 step = joint.transform(tree.value(joint, values))
             out = step if out is None else out @ step
-        return pose7(out if out is not None else np.eye(4))
+        if out is None:
+            out = np.eye(4)
+        tool = self._ee_tool.get(side)
+        if tool is not None:
+            out = out @ tool
+        return pose7(out)
 
     # -- static content ----------------------------------------------------
 
@@ -217,8 +238,8 @@ class EpisodeRecording:
             static.append(
                 (
                     stamp,
-                    frame.parent,
-                    frame.child,
+                    self.frame(frame.parent),
+                    self.frame(frame.child),
                     (float(t[0]), float(t[1]), float(t[2])),
                     quaternion_xyzw(transform[:3, :3]),
                 )
@@ -230,7 +251,9 @@ class EpisodeRecording:
             "/robot_description",
             "std_msgs/String",
             messages.string_message(
-                self.scene.robot_description(self.frames.edges, self.frames.added)
+                self.scene.robot_description(
+                    self.frames.edges, self.frames.added, self.frame_names
+                )
             ),
             stamp,
         )
@@ -263,7 +286,9 @@ class EpisodeRecording:
         self.file.write(
             f"{camera.topic}/video",
             "foxglove_msgs/CompressedVideo",
-            messages.compressed_video(stamp, camera.frame_id, au, camera.codec),
+            messages.compressed_video(
+                stamp, self.frame(camera.frame_id), au, camera.codec
+            ),
             stamp,
         )
         info = camera.intrinsics
@@ -273,7 +298,7 @@ class EpisodeRecording:
                 "sensor_msgs/CameraInfo",
                 messages.camera_info(
                     stamp,
-                    camera.frame_id,
+                    self.frame(camera.frame_id),
                     width=info.width,
                     height=info.height,
                     distortion_model=info.distortion_model,
@@ -294,6 +319,7 @@ class EpisodeRecording:
         one written, are skipped.
         """
         last = self._imu_last.get(topic, self.start_perf)
+        frame_id = self.frame(frame_id)
         for sample in samples:
             if sample.perf <= last:
                 continue
@@ -354,7 +380,7 @@ class EpisodeRecording:
                     f"/ee_pose/{side}",
                     "geometry_msgs/PoseStamped",
                     messages.pose_stamped(
-                        stamp, self._ee_base, self._ee_pose(side, values, matrices)
+                        stamp, self._ee_frame, self._ee_pose(side, values, matrices)
                     ),
                     stamp,
                 )
@@ -479,7 +505,7 @@ class EpisodeRecording:
                         f"/ee_target/{side}",
                         "geometry_msgs/PoseStamped",
                         messages.pose_stamped(
-                            stamp, self._ee_base, self._ee_pose(side, values)
+                            stamp, self._ee_frame, self._ee_pose(side, values)
                         ),
                         stamp,
                     )
@@ -503,7 +529,7 @@ class EpisodeRecording:
             self.file.write(
                 f"/teleop/{side}/pose",
                 "geometry_msgs/PoseStamped",
-                messages.pose_stamped(stamp, VR_FRAME, pose),
+                messages.pose_stamped(stamp, self.frame(VR_FRAME), pose),
                 stamp,
             )
         axes = [self._col(row, f"vr.{name}") for name in VR_AXES]
@@ -513,7 +539,7 @@ class EpisodeRecording:
             "sensor_msgs/Joy",
             messages.joy(
                 stamp,
-                VR_FRAME,
+                self.frame(VR_FRAME),
                 [a if math.isfinite(a) else 0.0 for a in axes],
                 [1 if math.isfinite(b) and b >= 0.5 else 0 for b in buttons],
             ),
@@ -599,7 +625,7 @@ class EpisodeRecording:
                     "/base/cmd_vel",
                     "geometry_msgs/TwistStamped",
                     messages.twist_stamped(
-                        stamp, "jelly", (vx, vy, 0.0), (0.0, 0.0, wz)
+                        stamp, self.frame("jelly"), (vx, vy, 0.0), (0.0, 0.0, wz)
                     ),
                     stamp,
                 )
@@ -641,8 +667,8 @@ class EpisodeRecording:
             "nav_msgs/Odometry",
             messages.odometry(
                 stamp,
-                tree.root,
-                "jelly",
+                self.frame(tree.root),
+                self.frame("jelly"),
                 base_pose,
                 (sample.vx, sample.vy, 0.0),
                 (0.0, 0.0, sample.wz),
@@ -667,7 +693,7 @@ class EpisodeRecording:
                     f"{prefix}.topic": self.file.topic_names.get(
                         f"{camera.topic}/video", f"{camera.topic}/video"
                     ),
-                    f"{prefix}.frame_id": camera.frame_id,
+                    f"{prefix}.frame_id": self.frame(camera.frame_id),
                     f"{prefix}.serial": camera.serial,
                     f"{prefix}.width": camera.width,
                     f"{prefix}.height": camera.height,

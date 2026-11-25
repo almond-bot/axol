@@ -20,6 +20,7 @@ This command is configured through draccus. The robot and teleop settings live i
 | `--episode_metadata TEXT` | Extra `key=value` pairs saved in each MCAP episode, separated by commas. |
 | `--mcap_video_codec {h264,h265}` | Video codec of MCAP episodes (default: `h264`). |
 | `--mcap_topics TEXT` | Rename MCAP topics, as `default=new` pairs separated by commas. See [Rename topics](/operations/mcap#rename-topics). |
+| `--mcap_frames TEXT` | Rename MCAP transform frames, as `default=new` pairs separated by commas. See [Rename frames](/operations/mcap#rename-frames). |
 | `--fps INT` | Dataset frame rate (default: 30). It can't be higher than the camera capture rate. The headset stream is separate. |
 | `--dataset_resolution {SVGA,HD1080,HD1200}` | Resolution of the dataset video (default: `SVGA`, 960×600). A resumed dataset keeps its original resolution. |
 | `--stream_resolution {SVGA,HD1080,HD1200}` | Resolution of the headset stream, when smaller than the cameras' capture resolution (default: the capture resolution). |

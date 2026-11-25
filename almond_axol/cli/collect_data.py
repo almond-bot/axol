@@ -764,10 +764,11 @@ def mcap_setup_problem(
             "name for MCAP recording."
         )
     from ..recording.mcap.custom_metadata import parse_episode_metadata
-    from ..recording.mcap.topics import parse_topic_names
+    from ..recording.mcap.topics import parse_frame_names, parse_topic_names
 
     try:
         parse_topic_names(getattr(cfg, "mcap_topics", ""))
+        parse_frame_names(getattr(cfg, "mcap_frames", ""))
         parse_episode_metadata(getattr(cfg, "episode_metadata", ""))
     except ValueError as exc:
         return str(exc)
@@ -805,7 +806,7 @@ def _start_mcap_recorder(
     from ..recording.mcap.custom_metadata import parse_episode_metadata
     from ..recording.mcap.mounts import read_calibration
     from ..recording.mcap.recorder import McapRecorderProcess
-    from ..recording.mcap.topics import parse_topic_names
+    from ..recording.mcap.topics import parse_frame_names, parse_topic_names
     from ..robot.identity import hub_serial
     from ..robot.jelly import WHEEL_SIGNS
     from ..settings import resolve_gripper, resolve_robot_model
@@ -861,6 +862,7 @@ def _start_mcap_recorder(
             "jelly_lift": bool(jelly is not None and jelly.has_lift),
             "wheel_signs": dict(WHEEL_SIGNS),
             "topic_names": parse_topic_names(cfg.mcap_topics),
+            "frame_names": parse_frame_names(cfg.mcap_frames),
             "operator": cfg.operator,
             "episode_metadata": parse_episode_metadata(cfg.episode_metadata),
             "camera_calibration_path": str(CALIBRATION_PATH),
@@ -984,6 +986,8 @@ class CollectDataConfig:
     """Extra key=value pairs saved in each MCAP episode, separated by commas."""
     mcap_topics: str = ""
     """Rename MCAP topics, as default=new pairs separated by commas."""
+    mcap_frames: str = ""
+    """Rename MCAP transform frames, as default=new pairs separated by commas."""
     mcap_video_codec: McapVideoCodec = "h264"
     """Video codec of MCAP episodes: h264, or h265 for smaller files."""
 

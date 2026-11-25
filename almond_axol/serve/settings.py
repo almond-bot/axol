@@ -1105,6 +1105,18 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 targets={"collect-data": ("mcap_topics",)},
             ),
             SettingDef(
+                key="recording.mcap_frames",
+                label="MCAP frame names",
+                type="text",
+                help=(
+                    "Rename transform frames in MCAP episodes, as default=new pairs "
+                    "separated by commas. For example: root=lift_link. Leave empty "
+                    "to keep the default names."
+                ),
+                effective_default="the default names",
+                targets={"collect-data": ("mcap_frames",)},
+            ),
+            SettingDef(
                 key="recording.mcap_video_codec",
                 label="MCAP video codec",
                 type="select",

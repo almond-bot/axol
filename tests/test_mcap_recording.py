@@ -15,7 +15,7 @@ from mcap.reader import make_reader
 from mcap_ros2.decoder import DecoderFactory
 from scipy.spatial.transform import Rotation
 
-from almond_axol.constants import AxolModel, Joint, urdf_path
+from almond_axol.constants import GRIPPER_TIP_OFFSET, AxolModel, Joint, urdf_path
 from almond_axol.recording.mcap import messages
 from almond_axol.recording.mcap.odometry import (
     WHEEL_HALF_SPACING_M,
@@ -971,6 +971,17 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(len(by_topic["/ee_pose/left"]), 120)
         self.assertEqual(len(by_topic["/ee_target/right"]), 60)
         self.assertEqual(by_topic["/ee_pose/left"][0].ros_msg.header.frame_id, "root")
+        # /ee_pose is the TCP: the gripper mount plus the SDK's tool offset.
+        state = joints[-1].ros_msg
+        q = dict(zip(state.name, state.position))
+        expected = self.scene.tree.fk("root", "left_gripper", q)
+        expected[:3, 3] += expected[:3, :3] @ np.asarray(GRIPPER_TIP_OFFSET)
+        pose = by_topic["/ee_pose/left"][-1].ros_msg.pose
+        np.testing.assert_allclose(
+            [pose.position.x, pose.position.y, pose.position.z],
+            expected[:3, 3],
+            atol=1e-9,
+        )
         # One message per headset frame, not per tick.
         self.assertEqual(len(by_topic["/teleop/left/pose"]), 30)
         self.assertEqual(len(by_topic["/teleop/joy"]), 30)
@@ -1014,6 +1025,7 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(metadata["recording"]["wrist_left.gaps"], "1")
         self.assertEqual(metadata["recording"]["wrist_left.missing_frames"], "1")
         self.assertEqual(metadata["recording"]["joint_samples"], "120")
+        self.assertEqual(metadata["recording"]["ee_frames"], "left_tcp,right_tcp")
         self.assertEqual(metadata["recording"]["commands_applied"], "60")
         self.assertEqual(
             metadata["recording"]["commands_without_application_time"], "0"
@@ -1940,6 +1952,150 @@ class CalibratedSessionTest(unittest.TestCase):
         self.assertEqual(
             hashlib.sha256(raw).hexdigest(), calibration["calibration_file_sha256"]
         )
+
+
+# Somm's frame names (their TF requirements), as a customer would set them.
+SOMM_FRAMES = {
+    "jelly": "base_link",
+    "root": "lift_link",
+    "head_camera_left_optical": "head_left_optical",
+    "head_camera_right_optical": "head_right_optical",
+    "left_w2": "left_wrist_link",
+    "right_w2": "right_wrist_link",
+    "left_wrist_camera_optical": "left_wrist_optical",
+    "right_wrist_camera_optical": "right_wrist_optical",
+}
+
+
+class FrameNamesTest(unittest.TestCase):
+    def test_parses_pairs(self) -> None:
+        from almond_axol.recording.mcap.topics import parse_frame_names
+
+        self.assertEqual(parse_frame_names(""), {})
+        self.assertEqual(
+            parse_frame_names("root=lift_link,\n jelly = base_link, world=world"),
+            {"root": "lift_link", "jelly": "base_link"},
+        )
+        for text in ("root", "root=", "/root=lift", "root=a b", "root=a,root=b"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_frame_names(text)
+
+    def test_rejects_unknown_frames_and_clashes(self) -> None:
+        from almond_axol.recording.mcap.topics import frame_names_problem
+
+        available = ["world", "jelly", "root", "left_tcp"]
+        self.assertIsNone(frame_names_problem({"root": "lift_link"}, available))
+        problem = frame_names_problem({"torso": "x"}, available)
+        self.assertIn("no torso frame", problem or "")
+        problem = frame_names_problem({"root": "jelly"}, available)
+        self.assertIn("would both be named jelly", problem or "")
+
+    def test_scene_lists_every_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scene = Scene.build(
+                urdf_path(AxolModel.MOBILE),
+                has_gripper=True,
+                jelly_wheels=True,
+                jelly_lift=True,
+                cameras={},
+                calibration_dir=Path(directory),
+                gripper="parallel",
+            )
+        frames = scene.frame_ids()
+        for name in ("world", "jelly", "root", "left_w2", "left_tcp", "vr_world"):
+            self.assertIn(name, frames)
+
+
+class RenamedFramesTest(unittest.TestCase):
+    """An episode written with Somm's frame names, calibrated."""
+
+    tearDown = SessionTest.tearDown
+    _record = SessionTest._record
+    _record_and_check = SessionTest._record_and_check
+
+    def setUp(self) -> None:
+        SessionTest.setUp(self)  # type: ignore[arg-type]
+        self.session.frame_names = dict(SOMM_FRAMES)
+
+    def _write_calibration(self, renamed: bool) -> None:
+        from almond_axol.camera_calibration.file import write
+
+        doc = _calibration_doc(self.scene)
+        if renamed:
+            for entry in doc["transforms"]:
+                entry["parent"] = SOMM_FRAMES.get(entry["parent"], entry["parent"])
+                entry["child"] = SOMM_FRAMES.get(entry["child"], entry["child"])
+        write(doc, Path(self._tmp.name) / "camera_calibration.json")
+
+    def _messages(self) -> dict[str, list]:
+        by_topic: dict[str, list] = {}
+        path = self.root / "episode_000000.mcap"
+        for msg in read_ros2_messages(str(path)):
+            by_topic.setdefault(msg.channel.topic, []).append(msg.ros_msg)
+        return by_topic
+
+    def test_every_frame_is_renamed_and_the_checker_passes(self) -> None:
+        self._write_calibration(renamed=False)
+        results = self._record_and_check(set(self.readers))
+        self.assertFalse([r for r in results.values() if r.status == "FAIL"], results)
+        self.assertEqual(results["calibration"].status, "PASS")
+        for frame in ("head_left_optical", "left_wrist_optical", "right_wrist_optical"):
+            self.assertEqual(results[f"mount of {frame}"].status, "PASS")
+
+        by_topic = self._messages()
+        static = {
+            t.child_frame_id: t.header.frame_id
+            for t in by_topic["/tf_static"][0].transforms
+        }
+        self.assertEqual(static["head_right_optical"], "head")
+        self.assertEqual(static["left_tcp"], "left_gripper")
+        self.assertNotIn("head_camera_left_optical", static)
+        dynamic = {
+            t.child_frame_id: t.header.frame_id
+            for m in by_topic["/tf"]
+            for t in m.transforms
+        }
+        self.assertEqual(dynamic["left_wrist_link"], "left_w1")
+        self.assertEqual(dynamic["base_link"], "base_y_link")
+        self.assertEqual(dynamic["lift_link"], "lift_stage")
+        self.assertEqual(
+            by_topic["/head/left/camera_info"][0].header.frame_id, "head_left_optical"
+        )
+        self.assertEqual(by_topic["/ee_pose/left"][0].header.frame_id, "lift_link")
+        odom = by_topic["/base/odom"][0]
+        self.assertEqual(
+            (odom.header.frame_id, odom.child_frame_id), ("world", "base_link")
+        )
+        urdf = by_topic["/robot_description"][0].data
+        self.assertIn('<link name="lift_link"', urdf)
+        self.assertIn('<child link="left_wrist_optical"', urdf)
+        self.assertNotIn('name="root"', urdf)
+
+        with (self.root / "episode_000000.mcap").open("rb") as f:
+            meta = {r.name: r.metadata for r in make_reader(f).iter_metadata()}
+        self.assertIn("root=lift_link", meta["recording"]["frame_names"])
+        self.assertEqual(meta["recording"]["head_left.frame_id"], "head_left_optical")
+        self.assertIn(
+            "head_left_optical=calibration", meta["calibration"]["tf_sources"]
+        )
+
+    def test_a_calibration_file_in_the_renamed_frames_applies(self) -> None:
+        self._write_calibration(renamed=True)
+        results = self._record_and_check(set(self.readers))
+        self.assertEqual(results["calibration"].status, "PASS", results["calibration"])
+        self.assertEqual(results["mount of left_wrist_optical"].status, "PASS")
+        self.assertFalse([r for r in results.values() if r.status == "FAIL"])
+
+    def test_unknown_frames_stop_the_recorder(self) -> None:
+        config = dict(self.session.config, frame_names={"torso": "x"})
+        with self.assertRaisesRegex(ValueError, "no torso frame"):
+            McapSession(
+                config,
+                cameras={},
+                scene=self.scene,
+                tick_reader=self.session.tick_reader,
+                joint_reader=self.session.joint_reader,
+            )
 
 
 class EpisodeMetadataTest(unittest.TestCase):

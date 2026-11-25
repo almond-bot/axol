@@ -67,6 +67,10 @@ def imu_topic(camera: str) -> str:
     return f"{camera_base_topic(camera)}/imu"
 
 
+# The headset's tracking space, the frame of the raw headset input.
+VR_FRAME = "vr_world"
+
+
 def imu_frame_id(camera: str) -> str:
     """A camera IMU's frame (``head_camera_imu`` for the head camera)."""
     if camera == "overhead":
@@ -410,10 +414,15 @@ class Scene:
         self,
         edges: dict[str, np.ndarray],
         added: list[tuple[str, str, np.ndarray]],
+        frame_names: dict[str, str] | None = None,
     ) -> str:
         """The URDF with measured joint origins (``edges``, by child link) and
-        the ``added`` frames, so the robot model matches ``/tf_static``."""
-        if not edges and not added:
+        the ``added`` frames, so the robot model matches ``/tf_static``.
+
+        ``frame_names`` renames links (default name to new), as the episode
+        renames its frames; joint names stay.
+        """
+        if not edges and not added and not frame_names:
             return self.tree.xml
         root = ElementTree.fromstring(self.tree.xml)
         for el in root.findall("joint"):
@@ -429,7 +438,30 @@ class Scene:
             ElementTree.SubElement(joint, "parent", link=parent)
             ElementTree.SubElement(joint, "child", link=child)
             _set_origin(joint, transform)
+        if frame_names:
+            for el in root.findall("link"):
+                name = el.get("name")
+                if name in frame_names:
+                    el.set("name", frame_names[name])
+            for el in root.findall("joint"):
+                for end in ("parent", "child"):
+                    ref = el.find(end)
+                    if ref is not None and ref.get("link") in frame_names:
+                        ref.set("link", frame_names[ref.get("link")])
         return ElementTree.tostring(root, encoding="unicode")
+
+    def frame_ids(self) -> list[str]:
+        """Every frame an episode can name: the URDF's links, the TCPs, the
+        camera IMUs and the headset's tracking space."""
+        names = set(self.tree.links)
+        names.update(child for _, child, _ in self.tool_frames())
+        names.update(
+            imu_frame_id(c.camera)
+            for c in self.cameras.values()
+            if c.imu_requested or c.imu_socket
+        )
+        names.add(VR_FRAME)
+        return sorted(names)
 
     def imus(self) -> dict[str, tuple[str, str]]:
         """``{topic: (socket path, frame_id)}`` for every camera IMU recorded.
@@ -453,6 +485,12 @@ class Scene:
             for side in SIDES
             if self.tree.has_link(f"{side}_gripper")
         }
+
+    def ee_frames(self) -> dict[str, str]:
+        """The frame each side's end-effector pose is for: the TCP, or the
+        gripper mount for a gripper without one (parcel grippers)."""
+        tcp = {mount: child for mount, child, _ in self.tool_frames()}
+        return {side: tcp.get(link, link) for side, link in self.ee_links().items()}
 
     def ee_base(self) -> str:
         """Frame the end-effector poses are given in: the torso (``root``)."""
