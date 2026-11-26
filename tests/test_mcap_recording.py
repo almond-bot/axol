@@ -2082,6 +2082,40 @@ SOMM_FRAMES = {
 }
 
 
+class MeshUrlTest(unittest.TestCase):
+    """/robot_description points its meshes at the release on GitHub, so
+    viewers load the robot model from the file alone."""
+
+    def test_release_meshes_become_urls(self) -> None:
+        import xml.etree.ElementTree as ElementTree
+
+        from almond_axol.recording.mcap.scene import MESH_REPO_URL, mesh_base_url
+
+        urdf = urdf_path(AxolModel.MOBILE)
+        base = mesh_base_url(urdf, "0.2.48")
+        self.assertEqual(base, f"{MESH_REPO_URL}/v0.2.48/almond_axol/kinematics/urdf/")
+        scene = SimpleNamespace(tree=UrdfTree(urdf.read_text()), mesh_base=base)
+        xml = Scene.robot_description(scene, {}, [])
+        names = [m.get("filename") for m in ElementTree.fromstring(xml).iter("mesh")]
+        self.assertTrue(names)
+        for name in names:
+            self.assertTrue(name.startswith(base), name)
+            self.assertTrue((urdf.parent / name[len(base) :]).is_file(), name)
+
+    def test_no_urls_without_a_release(self) -> None:
+        from almond_axol.recording.mcap.scene import mesh_base_url
+
+        urdf = urdf_path(AxolModel.MOBILE)
+        for version in ("", "unknown", "0.2.48.dev3+g1234"):
+            self.assertEqual(mesh_base_url(urdf, version), "", version)
+        with tempfile.TemporaryDirectory() as tmp:
+            other = Path(tmp) / "robot.urdf"
+            other.write_text(urdf.read_text())
+            self.assertEqual(mesh_base_url(other, "0.2.48"), "")
+        scene = SimpleNamespace(tree=UrdfTree(urdf.read_text()), mesh_base="")
+        self.assertEqual(Scene.robot_description(scene, {}, []), scene.tree.xml)
+
+
 class FrameNamesTest(unittest.TestCase):
     def test_parses_pairs(self) -> None:
         from almond_axol.recording.mcap.topics import parse_frame_names

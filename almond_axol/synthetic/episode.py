@@ -186,6 +186,7 @@ class Rig:
             cameras=cameras,
             calibration_dir=self.calibration_dir,
             gripper="parallel",
+            software_version=options.software_version,
         )
         self.tree = self.scene.tree
         self.kin = ArmKinematics(self.tree)

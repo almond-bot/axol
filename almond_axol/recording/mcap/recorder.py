@@ -219,6 +219,7 @@ class McapSession:
                 cameras=sources,
                 calibration_dir=Path(config["calibration_dir"]),
                 gripper=config.get("gripper"),
+                software_version=str(config.get("software_version") or ""),
             )
         except BaseException:
             for reader in readers.values():

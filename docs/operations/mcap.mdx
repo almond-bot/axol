@@ -67,6 +67,8 @@ The `/base` topics appear on Axol on Jelly only. Time stamps are Unix time. Each
 
 `/joint_states` and `/joint_command` use the URDF's joint names, so the URDF in `/robot_description` places every link.
 
+The URDF links each mesh to its file on GitHub, at the release of the software that recorded the episode. Foxglove loads them when the computer is online, so the 3D panel shows the robot model. To show it, add a URDF layer to the 3D panel and set its source to the `/robot_description` topic.
+
 | Name | Joint |
 |---|---|
 | `left_s1_0`, `left_s2_0`, `left_s3_0` | Shoulder 1, 2 and 3 |

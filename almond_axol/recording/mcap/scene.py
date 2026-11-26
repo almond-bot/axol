@@ -23,6 +23,7 @@ Any other camera name is used as-is (``/<name>``, ``<name>_optical``).
 from __future__ import annotations
 
 import hashlib
+import re
 import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +45,31 @@ from .zed_conf import (
 _WRIST_SLOTS = {"left_arm": "left", "right_arm": "right"}
 LIFT_JOINT = "lift"
 BASE_JOINTS = ("base_x", "base_y", "base_yaw")
+
+# Where the released source tree is served, with CORS, so viewers such as
+# Foxglove can fetch the URDF's meshes by URL.
+MESH_REPO_URL = "https://raw.githubusercontent.com/almond-bot/axol"
+_PACKAGE_ROOT = Path(__file__).resolve().parents[3]
+_RELEASE = re.compile(r"^\d+\.\d+\.\d+$")
+_URL = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def mesh_base_url(urdf_path: Path, software_version: str) -> str:
+    """The URL prefix of the meshes next to ``urdf_path``, at the release tag
+    of ``software_version``.
+
+    Empty when the URDF isn't one this package ships, or the version isn't a
+    release (``X.Y.Z``): the meshes then keep their relative paths.
+    """
+    if not _RELEASE.match(software_version or ""):
+        return ""
+    try:
+        folder = Path(urdf_path).resolve().parent.relative_to(_PACKAGE_ROOT)
+    except ValueError:
+        return ""
+    if not folder.parts or folder.parts[0] != "almond_axol":
+        return ""
+    return f"{MESH_REPO_URL}/v{software_version}/{folder.as_posix()}/"
 
 
 def camera_topic(camera: str, eye: str | None) -> str:
@@ -233,6 +259,9 @@ class Scene:
     # Where each gripper's fingers close, in its mount link (None: no
     # gripper, or one without a defined tool centre).
     tool_offset: tuple[float, float, float] | None = None
+    # URL prefix that /robot_description puts before each relative mesh
+    # path ("" keeps the paths relative).
+    mesh_base: str = ""
 
     @classmethod
     def build(
@@ -245,6 +274,7 @@ class Scene:
         cameras: dict[str, CameraSource],
         calibration_dir: Path,
         gripper: str | None = None,
+        software_version: str = "",
     ) -> Scene:
         urdf_path = Path(urdf_path)
         raw = urdf_path.read_bytes()
@@ -257,6 +287,7 @@ class Scene:
             jelly_wheels=jelly_wheels and all(j in tree.joints for j in BASE_JOINTS),
             jelly_lift=jelly_lift and LIFT_JOINT in tree.joints,
             cameras=cameras,
+            mesh_base=mesh_base_url(urdf_path, software_version),
         )
         scene.arm_joints = {
             side: urdf_arm_joint_names(is_left=side == "left") for side in SIDES
@@ -420,11 +451,17 @@ class Scene:
         the ``added`` frames, so the robot model matches ``/tf_static``.
 
         ``frame_names`` renames links (default name to new), as the episode
-        renames its frames; joint names stay.
+        renames its frames; joint names stay. With :attr:`mesh_base`, each
+        relative mesh path becomes a URL.
         """
-        if not edges and not added and not frame_names:
+        if not edges and not added and not frame_names and not self.mesh_base:
             return self.tree.xml
         root = ElementTree.fromstring(self.tree.xml)
+        if self.mesh_base:
+            for mesh in root.iter("mesh"):
+                name = mesh.get("filename", "")
+                if name and not _URL.match(name) and not name.startswith("/"):
+                    mesh.set("filename", self.mesh_base + name)
         for el in root.findall("joint"):
             child = el.find("child")
             link = child.get("link") if child is not None else None
