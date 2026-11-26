@@ -1,0 +1,50 @@
+---
+title: "mcap.synthetic"
+description: "Write sample MCAP episodes from the sim, to try a data pipeline without a robot."
+---
+
+`axol mcap.synthetic` writes two sample episodes of Axol on Jelly with the Camera Kit, made in the sim. Use them to build and test a data pipeline before you have recordings from a robot. See [MCAP Recording](/operations/mcap).
+
+```bash
+axol mcap.synthetic ~/mcap-sample
+```
+
+It writes these files to the folder:
+
+| File | What it holds |
+|---|---|
+| `episode_000000.mcap` | The right arm puts a red cube in a bin. The episode uses a camera calibration. |
+| `episode_000001.mcap` | The left arm moves a blue cup next to the bin. The episode has no camera calibration, so its camera mounts come from CAD. |
+| `camera_calibration.json` | The camera calibration the first episode uses. |
+
+Each episode has the topics, metadata and format of an episode from Collect data:
+
+- video from the head camera's two eyes and both wrist cameras, rendered from where each camera is and through its lens;
+- joints, commands, the head camera's IMU, Jelly's odometry, wheels and lift, and the headset input;
+- the transform tree, `camera_info` and calibration metadata.
+
+The cameras, serial numbers and calibration are made up. Each episode's `custom` metadata has `synthetic=true`.
+
+Rendering takes about 20 minutes per 15-second episode at HD1200 and 60 fps on an 8-core computer.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--duration` | `15` | Seconds per episode. |
+| `--fps` | `60` | Camera frame rate. |
+| `--resolution` | `HD1200` | `HD1200` (1920 x 1200) or `SVGA` (960 x 600). |
+| `--codec` | `h264` | Video codec: `h264` or `h265`. |
+| `--quality` | `24` | Encoder quality. Lower is sharper and larger. |
+| `--workers` | `4` | Processes that render video. |
+| `--topic_names` | empty | Topic renames, written like **MCAP topic names**. |
+| `--frame_names` | empty | Frame renames, written like **MCAP frame names**. |
+| `--episode_metadata` | empty | `key=value` pairs, written like **Episode metadata**. |
+
+For example, to match a pipeline that uses its own names:
+
+```bash
+axol mcap.synthetic ~/mcap-sample --codec h265 \
+  --topic_names "/head/left/video=/top-left-camera/image-raw" \
+  --frame_names "root=lift_link"
+```
+
+The command renders offscreen with MuJoCo and encodes with PyAV, which come with the `lerobot` extra. On a computer without a GPU, it renders in software.

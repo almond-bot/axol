@@ -9,6 +9,7 @@ of every episode. It is JSON::
       "robot_serial": "E66138528F2B3F2A",
       "calibration_id": "cam-20261124T181500Z-3f9a21c4",
       "calibrated_at": "2026-11-24T18:15:00Z",
+      "due_at": "2026-12-24T18:15:00Z",
       "status": "pass",
       "transforms": [
         {"parent": "root", "child": "head_camera_left_optical",
@@ -24,8 +25,9 @@ quaternion ``x, y, z, w``. Frame names are the robot's URDF links. Only the
 measured frames are listed; everything else comes from the URDF.
 
 ``camera_serial`` (optional) names the camera that was measured. A transform
-whose camera has since been swapped is not used. Other keys (the board, the
-per-camera report) are informational.
+whose camera has since been swapped is not used. ``due_at`` (optional) is when
+the calibration expires: after it, the file is not used. Other keys (the
+board, the per-camera report) are informational.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +51,8 @@ DEFAULT_PATH = Path.home() / ".almond" / "camera_calibration.json"
 REPORTS_DIR = Path.home() / ".almond" / "camera_calibration"
 # A quaternion this far from unit length is a broken file, not rounding.
 _UNIT_TOLERANCE = 1e-3
+# How long a calibration stays valid unless the file says otherwise (days).
+VALID_DAYS = 30
 
 
 class CalibrationFileError(ValueError):
@@ -83,12 +88,22 @@ class CameraCalibration:
     transforms: tuple[FrameTransform, ...]
     raw: bytes
     sha256: str
+    due_at: str = ""
 
-    def problem_for(self, robot_serial: str | None) -> str | None:
-        """Why this file can't be used on ``robot_serial``, or ``None``."""
+    def problem_for(
+        self, robot_serial: str | None, now: datetime | None = None
+    ) -> str | None:
+        """Why this file can't be used on ``robot_serial`` (at ``now``), or
+        ``None``."""
         if self.status != "pass":
             return (
                 f"{self.path.name} records a failed calibration ({self.calibration_id})"
+            )
+        due = parse_time(self.due_at) if self.due_at else None
+        if due is not None and (now or datetime.now(UTC)) >= due:
+            return (
+                f"calibration {self.calibration_id} expired on {self.due_at}; "
+                "calibrate again"
             )
         if robot_serial and self.robot_serial and self.robot_serial != robot_serial:
             return (
@@ -100,6 +115,28 @@ class CameraCalibration:
                 f"this robot's serial is unknown, so {self.path.name} can't be matched"
             )
         return None
+
+
+def parse_time(text: str) -> datetime | None:
+    """An ISO 8601 time (``Z`` or an offset; UTC if neither), or ``None``."""
+    try:
+        out = datetime.fromisoformat(text.strip())
+    except ValueError:
+        return None
+    return out if out.tzinfo is not None else out.replace(tzinfo=UTC)
+
+
+def utc_text(when: datetime) -> str:
+    """``2026-11-24T18:15:00Z``: a UTC time to the second."""
+    return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def due_after(calibrated_at: str, days: float = VALID_DAYS) -> str:
+    """When a calibration made at ``calibrated_at`` expires (``""`` if never)."""
+    start = parse_time(calibrated_at)
+    if start is None or days <= 0:
+        return ""
+    return utc_text(start + timedelta(days=days))
 
 
 def quaternion_matrix(q: tuple[float, float, float, float]) -> np.ndarray:
@@ -179,6 +216,9 @@ def parse(raw: bytes, path: Path) -> CameraCalibration:
     status = doc.get("status")
     if status not in ("pass", "fail"):
         raise CalibrationFileError(f"{path.name} has no status (pass or fail)")
+    due_at = str(doc.get("due_at") or "")
+    if due_at and parse_time(due_at) is None:
+        raise CalibrationFileError(f"{path.name} has a due_at that is not a date")
     entries = doc.get("transforms")
     if not isinstance(entries, list) or not entries:
         raise CalibrationFileError(f"{path.name} lists no transforms")
@@ -198,6 +238,7 @@ def parse(raw: bytes, path: Path) -> CameraCalibration:
         transforms=transforms,
         raw=raw,
         sha256=hashlib.sha256(raw).hexdigest(),
+        due_at=due_at,
     )
 
 
@@ -242,15 +283,23 @@ def document(
     calibrated_at: str,
     status: str,
     transforms: list[dict[str, Any]],
+    due_at: str | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
-    """A whole calibration file as a JSON-ready dict."""
+    """A whole calibration file as a JSON-ready dict.
+
+    ``due_at`` defaults to :data:`VALID_DAYS` after ``calibrated_at``; pass
+    ``""`` for a calibration that never expires.
+    """
+    if due_at is None:
+        due_at = due_after(calibrated_at)
     return {
         "format": FORMAT,
         "version": VERSION,
         "robot_serial": robot_serial,
         "calibration_id": calibration_id,
         "calibrated_at": calibrated_at,
+        **({"due_at": due_at} if due_at else {}),
         "status": status,
         "transforms": transforms,
         **extra,

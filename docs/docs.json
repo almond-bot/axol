@@ -142,6 +142,7 @@
                   "cli/policy-check",
                   "cli/migrate-dataset",
                   "cli/mcap-check",
+                  "cli/mcap-synthetic",
                   "cli/calibration-cameras"
                 ]
               },

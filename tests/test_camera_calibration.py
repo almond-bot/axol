@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 import tempfile
 import time
 import unittest
@@ -176,9 +177,13 @@ class FileTest(unittest.TestCase):
         self.assertEqual(loaded.calibration_id, "cam-1")
         self.assertEqual(loaded.transforms[0].camera_serial, 7)
         np.testing.assert_allclose(loaded.transforms[0].matrix(), pose, atol=1e-12)
-        self.assertIsNone(loaded.problem_for("HUB1"))
-        self.assertIn("not this robot", loaded.problem_for("HUB2"))
-        self.assertIn("unknown", loaded.problem_for(None))
+        before = datetime(2026, 12, 1, tzinfo=UTC)
+        self.assertEqual(loaded.due_at, "2026-12-24T18:15:00Z")
+        self.assertIsNone(loaded.problem_for("HUB1", now=before))
+        self.assertIn("not this robot", loaded.problem_for("HUB2", now=before))
+        self.assertIn("unknown", loaded.problem_for(None, now=before))
+        after = datetime(2026, 12, 25, tzinfo=UTC)
+        self.assertIn("expired on 2026-12-24", loaded.problem_for("HUB1", now=after))
         self.assertIsNone(calfile.load(Path(directory) / "missing.json"))
 
     def test_broken_files(self) -> None:
@@ -187,6 +192,7 @@ class FileTest(unittest.TestCase):
             b"{": "not valid JSON",
             json.dumps(self._doc(calibration_id="")).encode(): "no calibration_id",
             json.dumps(self._doc(status="maybe")).encode(): "no status",
+            json.dumps(self._doc(due_at="soon")).encode(): "due_at that is not",
             json.dumps(self._doc(transforms=[])).encode(): "no transforms",
             json.dumps(self._doc(version=99)).encode(): "version 99",
             json.dumps(self._doc(format="other")).encode(): "not a camera calibration",
@@ -228,8 +234,10 @@ class BoardTest(unittest.TestCase):
         order = np.argsort(detection.ids)
         px = detection.pixels[order]
         self.assertAlmostEqual(
-            float(np.linalg.norm(px[1] - px[0])), 40 / 25.4 * 150, delta=1.5
+            float(np.linalg.norm(px[1] - px[0])), 30 / 25.4 * 150, delta=1.5
         )
+        self.assertEqual(detection.markers, 54)
+        self.assertTrue(board.usable(detection))
         self.assertIsNone(board.detect(np.full((400, 600), 255, np.uint8)))
 
     def test_pages(self) -> None:
@@ -237,11 +245,32 @@ class BoardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             pdf = board.save_page(Path(directory) / "board.pdf", dpi=100)
             self.assertTrue(pdf.read_bytes().startswith(b"%PDF"))
-            self.assertIn(b"MediaBox [ 0 0 792.0 612.0 ]", pdf.read_bytes())
+            # A3 landscape at actual size.
+            self.assertIn(b"MediaBox [ 0 0 1190.88 841.68 ]", pdf.read_bytes())
             png = board.save_page(Path(directory) / "board.png", dpi=100)
             self.assertTrue(png.read_bytes().startswith(b"\x89PNG"))
         with self.assertRaises(ValueError):
-            Board(BoardConfig(squares_x=9, square_mm=40)).render()
+            Board(BoardConfig(paper="letter")).render()
+        small = Board(
+            BoardConfig(
+                squares_x=6, squares_y=4, square_mm=40, marker_mm=30, paper="letter"
+            )
+        )
+        self.assertEqual(small.render(dpi=50).shape[1], round(279.4 * 50 / 25.4))
+
+    def test_usable_needs_markers_and_corners_off_one_line(self) -> None:
+        from almond_axol.camera_calibration.board import Detection
+
+        board = Board()
+        row = Detection(np.arange(11), np.zeros((11, 2)), markers=8)
+        self.assertFalse(board.usable(row))  # one row of corners
+        block = Detection(
+            np.array([0, 1, 2, 3, 11, 12, 13, 14, 22, 23, 24, 25]),
+            np.zeros((12, 2)),
+            markers=6,
+        )
+        self.assertTrue(board.usable(block))
+        self.assertFalse(board.usable(Detection(block.ids, block.pixels, markers=3)))
 
 
 class OpticsTest(unittest.TestCase):
@@ -488,7 +517,16 @@ class CliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "board.png"
             calibration_cameras.main(
-                ["--print_board", str(path), "--board.paper", "a4"]
+                [
+                    "--print_board",
+                    str(path),
+                    "--board.paper",
+                    "a4",
+                    "--board.squares_x",
+                    "8",
+                    "--board.squares_y",
+                    "6",
+                ]
             )
             self.assertTrue(path.exists())
 

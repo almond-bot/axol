@@ -39,7 +39,8 @@ from pathlib import Path
 from typing import Any
 
 from ..camera_calibration.board import BoardConfig
-from ..camera_calibration.file import DEFAULT_PATH
+from ..camera_calibration.checks import ProcedureLimits
+from ..camera_calibration.file import DEFAULT_PATH, REPORTS_DIR, VALID_DAYS
 from ..camera_calibration.session import CaptureRules, SessionOptions
 from ..camera_calibration.solve import Limits
 from ..constants import CAN_LEFT, CAN_RIGHT
@@ -72,6 +73,18 @@ class CameraCalibrationCmdConfig:
     """With from_report: save the calibration file if it passes."""
     output: str = str(DEFAULT_PATH)
     """Where to save the camera calibration file."""
+    sim: bool = False
+    """Run the calibration procedure in the sim: record Recording A and B of
+    the sim's robot, check them and write the evidence package. Nothing is
+    saved as this robot's calibration."""
+    packages: str = str(REPORTS_DIR)
+    """Folder for the evidence packages (one per calibration ID)."""
+    checks: ProcedureLimits = field(default_factory=ProcedureLimits)
+    """The procedure's pass/fail limits."""
+    valid_days: float = VALID_DAYS
+    """Days until a calibration expires (0: never)."""
+    sim_workers: int = 4
+    """With sim: processes that render video."""
     kd: float = 0.5
     """Gravity compensation damping (Nm·s/rad)."""
     fps: int = 30
@@ -234,6 +247,30 @@ def _run(cfg: CameraCalibrationCmdConfig) -> None:
                 pass
 
 
+def _run_sim(cfg: CameraCalibrationCmdConfig) -> None:
+    from dataclasses import replace
+
+    from ..camera_calibration.board import Board
+    from ..camera_calibration.procedure import report
+    from ..camera_calibration.sim import SimOptions, run_session
+
+    board_config = cfg.board
+    if not board_config.id:
+        board_config = replace(board_config, id="SIM-BOARD")
+    board = Board(board_config)
+    print(f"Calibrating the sim's robot with {board.describe()}.")
+    result = run_session(
+        Path(cfg.packages).expanduser() / "sim",
+        board,
+        options=SimOptions(workers=max(1, cfg.sim_workers)),
+        limits=cfg.checks,
+        calibration_path=None,
+        valid_days=cfg.valid_days,
+    )
+    for line in report(result):
+        print(line)
+
+
 def main(argv: list[str]) -> None:
     cfg = parse(CameraCalibrationCmdConfig, argv, fallback_overlay=_settings_overlay())
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
@@ -249,6 +286,9 @@ def main(argv: list[str]) -> None:
         return
     if cfg.from_report:
         _from_report(cfg)
+        return
+    if cfg.sim:
+        _run_sim(cfg)
         return
     try:
         _run(cfg)

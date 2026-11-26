@@ -10,19 +10,26 @@ Calibrate after you fit the Camera Kit. Calibrate again after you move, remount 
 ## What you need
 
 - Axol with the Camera Kit, with the head and wrist cameras assigned in the control panel's camera layout.
-- A printer, and something rigid and flat to mount the board on, such as foam board.
+- A calibration board (see below).
 - A clear table in front of Axol, in view of the head camera.
 - About 15 minutes.
 
-## Print the board
+## The board
 
-```bash
-axol calibration.cameras --print_board ~/calibration_board.pdf
-```
+Use a bought ChArUco board on a rigid, flat plate:
 
-1. Print the page at 100% (actual size). For A4 paper, add `--board.paper a4`.
-2. Tape it flat to the rigid board. Bumps and curls make the result worse.
-3. Measure one square with a ruler. It should be 40 mm. If it isn't, give the size you measured when you calibrate, for example `--board.square_mm 39.5`.
+| | |
+|---|---|
+| Squares | 12 x 9 |
+| Square size | 30 mm |
+| Marker size | 22 mm |
+| Markers | 5 x 5 ArUco dictionary (`DICT_5X5_100`) |
+
+Give the board's ID when you calibrate, for example `--board.id CB-0042`. Use the ID printed on the board, or one you write on it. Each calibration records it. Replace a board that is warped or damaged.
+
+For another board, set its size with `--board.squares_x`, `--board.squares_y`, `--board.square_mm`, `--board.marker_mm` and `--board.dictionary`.
+
+To try the tool before your board arrives, print one with `axol calibration.cameras --print_board ~/calibration_board.pdf` on A3 paper at 100%. Don't use a printed board for a calibration your episodes rely on: paper bends and printers scale.
 
 ## Calibrate
 
@@ -74,13 +81,55 @@ Every run keeps a report folder, `~/.almond/camera_calibration/run-<time>/`. Its
 
 ## How episodes use the calibration
 
-At the start of every episode, Collect data reads `~/.almond/camera_calibration.json`. It uses the file only when it passed and names this robot. The robot is named by its Axol hub serial.
+At the start of every episode, Collect data reads `~/.almond/camera_calibration.json`. It uses the file only when it passed, names this robot, and hasn't expired. The robot is named by its Axol hub serial.
 
 - Each measured camera is placed from the file. A lookup between the two frames in the file gives the file's values.
 - A camera that was swapped after calibrating keeps its CAD position until you calibrate again.
+- A calibration expires 30 days after it was made, at its `due_at` time. After that, episodes use the CAD positions until you calibrate again.
 - Without a usable file, episodes use the CAD positions. When you start Collect data, it says why the file isn't used.
 
 The episode's `calibration` metadata says which calibration was used and where each transform came from. See [Camera mounts](/operations/mcap#camera-mounts).
+
+## Try the procedure in the sim
+
+`axol calibration.cameras --sim true` runs the whole calibration procedure on the sim's robot, with no robot attached. The sim's cameras sit a few millimetres from CAD, and the result says how close the calibration came to their true positions. Nothing is saved as this robot's calibration.
+
+The procedure makes two separate recordings:
+
+- **Recording A** is for fitting. The board moves in front of the head camera, then lies on the table while each arm moves its wrist camera through generated poses around it.
+- **Recording B** is for testing. It repeats the same kinds of motion with different poses and a different board placement.
+
+The camera positions are fitted on Recording A only, then locked. Recording B is checked with those values held fixed. B is also fitted on its own, to check the result repeats. Each camera's lens and the head camera's stereo transform are the cameras' factory values.
+
+A calibration passes only if every check passes:
+
+| Check | Limit | Applies to |
+|---|---|---|
+| Reprojection error, median | 0.5 px or less | Each camera |
+| Reprojection error, 95th percentile | 2 px or less | Each camera |
+| Corners within 3 px | 95% or more | Each camera |
+| Error in the outer 20% of the image, 95th percentile | 5 px or less | Each camera |
+| Distinct poses in A and in B | 20 and 10 or more | Each camera |
+| Tilted views (15 degrees or more, from directions 10 degrees apart) | 4 or more | Each camera |
+| Image coverage | 12 of 16 cells, all four quadrants | Each camera |
+| Views where both eyes see the board, in A and in B | 10 or more each | Head camera |
+| Cross-camera error, median and 95th percentile | 1.5 px and 5 px or less | Head camera |
+| Repeatability between A and B | 0.5 degrees and 2.5 mm or less | Each camera |
+| Distance from CAD | 25 mm and 6 degrees or less | Each camera |
+
+Change a limit with `--checks.<name>`, for example `--checks.median_px 0.8`. The reprojection RMS and the head camera's epipolar residual are reported but not judged.
+
+Each calibration gets an ID of the form `<robot serial>-<date>-<run>`, such as `E66138528F2B3F2A-20261201-01`, and a due date 30 days later (`--valid_days`). Its evidence package is a folder named by the ID. The sim's packages are in `~/.almond/camera_calibration/sim/`. Each package holds:
+
+| File | Contents |
+|---|---|
+| `package.json` | The robot, cameras, board, image mode, lens values, every transform, both recordings with their IDs and SHA-256, every metric and check, and PASS or FAIL. |
+| `recording_A.mcap`, `recording_B.mcap` | The two recordings: every camera, the joints and the head camera's IMU. |
+| `corners_A.json`, `corners_B.json` | The board corners found in every frame that was examined, with its timestamp. |
+| `locked_A.json` | The values fitted on Recording A, saved before Recording B was examined. |
+| `camera_calibration.json` | The calibration file the session wrote, with `pass` or `fail`. |
+
+The sim run takes about 30 minutes on an 8-core computer, most of it rendering video. `--sim_workers` sets how many processes render.
 
 ## Solve again from a report
 
@@ -101,6 +150,7 @@ You can measure the cameras another way, for example with motion capture, and wr
   "robot_serial": "E66138528F2B3F2A",
   "calibration_id": "lab-2026-11-24",
   "calibrated_at": "2026-11-24T18:15:00Z",
+  "due_at": "2026-12-24T18:15:00Z",
   "status": "pass",
   "transforms": [
     {"parent": "root", "child": "head_camera_left_optical",
@@ -113,6 +163,8 @@ You can measure the cameras another way, for example with motion capture, and wr
 - Each transform gives the child frame's pose in the parent frame: the translation in metres and a unit quaternion in `x, y, z, w` order.
 - The parent must be fixed to the child, with no moving joint between them.
 - `camera_serial` is optional. When it is set, the transform applies only while that camera is fitted.
+- `due_at` is optional. When it is set, the file isn't used after that time.
+- Frame names can be the defaults below or the names you set in **MCAP frame names**.
 - List only the frames you measured. Every other frame comes from the URDF.
 
 | Camera | Child frame | Parent frame |

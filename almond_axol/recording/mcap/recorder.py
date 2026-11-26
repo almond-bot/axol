@@ -515,7 +515,7 @@ class McapSession:
             "gripper": config.get("gripper") or "",
             "jelly": "yes" if (scene.jelly_wheels or scene.jelly_lift) else "no",
             "software_version": config.get("software_version") or "",
-            "hostname": socket.gethostname(),
+            "hostname": config.get("hostname") or socket.gethostname(),
             "compute_serial": self.compute_serial,
         }
         recording_meta: dict[str, Any] = {
@@ -622,6 +622,7 @@ def calibration_metadata(
         "calibration_status": frames.status,
         "calibration_id": used.calibration_id if used is not None else "",
         "calibrated_at": used.calibrated_at if used is not None else "",
+        "due_at": used.due_at if used is not None else "",
         "calibration_file": used.path.name if used is not None else "",
         "calibration_file_sha256": used.sha256 if used is not None else "",
         "calibration_problem": frames.problem,

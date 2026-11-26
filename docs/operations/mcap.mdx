@@ -179,9 +179,9 @@ The `calibration` metadata says what was used:
 | Key | Contents |
 |---|---|
 | `calibration_status` | `calibrated` when every recorded camera is placed from the file, `partial` when some are, `uncalibrated` when none are. |
-| `calibration_id`, `calibrated_at` | The file's ID and date. Empty when no file was used. |
+| `calibration_id`, `calibrated_at`, `due_at` | The file's ID, date and expiry. Empty when no file was used. |
 | `calibration_file`, `calibration_file_sha256` | The file's name and SHA-256. |
-| `calibration_problem` | Why no file was used, such as no file or a file for another robot. |
+| `calibration_problem` | Why no file was used, such as no file, a file for another robot, or an expired calibration. |
 | `calibration_skipped` | Transforms in the file that were not used, and why. |
 | `tf_sources` | The source of every `/tf_static` transform: `calibration`, `zed_factory`, `urdf`, `gripper_model`, or `urdf_at_zero` for a moving joint nothing measures. |
 | `<camera>.extrinsics` | The source of each camera's mount. |
@@ -243,3 +243,7 @@ axol mcap.check ~/.cache/huggingface/lerobot/myorg/pick/episode_000000.mcap
 ```
 
 It exits with status 1 if something required is missing.
+
+## Sample episodes
+
+To get sample files without a robot, run [`axol mcap.synthetic`](/cli/mcap-synthetic). It writes two episodes made in the sim, with the same topics and metadata as Collect data's.

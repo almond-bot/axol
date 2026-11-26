@@ -421,6 +421,120 @@ class ZedConfTest(unittest.TestCase):
         np.testing.assert_allclose(transform[:3, :3], expected, atol=1e-12)
 
 
+# The layout of real factory files: distortion in its own sections.
+REAL_HEAD_CONF = """\
+[LEFT_CAM_FHD1200]
+fx=734.95
+fy=734.77
+cx=947.03
+cy=607.01
+
+[RIGHT_CAM_FHD1200]
+fx=735.4
+fy=735.2
+cx=962.6
+cy=598.3
+
+[LEFT_DISTO]
+k1=0.1094
+k2=0.0632
+k3=-0.0392
+k4=0.1171
+k5=0.1135
+k6=-0.0526
+p1=-0.00021
+p2=-0.00016
+
+[RIGHT_DISTO]
+k1=0.1101
+k2=0.0611
+k3=-0.0388
+k4=0.1162
+k5=0.1129
+k6=-0.0519
+p1=0.00012
+p2=-0.00009
+
+[STEREO]
+Baseline=49.80
+TY=-0.088
+TZ=0.142
+CV_FHD1200=0.0086
+RX_FHD1200=0.0022
+RZ_FHD1200=0.0010
+"""
+
+REAL_MONO_CONF = """\
+[CAM_FHD1200]
+fx=455.98
+fy=455.84
+cx=978.60
+cy=604.35
+
+[DISTO]
+k1=0.0684528
+k2=0.00473935
+k3=-0.00222603
+k4=-4.37426e-05
+k5=0
+k6=0
+p1=0
+p2=0
+"""
+
+
+class RealConfLayoutTest(unittest.TestCase):
+    def _load(self, text: str):
+        from almond_axol.recording.mcap.zed_conf import load_calibration
+
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "SN1.conf").write_text(text)
+            return load_calibration(1, Path(directory))
+
+    def test_head_distortion_comes_from_each_eye_section(self) -> None:
+        from almond_axol.recording.mcap.zed_conf import camera_intrinsics
+
+        calib = self._load(REAL_HEAD_CONF)
+        left = camera_intrinsics(
+            calib,
+            eye="left",
+            capture_resolution="HD1200",
+            width=1920,
+            height=1200,
+            fisheye=False,
+        )
+        right = camera_intrinsics(
+            calib,
+            eye="right",
+            capture_resolution="HD1200",
+            width=1920,
+            height=1200,
+            fisheye=False,
+        )
+        self.assertEqual(left.distortion_model, "rational_polynomial")
+        self.assertEqual(
+            left.d,
+            (0.1094, 0.0632, -0.00021, -0.00016, -0.0392, 0.1171, 0.1135, -0.0526),
+        )
+        self.assertEqual(right.d[2], 0.00012)
+
+    def test_mono_fisheye_distortion_comes_from_disto(self) -> None:
+        from almond_axol.recording.mcap.zed_conf import camera_intrinsics
+
+        calib = self._load(REAL_MONO_CONF)
+        info = camera_intrinsics(
+            calib,
+            eye="left",
+            capture_resolution="HD1200",
+            width=1920,
+            height=1200,
+            fisheye=True,
+        )
+        self.assertEqual(info.distortion_model, "equidistant")
+        self.assertEqual(info.d, (0.0684528, 0.00473935, -0.00222603, -4.37426e-05))
+        self.assertAlmostEqual(info.fx, 455.98)
+
+
 class UrdfTreeTest(unittest.TestCase):
     def test_forward_kinematics_matches_yourdfpy(self) -> None:
         import yourdfpy
@@ -1755,6 +1869,7 @@ def _calibration_doc(scene: Scene, **overrides) -> dict:
         robot_serial="HUB123",
         calibration_id="cam-test-1",
         calibrated_at="2026-11-24T18:15:00Z",
+        due_at="",
         status="pass",
         transforms=entries,
     )
@@ -2096,6 +2211,39 @@ class RenamedFramesTest(unittest.TestCase):
                 tick_reader=self.session.tick_reader,
                 joint_reader=self.session.joint_reader,
             )
+
+
+class CalibrationExpiryTest(unittest.TestCase):
+    """An expired calibration is not used: episodes record CAD mounts."""
+
+    tearDown = SessionTest.tearDown
+    _record = SessionTest._record
+    _record_and_check = SessionTest._record_and_check
+
+    def setUp(self) -> None:
+        SessionTest.setUp(self)  # type: ignore[arg-type]
+
+    def _write(self, due_at: str) -> None:
+        from almond_axol.camera_calibration.file import write
+
+        write(
+            _calibration_doc(self.scene, due_at=due_at),
+            Path(self._tmp.name) / "camera_calibration.json",
+        )
+
+    def test_an_expired_file_is_not_used(self) -> None:
+        self._write("2020-01-01T00:00:00Z")
+        results = self._record_and_check(set(self.readers))
+        self.assertEqual(results["calibration"].status, "WARN")
+        self.assertIn("expired on 2020-01-01T00:00:00Z", results["calibration"].detail)
+
+    def test_a_current_file_records_its_due_date(self) -> None:
+        self._write("2999-01-01T00:00:00Z")
+        self._record_and_check(set(self.readers))
+        with (self.root / "episode_000000.mcap").open("rb") as f:
+            meta = {r.name: r.metadata for r in make_reader(f).iter_metadata()}
+        self.assertEqual(meta["calibration"]["calibration_status"], "calibrated")
+        self.assertEqual(meta["calibration"]["due_at"], "2999-01-01T00:00:00Z")
 
 
 class EpisodeMetadataTest(unittest.TestCase):

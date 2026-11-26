@@ -2,14 +2,19 @@
 
 The ZED SDK caches each camera's factory calibration in
 ``/usr/local/zed/settings/SN<serial>.conf`` (see :mod:`almond_axol.zed.calibration`).
-It is an INI file with one section per eye and sensor resolution, for example::
+It is an INI file with one section per eye and sensor resolution, the lens
+distortion per eye, and the stereo transform, for example::
 
     [LEFT_CAM_FHD1200]
     fx=733.4
     fy=733.1
     cx=969.2
     cy=592.8
-    k1=...
+
+    [LEFT_DISTO]
+    k1=0.109
+    ...
+    p2=-0.00016
 
     [STEREO]
     Baseline=50.02
@@ -22,9 +27,11 @@ It is an INI file with one section per eye and sensor resolution, for example::
 Reading the file needs no camera and no SDK, so the recorder can describe
 every camera's calibration while the relay owns the cameras.
 
-Distortion model. A pinhole calibration stores tangential terms (``p1``,
-``p2``) next to the radial ones; a fisheye calibration stores the four
-equidistant terms as ``k1`` to ``k4`` with no tangential terms. ROS calls those
+Distortion model. The terms are in ``[LEFT_DISTO]`` / ``[RIGHT_DISTO]`` for a
+stereo camera and ``[DISTO]`` for a mono one (a resolution section may also
+carry them). A pinhole calibration stores tangential terms (``p1``, ``p2``)
+next to the radial ones; a fisheye calibration stores the four equidistant
+terms as ``k1`` to ``k4`` with no tangential terms. ROS calls those
 ``plumb_bob`` / ``rational_polynomial`` and ``equidistant``.
 
 Stereo transform. ``Baseline``, ``TY`` and ``TZ`` (mm) place the right eye in
@@ -175,6 +182,23 @@ def _eye_section(
     return None
 
 
+_DISTORTION_KEYS = ("k1", "k2", "k3", "k4", "k5", "k6", "p1", "p2")
+
+
+def _with_distortion(
+    calib: CalibrationFile, eye: str, section: dict[str, float]
+) -> dict[str, float]:
+    """``section`` plus the eye's distortion terms, from ``[<EYE>_DISTO]``
+    (stereo) or ``[DISTO]`` (mono) when the section has none of its own."""
+    if any(key in section for key in _DISTORTION_KEYS):
+        return section
+    for name in (f"{eye.upper()}_DISTO", "DISTO"):
+        disto = calib.section(name)
+        if disto:
+            return {**section, **disto}
+    return section
+
+
 def distortion(
     values: dict[str, float], *, fisheye: bool
 ) -> tuple[str, tuple[float, ...]]:
@@ -227,7 +251,7 @@ def camera_intrinsics(
     if section is None:
         return None
     _, cap_w, cap_h = _CONF_RESOLUTIONS[capture_resolution]
-    model, coeffs = distortion(section, fisheye=fisheye)
+    model, coeffs = distortion(_with_distortion(calib, eye, section), fisheye=fisheye)
     base = Intrinsics(
         width=cap_w,
         height=cap_h,
