@@ -159,6 +159,13 @@ class ProcedureTest(unittest.TestCase):
             & (px[:, 1] >= 0)
             & (px[:, 1] < 1200)
         )
+        # Far off the axis the lens model folds back into the image, which a
+        # real image never shows: keep points whose pixel maps back to them.
+        front = np.where(ok)[0]
+        if len(front):
+            back = lens.normalized(px[front])
+            want = pts[front, :2] / pts[front, 2:]
+            ok[front[np.linalg.norm(back - want, axis=1) > 1e-6]] = False
         if ok.sum() < 20:
             return None
         return Detection(np.nonzero(ok)[0], px[ok], markers=20)

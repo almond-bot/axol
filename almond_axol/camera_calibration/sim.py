@@ -336,7 +336,7 @@ class CalibrationSim:
             points=self.board.points,
             count=head_poses,
             rng=self.rng,
-            min_z=self.table_z + 0.12,
+            min_z=self.table_z + 0.05,
         )
         start = head[0] if head else placements[0]
         plan = _Plan(self.tuck, start)

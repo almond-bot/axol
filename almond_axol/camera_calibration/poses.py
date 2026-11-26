@@ -207,7 +207,7 @@ def wrist_poses(
     candidates: list[WristPose] = []
     last = dict(seed)
     for _ in range(tries):
-        distance = rng.uniform(0.2, 0.42)
+        distance = rng.uniform(0.18, 0.42)
         angle = rng.choice([0.0, 0.0, 12.0, 20.0, 28.0, 36.0])
         azimuth = rng.uniform(0.0, 360.0)
         roll = rng.uniform(-45.0, 45.0)
@@ -215,8 +215,8 @@ def wrist_poses(
             board_in_root
             @ np.array(
                 [
-                    width / 2 + rng.uniform(-0.3, 0.3) * width,
-                    height / 2 + rng.uniform(-0.3, 0.3) * height,
+                    width / 2 + rng.uniform(-0.5, 0.5) * width,
+                    height / 2 + rng.uniform(-0.5, 0.5) * height,
                     0.0,
                     1.0,
                 ]
@@ -369,7 +369,7 @@ def head_board_poses(
     count: int,
     rng: np.random.Generator,
     min_z: float,
-    min_x: float = 0.2,
+    min_x: float = 0.12,
 ) -> list[np.ndarray]:
     """Board poses (in root) in front of the head camera that put the board
     in every part of the image, near and far, some tilted."""
@@ -381,14 +381,15 @@ def head_board_poses(
     seen: list[np.ndarray] = []
     cells = [(i, j) for j in range(GRID) for i in range(GRID)]
     tries = 0
-    while len(out) < count and tries < count * 40:
+    while len(out) < count and tries < count * 80:
         tries += 1
-        i, j = cells[len(out) % len(cells)]
+        # Every cell in turn: a cell the board cannot reach costs one try.
+        i, j = cells[tries % len(cells)]
         u = (i + rng.uniform(0.2, 0.8)) / GRID * lens.width
         v = (j + rng.uniform(0.2, 0.8)) / GRID * lens.height
         ray = np.append(lens.normalized(np.array([[u, v]]))[0], 1.0)
         ray /= np.linalg.norm(ray)
-        distance = rng.uniform(0.42, 0.8)
+        distance = rng.uniform(0.3, 0.8)
         centre_cam = ray * distance
         angle = rng.choice([0.0, 10.0, 20.0, 30.0])
         azimuth = rng.uniform(0.0, 360.0)
