@@ -165,7 +165,8 @@ class Rig:
         self.work = work
         self.calibration_dir = work / "zed"
         serials = write_files(self.calibration_dir)
-        self.imu_socket = str(work / "imu.sock")
+        # A short path: Unix socket names are limited to about 100 bytes.
+        self.imu_socket = str(Path(tempfile.mkdtemp(prefix="axsyn-")) / "imu.sock")
         meta = {
             "overhead_left": self._meta("overhead", "left", serials["overhead"], True),
             "overhead_right": self._meta(
