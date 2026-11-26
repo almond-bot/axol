@@ -12,7 +12,7 @@ Calibrate after you fit the Camera Kit. Calibrate again after you move, remount 
 - Axol with the Camera Kit, with the head and wrist cameras assigned in the control panel's camera layout.
 - A calibration board (see below).
 - A clear table in front of Axol, in view of the head camera.
-- About 15 minutes.
+- About 30 minutes.
 
 ## The board
 
@@ -33,71 +33,24 @@ To try the tool before your board arrives, print one with `axol calibration.came
 
 ## Calibrate
 
-The arms go limp in gravity compensation while the tool runs, so you can move them by hand.
+The session makes two separate recordings, both recorded like Collect data, with the same cameras, image mode and encoder:
 
-1. Run `axol calibration.cameras` on the robot.
-2. Lay the board flat on the table where the head camera sees it. Press Enter.
-3. Move the left arm by hand until its wrist camera points at the board, 20 to 40 cm away, then let go. When the arm is still, the tool takes a view and prints it.
-4. Take about four views from different angles. Between views, tilt the camera toward the board from another side, and turn it about its own axis.
-5. Do the same with the right arm.
-6. Press Enter, move the board to another spot on the table, and press Enter again. Views pause while you move it.
-7. Repeat steps 3 to 6 until the board has been in at least three places, spread across the table. Four places is better.
-8. Type `done` and press Enter. The tool solves and prints a result for each camera.
-9. Rest both arms on something, then press Enter to stop. The arms go limp when the tool stops.
+- **Recording A** is for fitting.
+- **Recording B** is for testing. It repeats the same kinds of motion with different poses and a different board placement.
 
-Keep your hands and body out of the head camera's view of the board when you can. Each wrist camera needs at least 10 views in total.
+Each recording has two parts. First you move the board in front of the head camera. Then the board lies on the table while each arm moves its wrist camera around it on its own. The arms move slowly. Keep people and objects clear of them, and keep a hand near the E-Stop.
+
+1. Park Jelly and leave the lift where it is for the whole session.
+2. Run `axol calibration.cameras --board.id <your board's ID>` on the robot. The arms rise out of the head camera's way.
+3. Press Enter, then hold the board in front of the head camera, 40 to 80 cm away. Move it slowly to every part of the camera's view, near and far, and tilt it toward the camera from each side. Pause about a second at each spot. The tool prints how many poses, tilted views and image cells it has, and says when there are enough.
+4. When the tool asks, lay the board flat on the table in front of the robot and press Enter. The tool finds it with the head camera, then moves the left arm, then the right arm, through poses around it.
+5. Recording A asks for a second spot on the table. Put the board somewhere else, at another angle, and press Enter.
+6. Recording B repeats steps 3 and 4 with one board spot.
+7. Rest the arms on something, then press Enter. The tool checks the recordings and prints the result.
+
+Keep your hands and body out of the head camera's view of the board while the arms move.
 
 ## Read the result
-
-Each camera gets `PASS` or `FAIL`, with what the tool measured:
-
-```
-Head camera: PASS. 24 views, error 0.62 px, 3.8 mm and 0.41 degrees from CAD.
-Left wrist camera: PASS. 14 views, error 1.10 px, 2.1 mm and 0.93 degrees from CAD, wrist turned 34 and 15 degrees.
-```
-
-A camera passes when all of these hold:
-
-| Check | Passes when |
-|---|---|
-| Views | A wrist camera has at least 10 views. The head camera saw the board in at least 3 places. |
-| Error | The board corners land within 3 px, on average, of where the calibration puts them. |
-| Wrist turn | The wrist turned about at least two different axes between views. |
-| Distance from CAD | The camera is within 25 mm and 6 degrees of its CAD position. |
-
-When every camera passes, the tool saves the calibration to `~/.almond/camera_calibration.json`.
-
-When a camera fails, nothing is saved, and the previous calibration stays in use. Fix the problem and run the tool again:
-
-| Message | What to do |
-|---|---|
-| `capture at least 10` | Take more views with that arm. |
-| `move it to at least 3 places` | Move the board to more spots, each one seen by the head camera and a wrist camera. |
-| `turned too little` | Tilt the wrist camera toward the board from more sides, not only from above. |
-| `from CAD` | Check the camera mount is tight, then calibrate again. |
-| `reprojection error` | Check the board is flat and the square size is right. Hold the arm still for each view. |
-
-Every run keeps a report folder, `~/.almond/camera_calibration/run-<time>/`. Its `checked` folder has each view with green circles where the tool found the board corners and red crosses where the calibration puts them. On a good calibration they overlap.
-
-## How episodes use the calibration
-
-At the start of every episode, Collect data reads `~/.almond/camera_calibration.json`. It uses the file only when it passed, names this robot, and hasn't expired. The robot is named by its Axol hub serial.
-
-- Each measured camera is placed from the file. A lookup between the two frames in the file gives the file's values.
-- A camera that was swapped after calibrating keeps its CAD position until you calibrate again.
-- A calibration expires 30 days after it was made, at its `due_at` time. After that, episodes use the CAD positions until you calibrate again.
-- Without a usable file, episodes use the CAD positions. When you start Collect data, it says why the file isn't used.
-
-The episode's `calibration` metadata says which calibration was used and where each transform came from. See [Camera mounts](/operations/mcap#camera-mounts).
-
-## Try the procedure in the sim
-
-`axol calibration.cameras --sim true` runs the whole calibration procedure on the sim's robot, with no robot attached. The sim's cameras sit a few millimetres from CAD, and the result says how close the calibration came to their true positions. Nothing is saved as this robot's calibration.
-
-The procedure makes two separate recordings:
-
-- **Recording A** is for fitting. The board moves in front of the head camera, then lies on the table while each arm moves its wrist camera through generated poses around it.
-- **Recording B** is for testing. It repeats the same kinds of motion with different poses and a different board placement.
 
 The camera positions are fitted on Recording A only, then locked. Recording B is checked with those values held fixed. B is also fitted on its own, to check the result repeats. Each camera's lens and the head camera's stereo transform are the cameras' factory values.
 
@@ -119,7 +72,16 @@ A calibration passes only if every check passes:
 
 Change a limit with `--checks.<name>`, for example `--checks.median_px 0.8`. The reprojection RMS and the head camera's epipolar residual are reported but not judged.
 
-Each calibration gets an ID of the form `<robot serial>-<date>-<run>`, such as `E66138528F2B3F2A-20261201-01`, and a due date 30 days later (`--valid_days`). Its evidence package is a folder named by the ID. The sim's packages are in `~/.almond/camera_calibration/sim/`. Each package holds:
+When every check passes, the tool saves the calibration to `~/.almond/camera_calibration.json`. When a check fails, nothing is saved, and the previous calibration stays in use until it expires:
+
+| Failed check | What to do |
+|---|---|
+| Distinct poses, tilted views or image coverage of the head camera | Move the board to more parts of the view, and tilt it more. |
+| Distinct poses or coverage of a wrist camera | Put the board nearer the middle of the table, where both arms reach it. |
+| Reprojection error | Check the board is flat and undamaged, and the board size is right. |
+| Repeatability or distance from CAD | Check the camera mounts are tight, then calibrate again. |
+
+Each calibration gets an ID of the form `<robot serial>-<date>-<run>`, such as `E66138528F2B3F2A-20261201-01`, and a due date 30 days later (`--valid_days`). Its evidence package is a folder named by the ID, in `~/.almond/camera_calibration/`. The package is kept whether the calibration passed or failed. It holds:
 
 | File | Contents |
 |---|---|
@@ -129,17 +91,28 @@ Each calibration gets an ID of the form `<robot serial>-<date>-<run>`, such as `
 | `locked_A.json` | The values fitted on Recording A, saved before Recording B was examined. |
 | `camera_calibration.json` | The calibration file the session wrote, with `pass` or `fail`. |
 
-The sim run takes about 30 minutes on an 8-core computer, most of it rendering video. `--sim_workers` sets how many processes render.
+Keep each package with the episodes recorded under that calibration.
 
-## Solve again from a report
+## How episodes use the calibration
 
-To solve a saved run again without the robot, for example with different limits:
+At the start of every episode, Collect data reads `~/.almond/camera_calibration.json`. It uses the file only when it passed, names this robot, and hasn't expired. The robot is named by its Axol hub serial.
 
-```bash
-axol calibration.cameras --from_report ~/.almond/camera_calibration/run-20261124T181500Z
-```
+- Each measured camera is placed from the file. A lookup between the two frames in the file gives the file's values.
+- A camera that was swapped after calibrating keeps its CAD position until you calibrate again.
+- A calibration expires 30 days after it was made, at its `due_at` time. After that, episodes use the CAD positions until you calibrate again.
+- Without a usable file, episodes use the CAD positions. When you start Collect data, it says why the file isn't used.
 
-It prints the result and writes it to a `resolved` folder inside the report. Add `--save_from_report true` to save the calibration file when every camera passes.
+The episode's `calibration` metadata says which calibration was used and where each transform came from. See [Camera mounts](/operations/mcap#camera-mounts).
+
+## Try the procedure in the sim
+
+`axol calibration.cameras --sim true` runs the whole procedure on the sim's robot, with no robot attached. The sim's cameras sit a few millimetres from CAD, and the result says how close the calibration came to their true positions. Its packages are in `~/.almond/camera_calibration/sim/`. Nothing is saved as this robot's calibration.
+
+The sim run takes about 40 minutes on an 8-core computer, most of it rendering video. `--sim_workers` sets how many processes render.
+
+## Quick check by hand
+
+`axol calibration.cameras --hand_guided true` is a shorter session without the two recordings or an evidence package. The arms go limp, and you move each wrist camera around the board by hand. It saves a calibration when every camera passes its own checks: enough views, an average error of 3 px or less, and within 25 mm and 6 degrees of CAD. Every run keeps a report folder, `~/.almond/camera_calibration/run-<time>/`, and `--from_report <folder>` solves a saved run again without the robot.
 
 ## Use your own calibration
 

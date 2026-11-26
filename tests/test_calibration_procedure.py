@@ -349,3 +349,141 @@ class JudgeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RobotSessionTest(unittest.TestCase):
+    """The robot session's flow, with stand-ins for the hardware."""
+
+    def test_a_recording_moves_through_its_phases(self) -> None:
+        import asyncio
+        import json
+        from unittest import mock
+
+        from almond_axol.camera_calibration import robot as robot_mod
+        from almond_axol.camera_calibration.poses import WristPose
+        from almond_axol.constants import AxolModel, urdf_path
+        from almond_axol.recording.mcap.urdf_tree import UrdfTree
+        from almond_axol.synthetic.episode import READY
+        from almond_axol.synthetic.motion import ArmKinematics
+
+        tree = UrdfTree.load(urdf_path(AxolModel.MOBILE))
+        kin = ArmKinematics(tree)
+        board = Board()
+        sent: list[tuple[np.ndarray, np.ndarray]] = []
+
+        class Arm:
+            def __init__(self, q) -> None:
+                self.positions = np.append(np.asarray(q, np.float32), 1.0)
+
+        class Robot:
+            left = Arm(READY["left"])
+            right = Arm(READY["right"])
+
+            async def motion_control(self, left=None, right=None) -> None:
+                sent.append((left, right))
+
+        solver = SimpleNamespace(
+            num_joints=14, left_indices=np.arange(7), right_indices=np.arange(7, 14)
+        )
+        calls: list[str] = []
+        recorder = SimpleNamespace(
+            start_episode=lambda task: calls.append("start"),
+            stop_capture=lambda: (calls.append("stop") or (40, None)),
+            save_episode=lambda info: calls.append(("save", info)),
+        )
+        relay = SimpleNamespace(set_raw_enabled=lambda on: calls.append(("raw", on)))
+        head_in_root = tree.fk("root", "head_camera_left_optical", {})
+        on_table = _pose(np.diag([1.0, -1.0, -1.0]), [0.4, -0.1, 0.42])
+        held = [
+            _pose(
+                Rotation.from_euler(
+                    "XZ", [20 if i % 2 else 0, a], degrees=True
+                ).as_matrix(),
+                [0.02 * i, 0.01 * i, 0.5],
+            )
+            for i, a in enumerate(range(0, 360, 45))
+        ]
+
+        class Head:
+            lens = _lens(False)
+            last_pixels = np.array(
+                [
+                    [x, y]
+                    for x in np.linspace(10, 1900, 8)
+                    for y in np.linspace(10, 1190, 8)
+                ]
+            )
+            calls = 0
+            table = False
+
+            def board_pose(self):
+                if self.table:
+                    return np.linalg.inv(head_in_root) @ on_table
+                Head.calls += 1
+                return held[min(Head.calls // 6, len(held) - 1)]
+
+        head = Head()
+        session = robot_mod.RobotSession(
+            robot=Robot(),
+            solver=solver,
+            kin=kin,
+            tree=tree,
+            board=board,
+            relay=relay,
+            recorder=recorder,
+            head=head,
+            wrist_lens={"left": _lens(True), "right": _lens(True)},
+            plan=robot_mod.RobotPlan(
+                head_a=4, rate_hz=50.0, hold_s=0.02, head_timeout_s=30.0
+            ),
+            work=Path("."),
+            say=lambda _m: None,
+        )
+
+        def linear(_solver, a, b, **_kw):
+            return [a + s * (b - a) for s in np.linspace(0, 1, 5)]
+
+        def poses(_kin, side, **kw):
+            q = dict(zip(kin.joints[side], READY[side], strict=True))
+            return [WristPose(q, np.eye(4), np.eye(4), np.zeros((0, 2)))]
+
+        async def answer(_prompt: str) -> str:
+            head.table = True
+            return ""
+
+        with (
+            mock.patch(
+                "almond_axol.teleop.trajectory.plan_collision_aware_trajectory", linear
+            ),
+            mock.patch.object(robot_mod, "wrist_poses", poses),
+            mock.patch.object(robot_mod, "_ask", answer),
+        ):
+            head.table = False
+
+            async def run() -> None:
+                # The head phase asks first (Enter), then sees held poses.
+                head.table = False
+                original = robot_mod._ask
+
+                async def first(prompt: str) -> str:
+                    robot_mod._ask = answer
+                    return ""
+
+                robot_mod._ask = first
+                try:
+                    await session.record("A", 4, 1, 1)
+                finally:
+                    robot_mod._ask = original
+
+            asyncio.run(run())
+        self.assertEqual(calls[:2], ["start", ("raw", True)])
+        self.assertIn("stop", calls)
+        save = next(c for c in calls if isinstance(c, tuple) and c[0] == "save")
+        phases = json.loads(save[1]["calibration_phases"])
+        self.assertEqual([p["kind"] for p in phases], ["head", "table", "table"])
+        self.assertEqual({p["arm"] for p in phases[1:]}, {"left", "right"})
+        self.assertTrue(all(p["end_ns"] >= p["start_ns"] for p in phases))
+        self.assertGreater(len(sent), 10)
+        # The arms end raised, out of the head camera's way.
+        last_left = sent[-1][0][:7]
+        np.testing.assert_allclose(last_left, session.raised["left"], atol=1e-5)

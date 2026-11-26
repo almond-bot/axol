@@ -38,8 +38,10 @@ CAMERAS = {
     "left_wrist": "/wrist/left",
     "right_wrist": "/wrist/right",
 }
-# An arm is still when no joint moves faster than this (rad/s) ...
-_STILL_RAD_S = 0.01
+# An arm is still when no joint moves faster than this (rad/s), measured
+# over _SPEED_SPAN_S so encoder noise doesn't count as motion ...
+_STILL_RAD_S = 0.02
+_SPEED_SPAN_S = 0.04
 # ... for this long around the frame (s).
 _STILL_S = 0.25
 # A held board moves less than this between frames (px, median corner).
@@ -137,9 +139,13 @@ def _still_windows(
     still for at least ``_STILL_S``."""
     if len(times) < 3:
         return []
-    dt = np.diff(times) / 1e9
-    speed = np.max(np.abs(np.diff(positions, axis=0)), axis=1) / np.maximum(dt, 1e-6)
-    still = speed < threshold
+    seconds = (times - times[0]) / 1e9
+    # Each sample's speed over the span ending at it.
+    back = np.searchsorted(seconds, seconds - _SPEED_SPAN_S)
+    back = np.minimum(back, np.arange(len(times)) - 1).clip(0)
+    span = np.maximum(seconds - seconds[back], 1e-6)
+    speed = np.max(np.abs(positions - positions[back]), axis=1) / span
+    still = (speed < threshold)[1:]
     spans: list[tuple[int, int]] = []
     start = None
     for i, s in enumerate(still):
@@ -205,16 +211,7 @@ def read(
                 joint_t.append(message.log_time)
                 joint_q.append(list(msg.position))
             elif topic == "/tf_static" and stereo is None:
-                msg = decoder(message.data)
-                for t in msg.transforms:
-                    if t.child_frame_id == "head_camera_right_optical":
-                        from .file import quaternion_matrix
-
-                        stereo = np.eye(4)
-                        r = t.transform.rotation
-                        stereo[:3, :3] = quaternion_matrix((r.x, r.y, r.z, r.w))
-                        tr = t.transform.translation
-                        stereo[:3, 3] = (tr.x, tr.y, tr.z)
+                stereo = _stereo(decoder(message.data))
     episode = metadata.get("episode", {})
     phases = [Phase(**p) for p in json.loads(episode.get("calibration_phases", "[]"))]
     lenses: dict[str, Lens] = {}
@@ -258,7 +255,10 @@ def read(
         frames = ctx.decode(av.Packet(au)) + ctx.decode(None)
         return frames[0].to_ndarray(format="gray") if frames else None
 
-    for key, messages in video.items():
+    head_moments: list[int] = []
+    order = sorted(video, key=lambda k: (k != "head_left", k))
+    for key in order:
+        messages = video[key]
         stamps = np.array([m[0] for m in messages], dtype=np.int64)
         picked: dict[int, tuple[str, int]] = {}
         for middle, kind, placement in wanted.get(key, []):
@@ -275,9 +275,23 @@ def read(
                 frames.append(
                     Frame(key, stamp, detection, joints_at(stamp), kind, placement)
                 )
-        # Head phases: every frame, kept where the board held still.
+        # Head phases: every frame, kept where the board held still. The right
+        # eye uses the left eye's moments, so the pair sees the board together.
+        if key == "head_right" and head_moments:
+            for moment in head_moments:
+                i = int(np.argmin(np.abs(stamps - moment)))
+                if abs(int(stamps[i]) - moment) > 2_000_000:
+                    continue
+                stamp, au, fmt = messages[i]
+                image = decode(key, au, fmt)
+                detection = board.detect(image) if image is not None else None
+                out.corners.append(_corner_record(key, stamp, detection, "head", 0))
+                if board.usable(detection):
+                    frames.append(
+                        Frame(key, stamp, detection, joints_at(stamp), "head")
+                    )
         for phase in phases:
-            if phase.kind != "head" or not key.startswith("head"):
+            if phase.kind != "head" or key != "head_left":
                 continue
             inside = [
                 i for i, s in enumerate(stamps) if phase.start_ns <= s <= phase.end_ns
@@ -290,6 +304,7 @@ def read(
                     return
                 i, detection = run[len(run) // 2]
                 stamp = int(stamps[i])
+                head_moments.append(stamp)
                 out.corners.append(_corner_record(key, stamp, detection, "head", 0))
                 if board.usable(detection):
                     frames.append(
@@ -316,6 +331,34 @@ def read(
         if progress is not None:
             progress(f"{path.name}: {key}: {len(frames)} usable views")
     return out
+
+
+def _stereo(msg: Any) -> np.ndarray | None:
+    """The right head eye in the left one, from ``/tf_static`` (both eyes
+    hang from the same link)."""
+    from .file import quaternion_matrix
+
+    eyes: dict[str, tuple[str, np.ndarray]] = {}
+    for t in msg.transforms:
+        if t.child_frame_id in (
+            "head_camera_left_optical",
+            "head_camera_right_optical",
+        ):
+            pose = np.eye(4)
+            r = t.transform.rotation
+            pose[:3, :3] = quaternion_matrix((r.x, r.y, r.z, r.w))
+            tr = t.transform.translation
+            pose[:3, 3] = (tr.x, tr.y, tr.z)
+            eyes[t.child_frame_id] = (t.header.frame_id, pose)
+    left = eyes.get("head_camera_left_optical")
+    right = eyes.get("head_camera_right_optical")
+    if left is None or right is None:
+        return None
+    if right[0] == "head_camera_left_optical":
+        return right[1]
+    if right[0] != left[0]:
+        return None
+    return np.linalg.inv(left[1]) @ right[1]
 
 
 def _held(a: Detection, b: Detection) -> bool:

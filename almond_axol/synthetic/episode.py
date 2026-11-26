@@ -733,6 +733,21 @@ def exposure_times(
     return times + rng.normal(0.0, 2e-5, n).clip(-6e-5, 6e-5)
 
 
+def camera_exposures(
+    sources: Sequence[str], fps: int, duration: float, rng: np.random.Generator
+) -> dict[str, np.ndarray]:
+    """Exposure times per camera; a stereo camera's eyes share theirs."""
+    out: dict[str, np.ndarray] = {}
+    for source in sources:
+        if source == "overhead_right" and "overhead_left" in out:
+            out[source] = out["overhead_left"]
+        else:
+            out[source] = exposure_times(source, fps, duration, rng)
+    if "overhead_left" in sources and "overhead_right" in sources:
+        out["overhead_right"] = out["overhead_left"]
+    return out
+
+
 def render_video(
     rig: Rig,
     timeline: Timeline,
@@ -1115,10 +1130,7 @@ def make_episodes(
             progress(f"{spec.task}: planning the motion")
             timeline = build_timeline(rig, spec, duration)
             rng = np.random.default_rng(spec.seed + 7)
-            exposures = {
-                src: exposure_times(src, options.fps, duration, rng)
-                for src in rig.raw_meta
-            }
+            exposures = camera_exposures(list(rig.raw_meta), options.fps, duration, rng)
             progress(
                 f"{spec.task}: rendering {sum(len(v) for v in exposures.values())} frames"
             )

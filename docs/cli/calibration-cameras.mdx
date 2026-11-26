@@ -10,7 +10,7 @@ axol calibration.cameras --board.id CB-0042
 axol calibration.cameras --sim true
 ```
 
-The cameras and arm settings come from the control panel's settings, the same ones teleop uses. The arms are in gravity compensation while it runs.
+The cameras, image mode and encoder come from Collect data's settings, and the arm and IK settings from teleop's. Without `--hand_guided`, the arms move on their own through generated poses.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -22,6 +22,7 @@ The cameras and arm settings come from the control panel's settings, the same on
 | `--board.paper {letter,a4,a3}` | `a3` | Paper size of the printable board. |
 | `--sim` | `false` | Run the two-recording calibration procedure on the sim's robot. See [Try the procedure in the sim](/operations/camera-calibration#try-the-procedure-in-the-sim). |
 | `--sim_workers` | `4` | With `--sim`: processes that render video. |
+| `--hand_guided` | `false` | A quick session where you move the arms by hand, without the two recordings or an evidence package. |
 | `--packages DIR` | `~/.almond/camera_calibration` | Folder for the evidence packages. |
 | `--checks.<name>` | | The procedure's limits, such as `--checks.median_px 0.5`. |
 | `--valid_days` | `30` | Days until a calibration expires. `0` means it never expires. |
@@ -36,7 +37,7 @@ The cameras and arm settings come from the control panel's settings, the same on
 | `--kd` | `0.5` | Gravity compensation damping, in N·m·s/rad. |
 | `--left_channel`, `--right_channel` | Panel settings | CAN interfaces of the arms. |
 
-While it runs:
+With `--hand_guided true`, while it runs:
 
 | Input | Effect |
 |---|---|

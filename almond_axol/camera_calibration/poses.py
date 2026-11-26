@@ -266,6 +266,27 @@ def _above_table(
     return bool(tcp[2, 3] > table_z + 0.03)
 
 
+def route(
+    kin: object,
+    side: str,
+    q_from: np.ndarray,
+    q_to: np.ndarray,
+    *,
+    table_z: float,
+    via: np.ndarray,
+    samples: int = 16,
+) -> list[np.ndarray]:
+    """Joint targets from ``q_from`` to ``q_to`` that keep the arm above the
+    table: straight in joint space, or through ``via`` (a raised pose) when
+    the straight move would bring a link too close to it."""
+    names = kin.joints[side]  # type: ignore[attr-defined]
+    for s in np.linspace(0.0, 1.0, samples):
+        q = dict(zip(names, q_from + s * (q_to - q_from), strict=True))
+        if not _above_table(kin, side, q, table_z - 0.02):
+            return [np.asarray(via, float), np.asarray(q_to, float)]
+    return [np.asarray(q_to, float)]
+
+
 def _select(candidates: list[WristPose], count: int, lens: object) -> list[WristPose]:
     """Tilted views from many sides first, then views that cover new parts
     of the image, then the most different of the rest; in a short path."""

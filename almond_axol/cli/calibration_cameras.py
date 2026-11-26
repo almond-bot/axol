@@ -44,12 +44,13 @@ from ..camera_calibration.file import DEFAULT_PATH, REPORTS_DIR, VALID_DAYS
 from ..camera_calibration.session import CaptureRules, SessionOptions
 from ..camera_calibration.solve import Limits
 from ..constants import CAN_LEFT, CAN_RIGHT
+from ..kinematics.config import KinematicsConfig
 from ..robot.config import AxolConfig
 from .config import LogLevel, parse
 
 _logger = logging.getLogger(__name__)
 # Shared settings this command reads (from teleop's: the cameras and the arms).
-_SETTINGS_KEYS = ("axol", "left_channel", "right_channel", "cameras")
+_SETTINGS_KEYS = ("axol", "left_channel", "right_channel", "cameras", "kinematics")
 
 
 @dataclass
@@ -59,6 +60,8 @@ class CameraCalibrationCmdConfig:
     axol: AxolConfig = field(default_factory=AxolConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
+    kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)
+    """Robot model and IK settings for moving the arms (from the panel)."""
     cameras: dict[str, int] = field(default_factory=dict)
     """Camera slot to ZED serial (overhead, left_arm, right_arm). Defaults to
     the control panel's camera settings."""
@@ -85,6 +88,9 @@ class CameraCalibrationCmdConfig:
     """Days until a calibration expires (0: never)."""
     sim_workers: int = 4
     """With sim: processes that render video."""
+    hand_guided: bool = False
+    """Instead of the procedure: one quick session where you move the arms
+    by hand. It saves a calibration but no evidence package."""
     kd: float = 0.5
     """Gravity compensation damping (Nm·s/rad)."""
     fps: int = 30
@@ -247,6 +253,28 @@ def _run(cfg: CameraCalibrationCmdConfig) -> None:
                 pass
 
 
+def _run_procedure(cfg: CameraCalibrationCmdConfig) -> None:
+    from ..camera_calibration.board import Board
+    from ..camera_calibration.procedure import report
+    from ..camera_calibration.robot import run_robot_session
+
+    if not cfg.board.id:
+        raise SystemExit(
+            "Give the board's ID with --board.id (the ID printed on it, or one "
+            "you write on it)."
+        )
+    if cfg.left_channel is None or cfg.right_channel is None:
+        raise SystemExit("Both arms must be on: each wrist camera needs its arm.")
+    board = Board(cfg.board)
+    print(
+        f"Camera calibration with {board.describe()}. Keep the base parked and the "
+        "lift still for the whole session, and keep the area around the arms clear."
+    )
+    result = asyncio.run(run_robot_session(cfg, board))
+    for line in report(result):
+        print(line)
+
+
 def _run_sim(cfg: CameraCalibrationCmdConfig) -> None:
     from dataclasses import replace
 
@@ -291,6 +319,9 @@ def main(argv: list[str]) -> None:
         _run_sim(cfg)
         return
     try:
-        _run(cfg)
+        if cfg.hand_guided:
+            _run(cfg)
+        else:
+            _run_procedure(cfg)
     except KeyboardInterrupt:
         print("\nStopped. Nothing was saved.")

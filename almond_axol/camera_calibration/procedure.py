@@ -251,7 +251,10 @@ def run(
         board=_board_identity(board),
         package=str(folder),
     )
-    file_in_package = write(doc, folder / "camera_calibration.json")
+    # A session that fitted nothing has no transforms, so no file to write.
+    file_in_package = (
+        write(doc, folder / "camera_calibration.json") if entries else None
+    )
     notes: list[str] = []
     if truth:
         for key, value in mounts_a.items():
@@ -352,12 +355,12 @@ def run(
             "Recording B was examined. Recording B was used only to check them and "
             "for the separate repeatability fit; its values replace nothing."
         ),
-        "calibration_file": file_in_package.name,
+        "calibration_file": file_in_package.name if file_in_package else None,
         "notes": notes,
     }
     write_json(folder / "package.json", package)
     written = None
-    if passed and calibration_path is not None:
+    if passed and entries and calibration_path is not None:
         written = write(doc, calibration_path)
     return SessionResult(
         passed, calibration_id, folder, outcome, mounts_a, written, notes

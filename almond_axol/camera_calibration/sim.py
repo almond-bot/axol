@@ -38,7 +38,7 @@ from ..synthetic.episode import (
     SyntheticOptions,
     Timeline,
     _props,
-    exposure_times,
+    camera_exposures,
     follow,
     play_episode,
     render_video,
@@ -47,7 +47,7 @@ from ..synthetic.motion import min_jerk, rotation_exp, rotation_log
 from ..synthetic.render import Prop
 from .board import Board
 from .optics import Lens
-from .poses import head_board_poses, wrist_poses
+from .poses import head_board_poses, route, wrist_poses
 
 _SIDES = ("left", "right")
 # Move and hold times (s).
@@ -348,12 +348,12 @@ class CalibrationSim:
             zip(placements, estimates, strict=True), start=1
         ):
             plan.move_board(placement, _PLACE_MOVE, 0.5)
-            target = estimate if estimate is not None else placement
+            aim = estimate if estimate is not None else placement
             for side in _SIDES:
                 found = wrist_poses(
                     self.kin,
                     side,
-                    board_in_root=target,
+                    board_in_root=aim,
                     board_size=self.board.size_m,
                     points=self.board.points,
                     lens=self.lenses[f"{side}_arm"],
@@ -368,9 +368,18 @@ class CalibrationSim:
                 )
                 begin = plan.t
                 for pose in found:
-                    plan.move_arm(
-                        side, np.array([pose.joints[n] for n in self.kin.joints[side]])
+                    target = np.array([pose.joints[n] for n in self.kin.joints[side]])
+                    steps = route(
+                        self.kin,
+                        side,
+                        plan.arm_now[side],
+                        target,
+                        table_z=self.table_z,
+                        via=self.tuck[side],
                     )
+                    for step in steps[:-1]:
+                        plan.move_arm(side, step, hold=0.0)
+                    plan.move_arm(side, steps[-1])
                 plan.move_arm(side, self.tuck[side], hold=0.2)
                 plan.phases.append(("table", begin, plan.t, number, side))
         return plan, start
@@ -391,10 +400,9 @@ class CalibrationSim:
 
         timeline = self._timeline(plan, start_board)
         duration = float(timeline.t[-1])
-        exposures = {
-            src: exposure_times(src, self.synthetic.fps, duration, self.rng)
-            for src in self.rig.raw_meta
-        }
+        exposures = camera_exposures(
+            list(self.rig.raw_meta), self.synthetic.fps, duration, self.rng
+        )
         frames = sum(len(v) for v in exposures.values())
         self.progress(f"Recording {label}: {duration:.0f} s, rendering {frames} frames")
         aus = render_video(self.rig, timeline, self.synthetic, exposures, self.progress)

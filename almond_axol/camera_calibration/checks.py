@@ -281,13 +281,20 @@ def view_counts(recording: Recording, board: Board) -> dict[str, dict[str, Any]]
     return out
 
 
-def _pairs(recording: Recording) -> list[tuple[Frame, Frame]]:
-    right = {f.stamp_ns: f for f in recording.frames.get("head_right", [])}
-    return [
-        (f, right[f.stamp_ns])
-        for f in recording.frames.get("head_left", [])
-        if f.stamp_ns in right
-    ]
+def _pairs(
+    recording: Recording, within_ns: int = 2_000_000
+) -> list[tuple[Frame, Frame]]:
+    """Left and right head views of the same moment (stamps within 2 ms)."""
+    right = recording.frames.get("head_right", [])
+    stamps = np.array([f.stamp_ns for f in right], dtype=np.int64)
+    out = []
+    for frame in recording.frames.get("head_left", []):
+        if not len(stamps):
+            break
+        i = int(np.argmin(np.abs(stamps - frame.stamp_ns)))
+        if abs(int(stamps[i]) - frame.stamp_ns) <= within_ns:
+            out.append((frame, right[i]))
+    return out
 
 
 def cross_camera(
