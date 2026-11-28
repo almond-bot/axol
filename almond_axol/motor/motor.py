@@ -118,6 +118,7 @@ class Motor:
         self.mode: ControlMode | None = None
         cfg = _JOINT_CONFIG[joint]
         motor_id = can_id if can_id is not None else cfg.motor_id
+        self.motor_id = motor_id
         self._driver = make_driver(bus, motor_id, kt=cfg.kt)
         self._position: float | None = None
         self._velocity: float | None = None

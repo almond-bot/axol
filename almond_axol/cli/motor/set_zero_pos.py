@@ -31,10 +31,11 @@ import asyncio
 import math
 import sys
 
-from ...constants import ARM_JOINTS, Joint
+from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
 from ...motor.bus import CanBus
 from ...motor.damiao import DamiaoMotor
 from ...motor.motor import Motor, make_driver
+from ...robot import joint_zero
 from ...robot.axol import EITHER_STOP_JOINTS, closer_end_stop
 from ...robot.safety import SafetyBoard, SafetyError, resolve_safety_channel
 from .. import web_prompt
@@ -145,6 +146,31 @@ def _parse_arm_joints(spec: str | None) -> list[Joint]:
     return [j for j in ARM_JOINTS if j in selected] or list(ARM_JOINTS)
 
 
+def _arm_side(args: argparse.Namespace, channel: str) -> str | None:
+    """The arm a single-motor zero is on, or ``None`` for a motor outside an
+    arm (a test stand on another bus)."""
+    if getattr(args, "l", False) or channel == CAN_LEFT:
+        return "left"
+    if getattr(args, "r", False) or channel == CAN_RIGHT:
+        return "right"
+    return None
+
+
+def _joint_for_id(motor_id: int) -> Joint | None:
+    """The joint an arm's CAN ID drives (``0x01`` is shoulder_1, ``0x08`` the gripper)."""
+    joints = list(Joint)
+    return joints[motor_id - 1] if 1 <= motor_id <= len(joints) else None
+
+
+def _record(side: str | None, joints: dict[str, dict], method: str) -> None:
+    """Add this zeroing to the robot's joint zeroing record."""
+    if side is None or not joints:
+        return
+    event = joint_zero.record_quietly(side, joints, method)
+    if event is not None:
+        print(f"\n  {joint_zero.summary_line(event)}")
+
+
 async def _run_single(args: argparse.Namespace) -> None:
     channel = resolve_channel(args)
     print(f"\nset-zero-pos — {channel}  id={args.id:#04x}")
@@ -160,6 +186,20 @@ async def _run_single(args: argparse.Namespace) -> None:
         after = await motor.get_position()
         print(f"  after:  {after:+.4f} rad")
         print("  done")
+
+        joint = _joint_for_id(args.id)
+        if joint is not None:
+            _record(
+                _arm_side(args, channel),
+                {
+                    joint.value: {
+                        "motor_id": args.id,
+                        "end_stop_deg": None,
+                        "reading_before_rad": round(before, 6),
+                    }
+                },
+                joint_zero.METHOD_SINGLE,
+            )
 
         if isinstance(motor, DamiaoMotor):
             print("\n  ⚠  Damiao motor — power-cycle required to apply.")
@@ -213,14 +253,15 @@ async def _calibrate_joint_either_stop(
     p_start: float,
     magnitude_rad: float,
     web_prompts: bool,
-) -> bool:
+) -> dict | None:
     """Zero one joint at whichever of its two end stops the operator chose.
 
     For :data:`EITHER_STOP_JOINTS` (symmetric limits ±``magnitude_rad``):
     the operator moves from the in-range start reference ``p_start`` to
     either stop; the direction of travel identifies which one, and the
     runtime later re-detects the side from the encoder reading, so no side
-    needs to be recorded. Returns ``True`` on success.
+    needs to be recorded. Returns what the zeroing record keeps on success,
+    ``None`` when skipped.
     """
     mag_deg = math.degrees(magnitude_rad)
     print(f"\n— {joint.name}  →  EITHER end stop (±{mag_deg:.1f}°) —")
@@ -232,7 +273,7 @@ async def _calibrate_joint_either_stop(
             f"-{mag_deg:.1f}° — whichever is better placed)",
             web_prompts,
         ):
-            return False
+            return None
         p_end = await motor.get_position()
         print(f"     end:   {_fmt(p_end)}")
 
@@ -256,7 +297,11 @@ async def _calibrate_joint_either_stop(
             f"    ✓ zeroed at the {chosen_deg:+.1f}° end stop at {_fmt(p_end)} "
             f"(side is auto-detected at runtime)."
         )
-        return True
+        return {
+            "motor_id": getattr(motor, "motor_id", None),
+            "end_stop_deg": round(chosen_deg, 2),
+            "reading_before_rad": round(p_end, 6),
+        }
 
 
 async def _calibrate_joint(
@@ -266,10 +311,10 @@ async def _calibrate_joint(
     target_rad: float,
     expected_sign: int,
     web_prompts: bool,
-) -> bool:
+) -> dict | None:
     """Zero one joint at its closer end stop, measured from ``p_start``.
 
-    Returns ``True`` on success.
+    Returns what the zeroing record keeps on success, ``None`` when skipped.
     """
     target_deg = math.degrees(target_rad)
     direction = "−" if expected_sign < 0 else "+"
@@ -281,7 +326,7 @@ async def _calibrate_joint(
     instruction = f"{joint.name}: move to the END STOP at {target_deg:+.1f}°"
     while True:
         if not _prompt(instruction, web_prompts):
-            return False
+            return None
         p_end = await motor.get_position()
         print(f"     end:   {_fmt(p_end)}")
 
@@ -315,7 +360,11 @@ async def _calibrate_joint(
         # Right direction → zero immediately, no extra confirmation.
         await motor.set_zero_position()
         print(f"    ✓ zeroed at {_fmt(p_end)}.")
-        return True
+        return {
+            "motor_id": getattr(motor, "motor_id", None),
+            "end_stop_deg": round(target_deg, 2),
+            "reading_before_rad": round(p_end, 6),
+        }
 
 
 async def _run_guided(args: argparse.Namespace) -> None:
@@ -366,6 +415,7 @@ async def _run_guided(args: argparse.Namespace) -> None:
             print(f"  {joint.name:<12} start: {_fmt(starts[joint])}")
 
         results: list[tuple[Joint, bool]] = []
+        zeroed: dict[str, dict] = {}
         zeroed_damiao: list[Joint] = []
         stopped = False
         for joint in joints:
@@ -373,11 +423,11 @@ async def _run_guided(args: argparse.Namespace) -> None:
             motor = motors[joint]
             try:
                 if joint in EITHER_STOP_JOINTS:
-                    ok = await _calibrate_joint_either_stop(
+                    info = await _calibrate_joint_either_stop(
                         motor, joint, starts[joint], abs(target), args.web_prompts
                     )
                 else:
-                    ok = await _calibrate_joint(
+                    info = await _calibrate_joint(
                         motor, joint, starts[joint], target, sign, args.web_prompts
                     )
             except KeyboardInterrupt:
@@ -386,13 +436,18 @@ async def _run_guided(args: argparse.Namespace) -> None:
                 # goes on to the summary and the Damiao power cycle.
                 stopped = args.web_prompts
                 break
+            ok = bool(info)
             results.append((joint, ok))
+            if ok:
+                zeroed[joint.value] = info if isinstance(info, dict) else {}
             if ok and isinstance(motor._driver, DamiaoMotor):
                 zeroed_damiao.append(joint)
 
         print("\n— summary —")
         for joint, ok in results:
             print(f"  {joint.name:<12} {'zeroed' if ok else 'skipped'}")
+        # Every zero already saved in a motor is recorded, even after a stop.
+        _record("left" if is_left else "right", zeroed, joint_zero.METHOD_GUIDED)
 
         if stopped:
             if zeroed_damiao:

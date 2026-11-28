@@ -32,7 +32,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
@@ -153,6 +153,38 @@ def _nudge(
     return out
 
 
+def write_joint_zero(path: Path, robot_serial: str, when: datetime) -> dict[str, str]:
+    """A zeroing record with both arms zeroed at their end stops at ``when``;
+    returns ``{side: zero ID}``."""
+    from ..constants import ARM_JOINTS
+    from ..robot import joint_zero
+    from ..robot.axol import closer_end_stop
+
+    ids = {}
+    for side in joint_zero.SIDES:
+        joints = {
+            joint.value: {
+                "motor_id": index + 1,
+                "end_stop_deg": round(
+                    math.degrees(closer_end_stop(joint, side == "left")[0]), 2
+                ),
+                "reading_before_rad": 0.0,
+            }
+            for index, joint in enumerate(ARM_JOINTS)
+        }
+        event = joint_zero.record(
+            side,
+            joints,
+            joint_zero.METHOD_GUIDED,
+            robot_serial=robot_serial,
+            path=path,
+            now=when,
+            hostname="synthetic",
+        )
+        ids[side] = event["zero_id"]
+    return ids
+
+
 class Rig:
     """The recorder's scene for Axol on Jelly with the Camera Kit, and the
     true camera mounts (a few mm from CAD) the renders use."""
@@ -204,6 +236,11 @@ class Rig:
                 )
             )
         now = datetime.now(UTC).replace(microsecond=0)
+        # Both arms zeroed at their end stops before the cameras were calibrated.
+        self.joint_zero_path = work / "joint_zero.json"
+        zero_ids = write_joint_zero(
+            self.joint_zero_path, options.robot_serial, now - timedelta(hours=1)
+        )
         calibrated_at = utc_text(now)
         self.calibration_doc = document(
             robot_serial=options.robot_serial,
@@ -211,6 +248,7 @@ class Rig:
             calibrated_at=calibrated_at,
             status="pass",
             transforms=entries,
+            joint_zero=zero_ids,
             synthetic=True,
         )
         truth = parse(
@@ -1114,6 +1152,7 @@ def make_episodes(
             "topic_names": dict(options.topic_names),
             "frame_names": dict(options.frame_names),
             "camera_calibration_path": str(calibration_path),
+            "joint_zero_path": str(rig.joint_zero_path),
             "teleop_hz": CONTROL_HZ,
         },
         cameras=readers,

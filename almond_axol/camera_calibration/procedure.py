@@ -136,6 +136,13 @@ def fit(
     return mounts, solution
 
 
+def joint_zero_ids(recording: Recording) -> dict[str, str]:
+    """``{side: zero ID}``: the joint zeroing each arm was on in a recording
+    (empty IDs when the robot had no zeroing record)."""
+    meta = recording.metadata.get("joint_zero", {})
+    return {side: str(meta.get(f"{side}.zero_id", "")) for side in ("left", "right")}
+
+
 def run(
     path_a: Path,
     path_b: Path,
@@ -241,6 +248,7 @@ def run(
         for key in _FRAMES
         if key in mounts_a
     ]
+    zero = joint_zero_ids(rec_a)
     doc = document(
         robot_serial=robot_serial,
         calibration_id=calibration_id,
@@ -250,6 +258,7 @@ def run(
         transforms=entries,
         board=_board_identity(board),
         package=str(folder),
+        joint_zero=zero,
     )
     # A session that fitted nothing has no transforms, so no file to write.
     file_in_package = (
@@ -288,6 +297,12 @@ def run(
                 "software_version", ""
             ),
             "image_mode": _image_mode(rec_a),
+            "joint_zero": {
+                **zero,
+                "record_sha256": rec_a.metadata.get("joint_zero", {}).get(
+                    "file_sha256", ""
+                ),
+            },
             **dict(identity or {}),
         },
         "intrinsics": {

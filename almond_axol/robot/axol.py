@@ -1940,8 +1940,33 @@ class AxolArm:
 
         Args:
             joints: List of joints to zero.
+
+        Each zeroing is added to the robot's joint zeroing record
+        (:mod:`almond_axol.robot.joint_zero`).
         """
+        before: dict[Joint, float | None] = {}
+        for j in joints:
+            try:
+                before[j] = float(await self.motors[j].get_position())
+            except Exception:  # noqa: BLE001 - the record notes it as unknown
+                before[j] = None
         await asyncio.gather(*[self.motors[j].set_zero_position() for j in joints])
+        from . import joint_zero
+
+        joint_zero.record_quietly(
+            "left" if self._is_left else "right",
+            {
+                j.value: {
+                    "motor_id": getattr(self.motors[j], "motor_id", None),
+                    "end_stop_deg": None,
+                    "reading_before_rad": (
+                        round(before[j], 6) if before[j] is not None else None
+                    ),
+                }
+                for j in joints
+            },
+            joint_zero.METHOD_SDK,
+        )
         # A re-zeroed joint's encoder moved under us: an either-stop joint's
         # detected offset no longer describes it (Damiao applies the new zero
         # after a power cycle, but the old detection is stale either way),

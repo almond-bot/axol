@@ -404,7 +404,50 @@ def check(path: Path) -> list[Result]:
         value = meta.get(record, {}).get(key, "")
         add(True if value else None, f"{record}.{key}", value or "empty")
     _check_calibration(s, add, calibration, static_poses)
+    _check_joint_zero(s, add, meta.get("joint_zero", {}))
     return results
+
+
+def _check_joint_zero(s: EpisodeSummary, add: Any, zero: dict[str, str]) -> None:
+    """Which joint zeroing each arm was on, and whether it changed since the
+    camera calibration."""
+    if not zero:
+        add(None, "joint zero", "no joint_zero metadata")
+        return
+    status = zero.get("status", "")
+    if status == "no record":
+        add(None, "joint zero", zero.get("problem") or "no zeroing record")
+        return
+    for side in ("left", "right"):
+        zero_id = zero.get(f"{side}.zero_id", "")
+        missing = zero.get(f"{side}.unrecorded_joints", "")
+        if zero_id:
+            add(
+                True,
+                f"joint zero: {side} arm",
+                f"{zero_id}, last zeroed {zero.get(f'{side}.last_zeroed_at') or '?'}",
+            )
+        else:
+            add(None, f"joint zero: {side} arm", f"no record for {missing or 'it'}")
+    name = zero.get("file", "")
+    if name:
+        raw = s.attachments.get(name)
+        if raw is None:
+            add(False, "joint zero record", f"{name} is not attached")
+        else:
+            ok = hashlib.sha256(raw).hexdigest() == zero.get("file_sha256", "")
+            add(
+                ok,
+                "joint zero record",
+                "attached" if ok else f"{name} does not match its SHA-256",
+            )
+    match = zero.get("camera_calibration", "")
+    if match == "same":
+        add(True, "joint zero since calibration", "unchanged")
+    elif match.startswith("changed"):
+        add(None, "joint zero since calibration", match)
+    elif match == "unknown":
+        add(None, "joint zero since calibration", "unknown (not recorded)")
 
 
 def _check_tf(

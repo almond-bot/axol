@@ -45,6 +45,7 @@ from typing import Any
 import numpy as np
 
 from ...camera_calibration.file import DEFAULT_PATH as DEFAULT_CALIBRATION_PATH
+from ...robot import joint_zero
 from ...video.shm_frames import SnapshotReader, SnapshotWriter
 from .episode import FORMAT_VERSION, EpisodeRecording, iso_utc
 from .rings import (
@@ -158,6 +159,12 @@ class McapSession:
             config.get("camera_calibration_path") or DEFAULT_CALIBRATION_PATH
         ).expanduser()
         self.frames: EpisodeFrames | None = None
+        # The joint zeroing record (almond_axol.robot.joint_zero), read again
+        # at the start of every episode. ``None`` is ~/.almond/joint_zero.json.
+        zero_path = config.get("joint_zero_path")
+        self.joint_zero_path = Path(zero_path).expanduser() if zero_path else None
+        self.zero: joint_zero.ZeroState | None = None
+        self._zero_note: str | None = None
         # The frame each IMU topic is written in this episode.
         self.imu_frames: dict[str, str] = {}
         self._calibration_note: str | None = None
@@ -293,6 +300,15 @@ class McapSession:
             frames=self.frames,
             frame_names=self.frame_names,
         )
+        self.zero = self._joint_zero()
+        if self.zero.raw:
+            # The record itself, so the zeroing history can be checked later.
+            self.episode.file.attachment(
+                joint_zero.FILE_NAME,
+                "application/json",
+                self.zero.raw,
+                self.episode.stamp(start_perf),
+            )
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._capture_loop, name="mcap-capture", daemon=True
@@ -347,6 +363,39 @@ class McapSession:
                     frames.status,
                 )
         return frames
+
+    def _calibration_zero(self) -> dict[str, str] | None:
+        """The zeroing each arm was on when the cameras were calibrated:
+        ``None`` without a camera calibration in use, ``{}`` when the
+        calibration didn't record it."""
+        calibration = self.frames.calibration if self.frames is not None else None
+        if calibration is None:
+            return None
+        return dict(calibration.joint_zero)
+
+    def _joint_zero(self) -> joint_zero.ZeroState:
+        """The zeroing each arm joint is on, from the zeroing record."""
+        zero = joint_zero.state(
+            self.config.get("robot_serial") or "", self.joint_zero_path
+        )
+        match = joint_zero.calibration_match(zero, self._calibration_zero())
+        note = match if match.startswith("changed") else (zero.problem or None)
+        if note != self._zero_note:
+            self._zero_note = note
+            if match.startswith("changed"):
+                _logger.warning(
+                    "Joint zero %s since the camera calibration. The wrist camera "
+                    "positions may be off. Run `axol calibration.cameras` again.",
+                    match.removeprefix("changed: "),
+                )
+            elif zero.problem:
+                _logger.warning(
+                    "Joint zero not recorded: %s. Episodes can't name the zeroing "
+                    "the arms are on until you zero them with `axol "
+                    "motor.set-zero-pos --guided`.",
+                    zero.problem,
+                )
+        return zero
 
     def _fail(self, message: str) -> None:
         if self.capture_error is None:
@@ -584,6 +633,9 @@ class McapSession:
             "robot": robot_meta,
             "recording": recording_meta,
             "calibration": calibration_metadata(scene, self.frames, self.frame_names),
+            "joint_zero": joint_zero.episode_metadata(
+                self.zero or self._joint_zero(), self._calibration_zero()
+            ),
             **({"custom": custom} if custom else {}),
         }
 

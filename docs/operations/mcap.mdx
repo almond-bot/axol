@@ -228,9 +228,26 @@ Each file has these metadata records.
 | `robot` | `serial` (the Axol hub serial), `model`, `gripper`, `jelly`, `software_version`, `hostname`, `compute_serial` (the Jetson's serial) |
 | `recording` | Frame counts, measured frame rate, gaps and missing frames for each camera with its serial and frame, joint sample counts, the IMU's frame and serial, the frames `/ee_pose` and `/ee_target` are for (`ee_frames`), and the clock offset |
 | `calibration` | The camera calibration used (see [Camera mounts](#camera-mounts)), and each camera's factory calibration file with its name, SHA-256 and date (`intrinsics_id`, `intrinsics_date`) |
+| `joint_zero` | The joint zeroing each arm was on (see [Joint zero](#joint-zero)) |
 | `custom` | The **Episode metadata** pairs, when there are any |
 
 A camera that drops an exposure leaves a gap, counted in `recording` as `gaps` and `missing_frames`.
+
+### Joint zero
+
+Joint angles, the TCP frames and the wrist camera mounts all depend on where each joint was zeroed. At the start of each episode, Collect data reads the robot's [zeroing record](/cli/motor-set-zero-pos#zeroing-record) and attaches it to the episode as `joint_zero.json`. The `joint_zero` metadata says which zeroing each arm was on:
+
+| Key | Contents |
+|---|---|
+| `status` | `recorded` when every arm joint has a recorded zeroing, `partly recorded` when some do, `no record` when none do. |
+| `left.zero_id`, `right.zero_id` | The arm's latest zeroing. Empty when a joint of that arm has no recorded zeroing. |
+| `left.last_zeroed_at`, `right.last_zeroed_at` | When that arm was last zeroed. |
+| `left.unrecorded_joints`, `right.unrecorded_joints` | Joints with no recorded zeroing. |
+| `joints` | Each joint's zeroing ID and date, as JSON. |
+| `file`, `file_sha256` | The attached record's name and SHA-256. |
+| `camera_calibration` | `same` when both arms are on the zeroing the camera calibration was made with. `changed` names each arm re-zeroed since. `unknown` when that isn't recorded. Empty without a camera calibration. |
+
+When an arm is re-zeroed after the cameras were calibrated, episodes still use the calibration. Collect data logs a warning and `axol mcap.check` warns. Calibrate the cameras again.
 
 ## Base odometry
 

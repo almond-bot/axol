@@ -2280,6 +2280,79 @@ class CalibrationExpiryTest(unittest.TestCase):
         self.assertEqual(meta["calibration"]["due_at"], "2999-01-01T00:00:00Z")
 
 
+class JointZeroEpisodeTest(unittest.TestCase):
+    """Episodes name the zeroing each arm is on, attach the zeroing record,
+    and say when an arm was re-zeroed after the camera calibration."""
+
+    tearDown = SessionTest.tearDown
+    _record = SessionTest._record
+    _record_and_check = SessionTest._record_and_check
+
+    def setUp(self) -> None:
+        from almond_axol.robot import joint_zero
+
+        SessionTest.setUp(self)  # type: ignore[arg-type]
+        self.zero_path = Path(self._tmp.name) / "joint_zero.json"
+        self.session.joint_zero_path = self.zero_path
+        all_joints = {j: {} for j in joint_zero.ARM_JOINT_NAMES}
+        self.ids = {
+            side: joint_zero.record(
+                side,
+                all_joints,
+                joint_zero.METHOD_GUIDED,
+                robot_serial="HUB123",
+                path=self.zero_path,
+            )["zero_id"]
+            for side in joint_zero.SIDES
+        }
+
+    def _write_calibration(self) -> None:
+        from almond_axol.camera_calibration.file import write
+
+        doc = _calibration_doc(self.scene, due_at="2999-01-01T00:00:00Z")
+        doc["joint_zero"] = dict(self.ids)
+        write(doc, Path(self._tmp.name) / "camera_calibration.json")
+
+    def _meta(self) -> dict:
+        with (self.root / "episode_000000.mcap").open("rb") as f:
+            return {r.name: r.metadata for r in make_reader(f).iter_metadata()}
+
+    def test_the_zeroing_is_recorded(self) -> None:
+        self._write_calibration()
+        results = self._record_and_check(set(self.readers))
+        zero = self._meta()["joint_zero"]
+        self.assertEqual(zero["status"], "recorded")
+        self.assertEqual(zero["left.zero_id"], self.ids["left"])
+        self.assertEqual(zero["right.zero_id"], self.ids["right"])
+        self.assertEqual(zero["camera_calibration"], "same")
+        self.assertEqual(results["joint zero: left arm"].status, "PASS")
+        self.assertEqual(results["joint zero record"].status, "PASS")
+        self.assertEqual(results["joint zero since calibration"].status, "PASS")
+
+    def test_a_re_zero_after_calibration_is_flagged(self) -> None:
+        from almond_axol.robot import joint_zero
+
+        self._write_calibration()
+        again = joint_zero.record(
+            "left",
+            {"wrist_2": {}},
+            joint_zero.METHOD_SINGLE,
+            robot_serial="HUB123",
+            path=self.zero_path,
+        )
+        results = self._record_and_check(set(self.readers))
+        zero = self._meta()["joint_zero"]
+        self.assertEqual(zero["left.zero_id"], again["zero_id"])
+        self.assertTrue(zero["camera_calibration"].startswith("changed: left arm"))
+        self.assertEqual(results["joint zero since calibration"].status, "WARN")
+
+    def test_no_record(self) -> None:
+        self.zero_path.unlink()
+        results = self._record_and_check(set(self.readers))
+        self.assertEqual(self._meta()["joint_zero"]["status"], "no record")
+        self.assertEqual(results["joint zero"].status, "WARN")
+
+
 class EpisodeMetadataTest(unittest.TestCase):
     def test_pairs(self) -> None:
         from almond_axol.recording.mcap.custom_metadata import parse_episode_metadata

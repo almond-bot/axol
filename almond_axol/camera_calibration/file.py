@@ -37,7 +37,7 @@ import json
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -89,6 +89,10 @@ class CameraCalibration:
     raw: bytes
     sha256: str
     due_at: str = ""
+    # The joint zeroing each arm was on when the cameras were calibrated
+    # ({side: zero ID}, see almond_axol.robot.joint_zero); empty when the
+    # file doesn't say.
+    joint_zero: Mapping[str, str] = field(default_factory=dict)
 
     def problem_for(
         self, robot_serial: str | None, now: datetime | None = None
@@ -239,7 +243,19 @@ def parse(raw: bytes, path: Path) -> CameraCalibration:
         raw=raw,
         sha256=hashlib.sha256(raw).hexdigest(),
         due_at=due_at,
+        joint_zero=_joint_zero(doc.get("joint_zero")),
     )
+
+
+def _joint_zero(value: Any) -> dict[str, str]:
+    """``{side: zero ID}`` from a file's ``joint_zero``; anything else is ignored."""
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(side): str(zero_id)
+        for side, zero_id in value.items()
+        if side in ("left", "right") and isinstance(zero_id, str)
+    }
 
 
 def load(path: Path = DEFAULT_PATH) -> CameraCalibration | None:

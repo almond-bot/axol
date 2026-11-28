@@ -424,6 +424,7 @@ class CalibrationSim:
                 "wheel_signs": dict(WHEEL_SIGNS),
                 # No calibration file: recordings place the cameras from CAD.
                 "camera_calibration_path": str(self.work / "no_calibration.json"),
+                "joint_zero_path": str(self.rig.joint_zero_path),
                 "teleop_hz": CONTROL_HZ,
                 "episode_metadata": {
                     "calibration_recording": label,

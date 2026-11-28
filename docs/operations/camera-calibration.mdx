@@ -5,7 +5,9 @@ description: "Measure where the cameras sit on your Axol so MCAP episodes place 
 
 MCAP episodes place each camera in the transform tree. Without a camera calibration, those positions come from CAD. `axol calibration.cameras` measures where the head camera and each wrist camera sit on your Axol and saves the result. Episodes use it from the next episode on.
 
-Calibrate after you fit the Camera Kit. Calibrate again after you move, remount or replace a camera, or after an arm is re-zeroed.
+Calibrate after you fit the Camera Kit, and after the arms are zeroed. Calibrate again after you move, remount or replace a camera, or after an arm is re-zeroed.
+
+Each calibration records which [joint zeroing](/cli/motor-set-zero-pos#zeroing-record) each arm was on. When an arm is re-zeroed later, its episodes still use the calibration, but their metadata and `axol mcap.check` say the arm was re-zeroed.
 
 ## What you need
 
@@ -85,7 +87,7 @@ Each calibration gets an ID of the form `<robot serial>-<date>-<run>`, such as `
 
 | File | Contents |
 |---|---|
-| `package.json` | The robot, cameras, board, image mode, lens values, every transform, both recordings with their IDs and SHA-256, every metric and check, and PASS or FAIL. |
+| `package.json` | The robot, cameras, board, image mode, the joint zeroing each arm was on, lens values, every transform, both recordings with their IDs and SHA-256, every metric and check, and PASS or FAIL. |
 | `recording_A.mcap`, `recording_B.mcap` | The two recordings: every camera, the joints and the head camera's IMU. |
 | `corners_A.json`, `corners_B.json` | The board corners found in every frame that was examined, with its timestamp. |
 | `locked_A.json` | The values fitted on Recording A, saved before Recording B was examined. |

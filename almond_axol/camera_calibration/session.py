@@ -352,6 +352,13 @@ def draw_views(
     return drawn
 
 
+def _joint_zero_ids(robot_serial: str) -> dict[str, str]:
+    """The joint zeroing each arm is on now (``{side: zero ID}``)."""
+    from ..robot import joint_zero
+
+    return joint_zero.state(robot_serial).ids()
+
+
 def finish(
     specs: dict[str, CameraSpec],
     views: list[View],
@@ -375,6 +382,7 @@ def finish(
             "software_version": options.software_version,
             "board": asdict(board.config),
             "report": str(report_dir),
+            "joint_zero": _joint_zero_ids(options.robot_serial),
         },
     )
     report_dir.mkdir(parents=True, exist_ok=True)
