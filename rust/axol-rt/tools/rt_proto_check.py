@@ -118,10 +118,15 @@ def check_feedback_parse():
     for i in range(8):
         pos, vel, tau, age = slots_in.get(i, (0.0, 0.0, 0.0, 0))
         payload += struct.pack("<3dI", pos, vel, tau, age)
+    # Applied trailer: valid, seq, age_us of the newest target sent.
+    payload += struct.pack("<BII", 1, 0xDEADBEEF, 700)
 
     before = time.time()
     side, slots = RtLink._parse_feedback(payload)
+    applied = RtLink._parse_applied(payload)
     after = time.time()
+    assert applied is not None and applied[0] == 0xDEADBEEF, applied
+    assert before - 700e-6 <= applied[1] <= after - 700e-6, applied
     assert side == 1, side
     assert set(slots) == {0, 7}, slots
     assert slots[0][:3] == (1.5, -0.25, 3.0), slots[0]

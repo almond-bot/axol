@@ -579,6 +579,11 @@ class Jelly:
         # atomic under the GIL), consumed by the command task.
         self._target: tuple[float, float, float, int] = (0.0, 0.0, 0.0, STOP)
         self._target_time: float = 0.0
+        # The same target as one immutable record for observers (recording):
+        # (command id, monotonic issue time, vx, vy, wz, lift). The id counts
+        # set_command calls this session.
+        self._command_count = 0
+        self._command: tuple[int, float, float, float, float, int] | None = None
         # The last VR frame object mapped by apply_vr_frame. A frame that is
         # handed over twice (a poller re-reading the server's latest frame,
         # say) must not count as a fresh command.
@@ -917,10 +922,27 @@ class Jelly:
             # turn a malformed network/SDK value into full Jelly speed.
             self._target = (0.0, 0.0, 0.0, STOP)
             self._target_time = time.monotonic()
+            self._note_command()
             raise
 
         self._target = (vx, vy, wz, int(lift))
         self._target_time = time.monotonic()
+        self._note_command()
+
+    def _note_command(self) -> None:
+        self._command_count += 1
+        self._command = (self._command_count, self._target_time, *self._target)
+
+    @property
+    def latest_command(self) -> tuple[int, float, float, float, float, int] | None:
+        """The newest drive and lift command, or ``None`` before the first.
+
+        ``(command_id, issued_at, vx, vy, wz, lift)``: ``command_id`` counts
+        :meth:`set_command` calls this session, ``issued_at`` is when it was
+        called (:func:`time.monotonic`), the speeds are fractions of full
+        speed and ``lift`` is ``UP``, ``STOP`` or ``DOWN``.
+        """
+        return self._command
 
     def apply_vr_frame(  # noqa: ANN001
         self, frame, resetting: bool = False, box_mode: bool = False

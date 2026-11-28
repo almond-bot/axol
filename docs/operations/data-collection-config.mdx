@@ -25,7 +25,7 @@ The [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.
 | `teleop_config.kinematics_config.*` | `kinematics` |
 | `teleop_config.vr_server_config.*` | `vr_server` |
 | `teleop_config.jelly.*` | `jelly` |
-| `fps`, `root`, `vcodec`, `push_to_hub`, `record_jelly`, `rerun_*` | `recording` |
+| `fps`, `root`, `vcodec`, `push_to_hub`, `record_jelly`, `rerun_*`, `format`, `mcap_*` | `recording` |
 
 ```bash
 axol collect-data --repo_id myorg/pick --task "pick up the cup" \
@@ -43,9 +43,16 @@ axol collect-data --repo_id myorg/pick --task "pick up the cup" \
 |---|---|---|
 | `--repo_id` | required | Dataset ID, `<user>/<dataset>`. |
 | `--task` | required | Task description stored with every frame. |
+| `--format` | `lerobot` | Episode file format: `lerobot` saves a LeRobot dataset, `mcap` saves one MCAP file per episode. See [MCAP Recording](/operations/mcap). |
+| `--operator` | empty | Who is recording. Saved in each MCAP episode. |
+| `--episode_metadata` | empty | Extra `key=value` pairs saved in each MCAP episode, separated by commas. |
+| `--mcap_video_codec` | `h264` | Video codec of MCAP episodes: `h264` or `h265`. |
+| `--mcap_topics` | empty | Rename MCAP topics, as `default=new` pairs separated by commas. See [Rename topics](/operations/mcap#rename-topics). |
+| `--mcap_frames` | empty | Rename MCAP transform frames, as `default=new` pairs separated by commas. See [Rename frames](/operations/mcap#rename-frames). |
 | `--fps` | `30` | Recording rate. Cameras capture at 60 and drop frames to match. `60` doubles the recording load on a Jetson. |
 | `--teleop_hz` | `120` | Motor command rate (Hz) while teleoperating, independent of `fps`. |
-| `--dataset_resolution` | `SVGA` | Resolution of the recorded video: `SVGA`, `HD1080` or `HD1200`. The headset stream keeps the capture resolution. |
+| `--dataset_resolution` | `SVGA` | Resolution of the recorded video: `SVGA`, `HD1080` or `HD1200`. It can't be larger than the cameras' capture resolution. |
+| `--stream_resolution` | `null` | Resolution of the headset stream when it is smaller than the capture: `SVGA`, `HD1080` or `HD1200`. `null` streams at the capture resolution. The control panel sets it from **Streaming resolution**. |
 | `--vcodec` | per platform | Dataset video codec: `h264` on Jetson, `auto` elsewhere. |
 | `--root` | `null` | Local dataset directory. Default is the LeRobot cache, `~/.cache/huggingface/lerobot`. |
 | `--push_to_hub` | `false` | Upload the dataset to the HuggingFace Hub when done. Log in first. See [Upload to the HuggingFace Hub](/operations/data-collection#upload-to-the-huggingface-hub). |

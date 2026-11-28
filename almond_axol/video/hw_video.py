@@ -107,13 +107,22 @@ def dataset_vbr_bitrate(width: int, height: int, fps: int) -> tuple[int, int]:
 # recovers ~41 dB; the cost is about 3.5x the on-disk/upload size per camera.
 _DATASET_INTRA_BPP = 0.6
 _DATASET_INTRA_PEAK_MULT = 1.5
+# H.265 intra frames need roughly a quarter fewer bits than H.264 for the same
+# detail, so the MCAP recording (H.265) gets a smaller budget and a lower cap:
+# at 1920x1200 and 60 fps the cap applies, 40 Mbps per camera.
+_DATASET_INTRA_BPP_H265 = 0.45
+_DATASET_INTRA_MAX_H265 = 40_000_000
 
 
-def dataset_intra_vbr_bitrate(width: int, height: int, fps: int) -> tuple[int, int]:
+def dataset_intra_vbr_bitrate(
+    width: int, height: int, fps: int, codec: str = "h264"
+) -> tuple[int, int]:
     """(target, peak) VBR bitrate (bits/s) for an all-intra dataset encode."""
-    target = max(
-        8_000_000, min(50_000_000, int(width * height * fps * _DATASET_INTRA_BPP))
-    )
+    if codec == "h265":
+        bpp, ceiling = _DATASET_INTRA_BPP_H265, _DATASET_INTRA_MAX_H265
+    else:
+        bpp, ceiling = _DATASET_INTRA_BPP, 50_000_000
+    target = max(8_000_000, min(ceiling, int(width * height * fps * bpp)))
     return target, int(target * _DATASET_INTRA_PEAK_MULT)
 
 

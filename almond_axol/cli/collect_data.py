@@ -66,6 +66,7 @@ import os
 import queue
 import signal
 import socket
+import tempfile
 import threading
 import time
 import uuid
@@ -119,6 +120,8 @@ from .config import (
     DatasetResolution,
     LogLevel,
     MantisSource,
+    McapVideoCodec,
+    RecordingFormat,
     normalize_bool_flags,
     parse,
 )
@@ -603,6 +606,8 @@ def _start_video_relay(
     dataset_resolution: str,
     raw_transport: str | None = None,
     policy_fps: int | None = None,
+    dataset_codec: str | None = None,
+    record_imu: bool = False,
 ) -> Any | None:
     """Start the out-of-process video relay for data collection.
 
@@ -632,6 +637,11 @@ def _start_video_relay(
     nobody looked at — on the Orin, the core the dataset encode branch was
     short of (see ``gst_zed._policy_rate_limit``). ``None``/``0`` keeps the
     ring at capture rate.
+
+    ``dataset_codec`` picks the recording encoder: ``None`` keeps the relay's
+    H.264 (LeRobot datasets); MCAP recording passes its chosen codec.
+    ``record_imu`` (MCAP) asks each stereo camera to send its IMU samples to a
+    socket the recorder reads (see :mod:`almond_axol.recording.mcap.imu`).
 
     Returns the :class:`VideoRelayProcess`, or ``None`` when it can't be used
     (no cameras or aiortc unavailable), in which case the caller uses the
@@ -673,13 +683,18 @@ def _start_video_relay(
         res = camcfg.resolution_name() if hasattr(camcfg, "resolution_name") else None
         if res:
             spec["resolution"] = res
-        # Downscale target for the dataset (raw) branch only; the encoded headset
-        # branch keeps the full capture resolution. Clamped to capture in the relay.
+        # Downscale targets, each clamped to the capture in the relay: the
+        # dataset (raw) branch, and the headset branch when it streams smaller.
         spec["dataset_resolution"] = dataset_resolution
+        stream_resolution = getattr(cfg, "stream_resolution", None)
+        if stream_resolution:
+            spec["stream_resolution"] = stream_resolution
         if raw_transport is not None:
             spec["raw_transport"] = raw_transport
         if policy_fps:
             spec["policy_fps"] = int(policy_fps)
+        if dataset_codec:
+            spec["dataset_codec"] = dataset_codec
         # The recorded eyes (``eyes``) must match observation_cameras() so the
         # relay's raw branch exports exactly the keys the recorder expects; the
         # streamed eyes (``stream_eyes``) drive the headset feed independently, so
@@ -710,6 +725,10 @@ def _start_video_relay(
             # keys remain as the SDK fallback, which can't pack. Recording
             # (record_eyes) is per-eye regardless.
             spec["stream_sbs"] = stream_eyes == "both"
+            if record_imu and wants_record:
+                spec["imu_socket"] = os.path.join(
+                    tempfile.gettempdir(), f"axol-imu-{os.getpid()}-{serial}.sock"
+                )
         else:
             spec["stereo"] = False
         specs[name] = spec
@@ -725,6 +744,138 @@ def _start_video_relay(
         relay.shutdown()
         return None
     return relay
+
+
+def mcap_setup_problem(
+    cfg: "CollectDataConfig", *, dataset_root: Path, dataset_resolution: str
+) -> str | None:
+    """Why an MCAP session can't record what it was asked to, or ``None``.
+
+    Pure config and file checks, run before any hardware opens.
+    """
+    if cfg.mantis:
+        return (
+            "MCAP recording works with Axol only. Set Recording format to lerobot "
+            "to record with Mantis."
+        )
+    if (dataset_root / "meta" / "info.json").exists():
+        return (
+            f"{dataset_root} holds a LeRobot dataset. Choose another dataset "
+            "name for MCAP recording."
+        )
+    from ..recording.mcap.custom_metadata import parse_episode_metadata
+    from ..recording.mcap.topics import parse_frame_names, parse_topic_names
+
+    try:
+        parse_topic_names(getattr(cfg, "mcap_topics", ""))
+        parse_frame_names(getattr(cfg, "mcap_frames", ""))
+        parse_episode_metadata(getattr(cfg, "episode_metadata", ""))
+    except ValueError as exc:
+        return str(exc)
+    rec_w, rec_h = ZED_RESOLUTION_DIMS[dataset_resolution]
+    for name, camcfg in getattr(cfg.robot_config, "cameras", {}).items():
+        if not bool(getattr(camcfg, "record", True)):
+            continue
+        capture = (
+            camcfg.resolution_name() if hasattr(camcfg, "resolution_name") else None
+        )
+        if capture is None:
+            continue  # the relay opens it at full resolution
+        cap_w, cap_h = ZED_RESOLUTION_DIMS[capture]
+        if cap_w < rec_w or cap_h < rec_h:
+            return (
+                f"The {name} camera captures at {capture}, smaller than the "
+                f"Recording resolution ({dataset_resolution}). Capture at "
+                f"{dataset_resolution} or more, or lower Recording resolution."
+            )
+    return None
+
+
+def _start_mcap_recorder(
+    cfg: "CollectDataConfig",
+    robot: Any,
+    teleop: Any,
+    relay: Any,
+    expected: set[str],
+    dataset_root: Path,
+    teleop_hz: int,
+) -> Any:
+    """Spawn the MCAP recorder and feed it the Rust core's 240 Hz joint states."""
+    from ..camera_calibration.file import DEFAULT_PATH as CALIBRATION_PATH
+    from ..constants import AxolModel, urdf_path
+    from ..recording.mcap.custom_metadata import parse_episode_metadata
+    from ..recording.mcap.mounts import read_calibration
+    from ..recording.mcap.recorder import McapRecorderProcess
+    from ..recording.mcap.topics import parse_frame_names, parse_topic_names
+    from ..robot.identity import hub_serial
+    from ..robot.jelly import WHEEL_SIGNS
+    from ..settings import resolve_gripper, resolve_robot_model
+    from ..zed.calibration import SETTINGS_DIR
+
+    axol = getattr(robot, "axol", None)
+    if not callable(getattr(axol, "add_state_listener", None)):
+        raise RuntimeError(
+            "MCAP recording needs the realtime core's joint feedback, which this "
+            "robot connection doesn't provide."
+        )
+    kin = getattr(cfg.teleop_config, "kinematics_config", None)
+    jelly = teleop.jelly
+    model = resolve_robot_model(
+        getattr(kin, "robot_model", None),
+        jelly_enabled=jelly is not None,
+        mount=getattr(kin, "mount", None),
+    )
+    axol_cfg = cfg.robot_config.axol_config
+    gripper = resolve_gripper(axol_cfg.gripper)
+    try:
+        from importlib.metadata import version
+
+        software_version = version("almond-axol")
+    except Exception:  # noqa: BLE001 - informational
+        software_version = ""
+    robot_serial = hub_serial() or ""
+    calibration, problem = read_calibration(CALIBRATION_PATH, robot_serial or None)
+    if calibration is None:
+        _logger.warning(
+            "Camera calibration not used: %s. Episodes record the camera positions "
+            "from CAD. Run `axol calibration.cameras` to calibrate.",
+            problem,
+        )
+    else:
+        _logger.info(
+            "Camera calibration %s from %s.",
+            calibration.calibration_id,
+            calibration.calibrated_at or "an unknown date",
+        )
+    recorder = McapRecorderProcess(
+        raw_meta={src: m for src, m in relay.raw_meta.items() if src in expected},
+        config={
+            "dataset_root": str(dataset_root),
+            "urdf_path": str(
+                urdf_path(
+                    model, gripper=gripper if model is AxolModel.MOBILE else "parallel"
+                )
+            ),
+            "calibration_dir": str(SETTINGS_DIR),
+            "has_gripper": bool(axol_cfg.has_gripper),
+            "jelly_wheels": bool(jelly is not None and jelly.has_wheels),
+            "jelly_lift": bool(jelly is not None and jelly.has_lift),
+            "wheel_signs": dict(WHEEL_SIGNS),
+            "topic_names": parse_topic_names(cfg.mcap_topics),
+            "frame_names": parse_frame_names(cfg.mcap_frames),
+            "operator": cfg.operator,
+            "episode_metadata": parse_episode_metadata(cfg.episode_metadata),
+            "camera_calibration_path": str(CALIBRATION_PATH),
+            "robot_serial": robot_serial,
+            "robot_model": model.value,
+            "gripper": gripper,
+            "software_version": software_version,
+            "teleop_hz": teleop_hz,
+            "log_level": cfg.log_level,
+        },
+    )
+    axol.add_state_listener(recorder.publish_joint_state)
+    return recorder
 
 
 @dataclass
@@ -786,6 +937,11 @@ class CollectDataConfig:
     # saturates the Jetson CPU moving raw bytes, collapsing the control loop.
     # Clamped to the capture resolution, so it only ever downscales.
     dataset_resolution: DatasetResolution = "SVGA"
+    # Resolution of the headset stream when it is smaller than the capture:
+    # the control panel's Streaming resolution, with the cameras capturing at a
+    # larger Recording resolution. The relay scales the headset branch down on
+    # the GPU. None streams at the capture resolution.
+    stream_resolution: DatasetResolution | None = None
     # Video codec for the recorded LeRobot dataset; defaults per-platform (see
     # record_proc.default_vcodec). Override with any of LeRobot's
     # VALID_VIDEO_CODECS (e.g. auto, h264, libsvtav1).
@@ -819,6 +975,21 @@ class CollectDataConfig:
     rerun_ip: str | None = None
     rerun_port: int = 9876
     log_level: LogLevel = "INFO"
+    # Episode file format: ``lerobot`` (a LeRobot dataset, the default) or
+    # ``mcap`` (one MCAP file per episode, see almond_axol.recording.mcap).
+    # MCAP records video at the Recording resolution and fps, joints at
+    # the realtime core's rate, and the calibration and TF tree. Axol only.
+    format: RecordingFormat = "lerobot"
+    operator: str = ""
+    """Who is recording. Saved in each MCAP episode."""
+    episode_metadata: str = ""
+    """Extra key=value pairs saved in each MCAP episode, separated by commas."""
+    mcap_topics: str = ""
+    """Rename MCAP topics, as default=new pairs separated by commas."""
+    mcap_frames: str = ""
+    """Rename MCAP transform frames, as default=new pairs separated by commas."""
+    mcap_video_codec: McapVideoCodec = "h264"
+    """Video codec of MCAP episodes: h264, or h265 for smaller files."""
 
 
 # ----------------------------------------------------------------------
@@ -887,6 +1058,9 @@ class EpisodeQAStats:
     # click began. Rows captured after it are trimmed before the save so the
     # clicks (gripper commands) stay out of the dataset. None keeps every row.
     end_t_host: float | None = None
+    # How the operator ended the take: "success", or "failure" when the
+    # headset marked it failed. Saved in MCAP episode metadata.
+    outcome: str = "success"
 
     @property
     def stale_fraction(self) -> float:
@@ -1592,9 +1766,28 @@ def _run_session(
     rerun_port = cfg.rerun_port
 
     dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
-    # Name the dataset for the panel's preview. getattr: a downstream
-    # package may hand in its own control without this hook.
-    if (note_dataset := getattr(control, "note_dataset", None)) is not None:
+    # MCAP writes one file per episode instead of a LeRobot dataset; see
+    # almond_axol.recording.mcap. getattr: a downstream config may lack it.
+    mcap_mode = getattr(cfg, "format", "lerobot") == "mcap"
+    from ..recording.mcap.rings import pack_tick
+
+    if mcap_mode:
+        problem = mcap_setup_problem(
+            cfg, dataset_root=dataset_root, dataset_resolution=cfg.dataset_resolution
+        )
+        if problem is not None:
+            raise ValueError(problem)
+        if push_to_hub:
+            _logger.warning(
+                "Push to HuggingFace Hub works with LeRobot datasets only; MCAP "
+                "episodes stay in %s.",
+                dataset_root,
+            )
+            push_to_hub = False
+        rerun_ip = None
+    # Name the dataset for the panel's preview (LeRobot datasets only).
+    # getattr: a downstream package may hand in its own control without it.
+    elif (note_dataset := getattr(control, "note_dataset", None)) is not None:
         note_dataset(repo_id, dataset_root)
 
     # The upload runs when the session ends; check the login now, not then.
@@ -1683,7 +1876,9 @@ def _run_session(
 
     # Check resume eligibility before connecting (file check only)
     meta = dataset_root / "meta"
-    has_info = (meta / "info.json").exists()
+    # An MCAP session never resumes a LeRobot dataset (mcap_setup_problem
+    # refused one already); its episodes are numbered from the files present.
+    has_info = not mcap_mode and (meta / "info.json").exists()
     is_complete = (
         has_info and (meta / "tasks.parquet").exists() and (meta / "episodes").is_dir()
     )
@@ -1787,9 +1982,76 @@ def _run_session(
         + ["headset", "ik", "dataset"]
     )
     progress.step("cameras")
-    relay = _start_video_relay(cfg, dataset_resolution)
+    mcap_codec = getattr(cfg, "mcap_video_codec", "h264")
+    if mcap_mode:
+        from ..video.gst_zed import _element_available
+
+        if not _element_available(f"nvv4l2{mcap_codec}enc"):
+            raise RuntimeError(
+                f"MCAP recording needs the Jetson {mcap_codec.upper()} encoder, "
+                "which isn't available. Run `axol gst.install`, then start again."
+            )
+    relay = _start_video_relay(
+        cfg,
+        dataset_resolution,
+        dataset_codec=mcap_codec if mcap_mode else None,
+        record_imu=mcap_mode,
+    )
     expected = set(cfg.robot_config.observation_cameras().keys())
     use_relay = relay is not None and expected <= set(relay.raw_cameras)
+    if mcap_mode and use_relay:
+        assert relay is not None
+        unencoded = sorted(
+            src
+            for src, m in relay.raw_meta.items()
+            if src in expected and m.get("transport") != f"gstshm-{mcap_codec}"
+        )
+        if unencoded:
+            relay.shutdown()
+            raise RuntimeError(
+                "MCAP recording needs the GStreamer camera pipeline for every "
+                f"recording camera, but {', '.join(unencoded)} fell back to "
+                "another path. Run `axol gst.install`, then start again."
+            )
+    if mcap_mode and not use_relay:
+        if relay is not None:
+            relay.shutdown()
+        raise RuntimeError(
+            "MCAP recording needs the GStreamer camera pipeline, which didn't "
+            "start. Run `axol gst.install`, then start again."
+        )
+    if mcap_mode:
+        assert relay is not None
+        from ..recording.mcap.scene import CameraSource, imu_topic
+        from ..recording.mcap.topics import (
+            default_topics,
+            parse_topic_names,
+            topic_names_problem,
+        )
+
+        sources = [
+            CameraSource.from_meta(src, m)
+            for src, m in sorted(relay.raw_meta.items())
+            if src in expected
+        ]
+        problem = topic_names_problem(
+            parse_topic_names(cfg.mcap_topics),
+            default_topics(
+                (s.topic for s in sources),
+                (imu_topic(s.camera) for s in sources if s.imu_socket),
+            ),
+        )
+        if problem is not None:
+            relay.shutdown()
+            raise ValueError(problem)
+        for name in sorted({s.camera for s in sources if s.imu_requested}):
+            if not any(s.imu_socket for s in sources if s.camera == name):
+                _logger.warning(
+                    "The %s camera's IMU won't be recorded: the ZED camera "
+                    "plugins need updating. Run `axol gst.build-zed`, then start "
+                    "again.",
+                    name,
+                )
     if use_relay:
         robot.set_external_cameras({k: relay.raw_cameras[k] for k in expected})
     elif relay is not None:
@@ -1811,7 +2073,7 @@ def _run_session(
             src: int(m["fps"])
             for src, m in relay.raw_meta.items()
             if src in expected
-            and m["transport"] == "gstshm-h264"
+            and str(m["transport"]).startswith("gstshm-h26")
             and int(m["fps"]) != fps
         }
         if mismatched:
@@ -2037,15 +2299,19 @@ def _run_session(
         if is_complete:
             _logger.info(f"Resuming existing dataset at {dataset_root}.")
         progress.step("dataset")
-        if use_relay:
-            recorder: DatasetRecorderProcess | InProcessRecorder = (
-                DatasetRecorderProcess(
-                    raw_cond=relay.raw_cond,
-                    raw_meta=relay.raw_meta,
-                    obs_keys=obs_keys,
-                    action_keys=action_keys,
-                    config=recorder_config,
-                )
+        recorder: Any
+        if mcap_mode:
+            assert relay is not None
+            recorder = _start_mcap_recorder(
+                cfg, robot, teleop, relay, expected, dataset_root, teleop_hz
+            )
+        elif use_relay:
+            recorder = DatasetRecorderProcess(
+                raw_cond=relay.raw_cond,
+                raw_meta=relay.raw_meta,
+                obs_keys=obs_keys,
+                action_keys=action_keys,
+                config=recorder_config,
             )
         else:
             recorder = InProcessRecorder(recorder_config, robot, robot_obs_proc)
@@ -2272,6 +2538,8 @@ def _run_session(
     # The outer failure/Stop paths need the active take's evidence even when
     # the episode coroutine cannot return its normal QA result.
     tracking_attempt: list[EpisodeTrackingQuality] = []
+    # MCAP: arm commands sent this session; the latest is its command_id.
+    mcap_commands_sent = [0]
 
     # The hot control loop runs *on the robot's event loop* (see
     # AxolRobot.event_loop) so motion_control is awaited inline — cooperatively
@@ -2342,6 +2610,8 @@ def _run_session(
         )
         last_robot_act: dict[str, Any] | None = None
         last_dataset_act: dict[str, Any] | None = None
+        # The teleop's joint targets for the last tick (MCAP's /joint_command).
+        last_command: dict[str, Any] | None = None
 
         class _TrackingContact(RuntimeError):
             pass
@@ -2349,7 +2619,7 @@ def _run_session(
         async def _tracking_tick() -> None:
             """Run one normal teleop tick without consuming boundary events."""
             nonlocal capture_failure, last_robot_act, last_dataset_act
-            nonlocal last_tcp, last_row_ts, was_engaged
+            nonlocal last_tcp, last_row_ts, was_engaged, last_command
             if _stopped() and last_robot_act is not None:
                 # Ctrl+C/Stop during recorder startup must drain the bounded
                 # worker before teardown, but must not keep following a moving
@@ -2383,6 +2653,7 @@ def _run_session(
             )
             t_proc = time.perf_counter()
             _sync_spring_caps()
+            t_issue = time.perf_counter()
             await robot.send_action_async(robot_act)
             t_send = time.perf_counter()
             sect["obs"] += t_obs - t0
@@ -2453,8 +2724,9 @@ def _run_session(
 
             last_robot_act = robot_act
             last_dataset_act = dataset_act
+            last_command = act_processed
             if not mantis_mode:
-                recorder.publish(_with_jelly(joint_obs), dataset_act, row_ts)
+                _publish_row(joint_obs, dataset_act, act_processed, row_ts, t_issue)
             elif (
                 last_tcp is not None
                 and pose_ts is not None
@@ -2529,13 +2801,46 @@ def _run_session(
             )
             teleop.send_feedback(joint_obs)
             _sync_spring_caps()
+            t_issue = time.perf_counter()
             await robot.send_action_async(last_robot_act)
             # Capture is already being stopped on the worker thread. Publishing
             # keeps the nearest-state history fresh for any final in-flight AU.
             if mantis_mode:
                 _publish_mantis_boundary(joint_obs)
             else:
-                recorder.publish(_with_jelly(joint_obs), last_dataset_act, t0)
+                _publish_row(joint_obs, last_dataset_act, last_command, t0, t_issue)
+
+        def _publish_row(
+            joint_obs: dict[str, Any],
+            dataset_act: dict[str, Any],
+            command: dict[str, Any] | None,
+            ts: float,
+            issued: float,
+        ) -> None:
+            # LeRobot gets the dataset row; MCAP gets the tick ring's columns
+            # (commanded joints and when they were sent, headset input, Jelly),
+            # see recording.mcap.
+            if mcap_mode:
+                mcap_commands_sent[0] += 1
+                axol = getattr(robot, "axol", None)
+                limp = getattr(axol, "limp", None)
+                recorder.publish(
+                    pack_tick(
+                        command,
+                        teleop.latest_vr_frame(),
+                        teleop.jelly,
+                        perf_minus_monotonic=time.perf_counter() - time.monotonic(),
+                        command_id=mcap_commands_sent[0],
+                        issue_t=issued,
+                        arm_mode="gravity_compensation" if limp else "impedance",
+                        # The core reports when it applies these (see rt.link).
+                        target_seqs=getattr(axol, "last_target_seqs", None),
+                    ),
+                    {},
+                    ts,
+                )
+            else:
+                recorder.publish(_with_jelly(joint_obs), dataset_act, ts)
 
         def _with_jelly(observation: dict[str, Any]) -> dict[str, Any]:
             # Record Jelly: the lift and wheel readings ride along with the
@@ -2873,6 +3178,7 @@ def _run_session(
             if events[TeleopEvents.TERMINATE_EPISODE]:
                 if events.get(TeleopEvents.FAILURE):
                     _logger.info("Episode ended as failure.")
+                    stats.outcome = "failure"
                 else:
                     _logger.info("Episode ended successfully.")
                     # A trigger-gesture end names when the first click began;
@@ -3211,6 +3517,8 @@ def _run_session(
                     capture_failure,
                     qa,
                 ) = _run_on_robot_loop(_episode_loop())
+                if mcap_mode and recording:
+                    recorder.set_outcome(qa.outcome)
             except BaseException as exc:
                 _preserve_interrupted_tracking_attempt(
                     tracking_attempt,

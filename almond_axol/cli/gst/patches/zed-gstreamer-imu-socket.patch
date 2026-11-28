@@ -1,0 +1,288 @@
+diff --git a/gst-zed-src/gstzedsrc.cpp b/gst-zed-src/gstzedsrc.cpp
+index 8c9e416..9dd6f44 100644
+--- a/gst-zed-src/gstzedsrc.cpp
++++ b/gst-zed-src/gstzedsrc.cpp
+@@ -34,6 +34,14 @@
+ #include "gst-zed-meta/gstzedmeta.h"
+ #include "gstzedsrc.h"
+ 
++#include <cerrno>
++#include <cmath>
++#include <cstring>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++#include <vector>
++
+ // AI Module
+ #define OD_INSTANCE_MODULE_ID 0
+ #define BT_INSTANCE_MODULE_ID 1
+@@ -312,6 +320,7 @@ enum {
+     PROP_SVO_REC_ENABLE,
+     PROP_SVO_REC_FILENAME,
+     PROP_SVO_REC_COMPRESSION,
++    PROP_IMU_SOCKET,
+     N_PROPERTIES
+ };
+ 
+@@ -534,6 +543,9 @@ typedef enum {
+ #define DEFAULT_PROP_SVO_REC_ENABLE FALSE
+ #define DEFAULT_PROP_SVO_REC_FILENAME ""
+ #define DEFAULT_PROP_SVO_REC_COMPRESSION GST_ZEDSRC_SVO_COMPRESSION_H265
++
++// Axol IMU export
++#define DEFAULT_PROP_IMU_SOCKET ""
+ //////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+ typedef enum {
+@@ -1728,6 +1740,12 @@ static void gst_zedsrc_class_init(GstZedSrcClass *klass) {
+                           "Compression mode for SVO recording", GST_TYPE_ZED_SVO_COMPRESSION,
+                           DEFAULT_PROP_SVO_REC_COMPRESSION,
+                           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
++    g_object_class_install_property(
++        gobject_class, PROP_IMU_SOCKET,
++        g_param_spec_string("imu-socket", "IMU socket",
++                            "Send every IMU sample to this Unix datagram socket (empty: off)",
++                            DEFAULT_PROP_IMU_SOCKET,
++                            (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+ 
+     g_object_class_install_property(
+         gobject_class, PROP_SVO_REAL_TIME,
+@@ -1996,6 +2014,13 @@ static void gst_zedsrc_init(GstZedSrc *src) {
+     src->svo_rec_filename = g_string_new(DEFAULT_PROP_SVO_REC_FILENAME);
+     src->svo_rec_compression = DEFAULT_PROP_SVO_REC_COMPRESSION;
+     src->svo_rec_active = FALSE;
++
++    // Axol IMU export
++    src->imu_socket = g_string_new(DEFAULT_PROP_IMU_SOCKET);
++    src->imu_fd = -1;
++    src->imu_last_ts = 0;
++    src->imu_pose_ready = FALSE;
++    src->imu_pose_sent_ns = 0;
+     // <---- Parameters initialization
+ 
+     src->stop_requested = FALSE;
+@@ -2352,6 +2377,10 @@ void gst_zedsrc_set_property(GObject *object, guint property_id, const GValue *v
+     case PROP_SVO_REC_COMPRESSION:
+         src->svo_rec_compression = g_value_get_enum(value);
+         break;
++    case PROP_IMU_SOCKET:
++        str = g_value_get_string(value);
++        g_string_assign(src->imu_socket, str ? str : "");
++        break;
+     case PROP_SVO_REAL_TIME:
+         src->svo_real_time = g_value_get_boolean(value);
+         break;
+@@ -2706,6 +2735,9 @@ void gst_zedsrc_get_property(GObject *object, guint property_id, GValue *value,
+     case PROP_SVO_REC_COMPRESSION:
+         g_value_set_enum(value, src->svo_rec_compression);
+         break;
++    case PROP_IMU_SOCKET:
++        g_value_set_string(value, src->imu_socket ? src->imu_socket->str : "");
++        break;
+     case PROP_SVO_REAL_TIME:
+         g_value_set_boolean(value, src->svo_real_time);
+         break;
+@@ -2821,6 +2853,13 @@ void gst_zedsrc_finalize(GObject *object) {
+     if (src->svo_rec_filename) {
+         g_string_free(src->svo_rec_filename, TRUE);
+     }
++    if (src->imu_fd >= 0) {
++        close(src->imu_fd);
++        src->imu_fd = -1;
++    }
++    if (src->imu_socket) {
++        g_string_free(src->imu_socket, TRUE);
++    }
+ 
+     G_OBJECT_CLASS(gst_zedsrc_parent_class)->finalize(object);
+ }
+@@ -3450,6 +3489,14 @@ static gboolean gst_zedsrc_stop(GstBaseSrc *bsrc) {
+         GST_INFO_OBJECT(src, "SVO recording stopped on pipeline stop");
+     }
+ 
++    if (src->imu_fd >= 0) {
++        close(src->imu_fd);
++        src->imu_fd = -1;
++    }
++    src->imu_last_ts = 0;
++    src->imu_pose_ready = FALSE;
++    src->imu_pose_sent_ns = 0;
++
+     gst_zedsrc_reset(src);
+ 
+     return TRUE;
+@@ -3626,6 +3673,146 @@ static void gst_zedsrc_setup_runtime_parameters(GstZedSrc *src,
+     }
+ }
+ 
++// ----> Axol IMU export
++// One datagram per IMU sample, little-endian and packed (AxolImuSample). The
++// timestamp is the SDK's acquisition time (ns, the same clock as the image
++// timestamps). Acceleration is m/s^2 with gravity, angular velocity deg/s, both
++// in the IMU frame, with the axes of the COORDINATE_SYSTEM the camera was
++// opened with. Once a second an AxolImuPose datagram gives that IMU frame's
++// pose in the left camera frame (the factory camera-to-IMU transform). Sending
++// never blocks: a missing or slow reader loses IMU data, never camera frames.
++#pragma pack(push, 1)
++struct AxolImuSample {
++    char magic[4];   // "AXIM"
++    guint32 version; // 1
++    guint64 timestamp_ns;
++    gfloat acc[3];
++    gfloat gyro[3];
++    gfloat temperature;   // IMU temperature (C), NaN when unknown
++};
++
++struct AxolImuPose {
++    char magic[4];   // "AXIP"
++    guint32 version; // 1
++    gfloat translation[3];   // metres
++    gfloat rotation[4];      // unit quaternion x, y, z, w
++};
++#pragma pack(pop)
++
++static float gst_zedsrc_metres_per_unit(sl::UNIT unit) {
++    switch (unit) {
++    case sl::UNIT::MILLIMETER:
++        return 0.001f;
++    case sl::UNIT::CENTIMETER:
++        return 0.01f;
++    case sl::UNIT::INCH:
++        return 0.0254f;
++    case sl::UNIT::FOOT:
++        return 0.3048f;
++    default:
++        return 1.0f;
++    }
++}
++
++// The IMU's pose in the left camera frame, read once per opened camera and
++// sent once a second (a reader that binds late still gets it).
++static void gst_zedsrc_export_imu_pose(GstZedSrc *src, const struct sockaddr_un *addr) {
++    const guint64 now_ns = static_cast<guint64>(g_get_monotonic_time()) * 1000ULL;
++    if (src->imu_pose_sent_ns != 0 && now_ns - src->imu_pose_sent_ns < 1000000000ULL) {
++        return;
++    }
++    src->imu_pose_sent_ns = now_ns;
++    if (!src->imu_pose_ready) {
++        sl::Transform t =
++            src->zed.getCameraInformation().sensors_configuration.camera_imu_transform;
++        const float scale = gst_zedsrc_metres_per_unit(src->zed.getInitParameters().coordinate_units);
++        sl::Translation tr = t.getTranslation();
++        sl::Orientation q = t.getOrientation();
++        src->imu_pose[0] = tr.tx * scale;
++        src->imu_pose[1] = tr.ty * scale;
++        src->imu_pose[2] = tr.tz * scale;
++        src->imu_pose[3] = q.ox;
++        src->imu_pose[4] = q.oy;
++        src->imu_pose[5] = q.oz;
++        src->imu_pose[6] = q.ow;
++        src->imu_pose_ready = TRUE;
++    }
++    AxolImuPose pose;
++    memcpy(pose.magic, "AXIP", 4);
++    pose.version = 1;
++    for (int i = 0; i < 3; ++i) {
++        pose.translation[i] = src->imu_pose[i];
++    }
++    for (int i = 0; i < 4; ++i) {
++        pose.rotation[i] = src->imu_pose[3 + i];
++    }
++    sendto(src->imu_fd, &pose, sizeof(pose), MSG_DONTWAIT | MSG_NOSIGNAL,
++           (const struct sockaddr *) addr, sizeof(*addr));
++}
++
++static void gst_zedsrc_export_imu(GstZedSrc *src) {
++    if (!src->imu_socket || src->imu_socket->len == 0) {
++        return;
++    }
++    if (src->imu_fd < 0) {
++        src->imu_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++        if (src->imu_fd < 0) {
++            GST_WARNING_OBJECT(src, "imu-socket: socket() failed: %s", g_strerror(errno));
++            g_string_assign(src->imu_socket, "");
++            return;
++        }
++    }
++    struct sockaddr_un addr;
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    g_strlcpy(addr.sun_path, src->imu_socket->str, sizeof(addr.sun_path));
++    gst_zedsrc_export_imu_pose(src, &addr);
++
++    // Every sample since the previous frame (SDK 5.1+), else the one nearest
++    // this frame's exposure.
++    std::vector<sl::SensorsData> batch;
++#if (ZED_SDK_MAJOR_VERSION > 5) || (ZED_SDK_MAJOR_VERSION == 5 && ZED_SDK_MINOR_VERSION >= 1)
++    if (src->zed.getSensorsDataBatch(batch) != sl::ERROR_CODE::SUCCESS) {
++        batch.clear();
++    }
++#endif
++    if (batch.empty()) {
++        sl::SensorsData data;
++        if (src->zed.getSensorsData(data, sl::TIME_REFERENCE::IMAGE) == sl::ERROR_CODE::SUCCESS) {
++            batch.push_back(data);
++        }
++    }
++    for (const sl::SensorsData &data : batch) {
++        if (!data.imu.is_available) {
++            continue;
++        }
++        const guint64 ts = data.imu.timestamp.getNanoseconds();
++        if (ts <= src->imu_last_ts) {
++            continue;   // already sent with an earlier frame
++        }
++        src->imu_last_ts = ts;
++        AxolImuSample sample;
++        memcpy(sample.magic, "AXIM", 4);
++        sample.version = 1;
++        sample.timestamp_ns = ts;
++        sample.acc[0] = data.imu.linear_acceleration.x;
++        sample.acc[1] = data.imu.linear_acceleration.y;
++        sample.acc[2] = data.imu.linear_acceleration.z;
++        sample.gyro[0] = data.imu.angular_velocity.x;
++        sample.gyro[1] = data.imu.angular_velocity.y;
++        sample.gyro[2] = data.imu.angular_velocity.z;
++        float temp = NAN;
++        if (data.temperature.get(sl::SensorsData::TemperatureData::SENSOR_LOCATION::IMU, temp) !=
++            sl::ERROR_CODE::SUCCESS) {
++            temp = NAN;
++        }
++        sample.temperature = temp;
++        sendto(src->imu_fd, &sample, sizeof(sample), MSG_DONTWAIT | MSG_NOSIGNAL,
++               (const struct sockaddr *) &addr, sizeof(addr));
++    }
++}
++// <---- Axol IMU export
++
+ static void gst_zedsrc_attach_metadata(GstZedSrc *src, GstBuffer *buf, GstClockTime clock_time,
+                                        guint64 frame_age_ns) {
+     ZedInfo info;
+@@ -3694,6 +3881,7 @@ static void gst_zedsrc_attach_metadata(GstZedSrc *src, GstBuffer *buf, GstClockT
+ 
+         sl::SensorsData sens_data;
+         src->zed.getSensorsData(sens_data, sl::TIME_REFERENCE::IMAGE);
++        gst_zedsrc_export_imu(src);
+ 
+         sens.imu.acc[0] = sens_data.imu.linear_acceleration.x;
+         sens.imu.acc[1] = sens_data.imu.linear_acceleration.y;
+diff --git a/gst-zed-src/gstzedsrc.h b/gst-zed-src/gstzedsrc.h
+index 76d0293..8fae308 100644
+--- a/gst-zed-src/gstzedsrc.h
++++ b/gst-zed-src/gstzedsrc.h
+@@ -187,6 +187,14 @@ struct _GstZedSrc {
+ 
+     gboolean stop_requested;
+ 
++    // Axol: every IMU sample is sent to this Unix datagram socket (imu-socket)
++    GString *imu_socket;
++    gint imu_fd;
++    guint64 imu_last_ts;
++    gboolean imu_pose_ready;
++    gfloat imu_pose[7];   // IMU in the left camera frame: metres, quaternion x y z w
++    guint64 imu_pose_sent_ns;
++
+ #if defined(SL_ENABLE_ADVANCED_CAPTURE_API) && defined(HAVE_NVBUFSURFTRANSFORM)
+     // Reusable destination surfaces for NV12 stereo side-by-side composition
+ #define GST_ZEDSRC_STEREO_SBS_POOL_SIZE 4

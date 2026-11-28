@@ -15,6 +15,16 @@ def _isolated_libsurvive_config(tmp_path, monkeypatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _isolated_joint_zero_record(tmp_path, monkeypatch) -> None:
+    """Keep zeroing tests from writing ~/.almond/joint_zero.json."""
+    from almond_axol.robot import joint_zero
+
+    monkeypatch.setattr(
+        joint_zero, "default_path", lambda: tmp_path / "joint_zero.json"
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_live_safety_link(monkeypatch) -> None:
     """Keep apps built by tests off the real lift bus.
 

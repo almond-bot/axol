@@ -1081,6 +1081,53 @@ SETTINGS: tuple[SettingCategory, ...] = (
         description="Dataset recording for Collect data and Run policy.",
         settings=(
             SettingDef(
+                key="recording.format",
+                label="Recording format",
+                type="select",
+                options=("lerobot", "mcap"),
+                help=(
+                    "lerobot saves a LeRobot dataset. mcap saves one MCAP file per "
+                    "episode, with video, joints, calibration and the transform "
+                    "tree. mcap works with Collect data on Axol only."
+                ),
+                targets={"collect-data": ("format",)},
+            ),
+            SettingDef(
+                key="recording.mcap_topics",
+                label="MCAP topic names",
+                type="text",
+                help=(
+                    "Rename MCAP topics, as default=new pairs separated by commas. "
+                    "For example: /joint_states=/robot/joints. Leave empty to keep "
+                    "the default names."
+                ),
+                effective_default="the default names",
+                targets={"collect-data": ("mcap_topics",)},
+            ),
+            SettingDef(
+                key="recording.mcap_frames",
+                label="MCAP frame names",
+                type="text",
+                help=(
+                    "Rename transform frames in MCAP episodes, as default=new pairs "
+                    "separated by commas. For example: root=lift_link. Leave empty "
+                    "to keep the default names."
+                ),
+                effective_default="the default names",
+                targets={"collect-data": ("mcap_frames",)},
+            ),
+            SettingDef(
+                key="recording.mcap_video_codec",
+                label="MCAP video codec",
+                type="select",
+                options=("h264", "h265"),
+                help=(
+                    "Video codec of MCAP episodes. h264 plays in a web browser on "
+                    "any computer. h265 makes smaller files."
+                ),
+                targets={"collect-data": ("mcap_video_codec",)},
+            ),
+            SettingDef(
                 key="recording.fps",
                 label="Recording fps",
                 type="number",

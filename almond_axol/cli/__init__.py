@@ -20,6 +20,8 @@ from . import (
     tracker_lighthouse_calibrate,
     tracker_pair,
 )
+from . import mcap_check as mcap_check_cmd
+from . import mcap_synthetic as mcap_synthetic_cmd
 from . import migrate_dataset as migrate_dataset_cmd
 from . import provision as provision_cmd
 from . import safety as safety_cmd
@@ -96,6 +98,10 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
 _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
     "teleop": ("teleop", "Run a VR teleoperation session."),
     "gravity-comp": ("gravity_comp", "Hold the Axol in gravity-compensation mode."),
+    "calibration.cameras": (
+        "calibration_cameras",
+        "Measure where the head and wrist cameras sit, for MCAP recordings.",
+    ),
     "waypoints": (
         "waypoints",
         "Teach waypoints by hand, then replay them as straight-line moves.",
@@ -197,6 +203,8 @@ def build_parser() -> argparse.ArgumentParser:
     tune_filter.add_parser(subparsers)
     motion_add_parser(subparsers)
     migrate_dataset_cmd.add_parser(subparsers)
+    mcap_check_cmd.add_parser(subparsers)
+    mcap_synthetic_cmd.add_parser(subparsers)
     serve_cmd.add_parser(subparsers)
 
     # Register the draccus + diagnostics commands as bare subparsers purely so

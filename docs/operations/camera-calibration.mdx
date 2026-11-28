@@ -1,0 +1,151 @@
+---
+title: "Calibrating the Cameras"
+description: "Measure where the cameras sit on your Axol so MCAP episodes place them from measurements, not CAD."
+---
+
+MCAP episodes place each camera in the transform tree. Without a camera calibration, those positions come from CAD. `axol calibration.cameras` measures where the head camera and each wrist camera sit on your Axol and saves the result. Episodes use it from the next episode on.
+
+Calibrate after you fit the Camera Kit, and after the arms are zeroed. Calibrate again after you move, remount or replace a camera, or after an arm is re-zeroed.
+
+Each calibration records which [joint zeroing](/cli/motor-set-zero-pos#zeroing-record) each arm was on. When an arm is re-zeroed later, its episodes still use the calibration, but their metadata and `axol mcap.check` say the arm was re-zeroed.
+
+## What you need
+
+- Axol with the Camera Kit, with the head and wrist cameras assigned in the control panel's camera layout.
+- A calibration board (see below).
+- A clear table in front of Axol, in view of the head camera.
+- About 30 minutes.
+
+## The board
+
+Use a bought ChArUco board on a rigid, flat plate:
+
+| | |
+|---|---|
+| Squares | 12 x 9 |
+| Square size | 30 mm |
+| Marker size | 22 mm |
+| Markers | 5 x 5 ArUco dictionary (`DICT_5X5_100`) |
+
+Give the board's ID when you calibrate, for example `--board.id CB-0042`. Use the ID printed on the board, or one you write on it. Each calibration records it. Replace a board that is warped or damaged.
+
+For another board, set its size with `--board.squares_x`, `--board.squares_y`, `--board.square_mm`, `--board.marker_mm` and `--board.dictionary`.
+
+To try the tool before your board arrives, print one with `axol calibration.cameras --print_board ~/calibration_board.pdf` on A3 paper at 100%. Don't use a printed board for a calibration your episodes rely on: paper bends and printers scale.
+
+## Calibrate
+
+The session makes two separate recordings, both recorded like Collect data, with the same cameras, image mode and encoder:
+
+- **Recording A** is for fitting.
+- **Recording B** is for testing. It repeats the same kinds of motion with different poses and a different board placement.
+
+Each recording has two parts. First you move the board in front of the head camera. Then the board lies on the table while each arm moves its wrist camera around it on its own. The arms move slowly. Keep people and objects clear of them, and keep a hand near the E-Stop.
+
+1. Park Jelly and leave the lift where it is for the whole session.
+2. Run `axol calibration.cameras --board.id <your board's ID>` on the robot. The arms rise out of the head camera's way.
+3. Press Enter, then hold the board in front of the head camera, 40 to 80 cm away. Move it slowly to every part of the camera's view, near and far, and tilt it toward the camera from each side. Pause about a second at each spot. The tool prints how many poses, tilted views and image cells it has, and says when there are enough.
+4. When the tool asks, lay the board flat on the table in front of the robot and press Enter. The tool finds it with the head camera, then moves the left arm, then the right arm, through poses around it.
+5. Recording A asks for a second spot on the table. Put the board somewhere else, at another angle, and press Enter.
+6. Recording B repeats steps 3 and 4 with one board spot.
+7. Rest the arms on something, then press Enter. The tool checks the recordings and prints the result.
+
+Keep your hands and body out of the head camera's view of the board while the arms move.
+
+## Read the result
+
+The camera positions are fitted on Recording A only, then locked. Recording B is checked with those values held fixed. B is also fitted on its own, to check the result repeats. Each camera's lens and the head camera's stereo transform are the cameras' factory values.
+
+A calibration passes only if every check passes:
+
+| Check | Limit | Applies to |
+|---|---|---|
+| Reprojection error, median | 0.5 px or less | Each camera |
+| Reprojection error, 95th percentile | 2 px or less | Each camera |
+| Corners within 3 px | 95% or more | Each camera |
+| Error in the outer 20% of the image, 95th percentile | 5 px or less | Each camera |
+| Distinct poses in A and in B | 20 and 10 or more | Each camera |
+| Tilted views (15 degrees or more, from directions 10 degrees apart) | 4 or more | Each camera |
+| Image coverage | 12 of 16 cells, all four quadrants | Each camera |
+| Views where both eyes see the board, in A and in B | 10 or more each | Head camera |
+| Cross-camera error, median and 95th percentile | 1.5 px and 5 px or less | Head camera |
+| Repeatability between A and B | 0.5 degrees and 2.5 mm or less | Each camera |
+| Distance from CAD | 25 mm and 6 degrees or less | Each camera |
+
+Change a limit with `--checks.<name>`, for example `--checks.median_px 0.8`. The reprojection RMS and the head camera's epipolar residual are reported but not judged.
+
+When every check passes, the tool saves the calibration to `~/.almond/camera_calibration.json`. When a check fails, nothing is saved, and the previous calibration stays in use until it expires:
+
+| Failed check | What to do |
+|---|---|
+| Distinct poses, tilted views or image coverage of the head camera | Move the board to more parts of the view, and tilt it more. |
+| Distinct poses or coverage of a wrist camera | Put the board nearer the middle of the table, where both arms reach it. |
+| Reprojection error | Check the board is flat and undamaged, and the board size is right. |
+| Repeatability or distance from CAD | Check the camera mounts are tight, then calibrate again. |
+
+Each calibration gets an ID of the form `<robot serial>-<date>-<run>`, such as `E66138528F2B3F2A-20261201-01`, and a due date 30 days later (`--valid_days`). Its evidence package is a folder named by the ID, in `~/.almond/camera_calibration/`. The package is kept whether the calibration passed or failed. It holds:
+
+| File | Contents |
+|---|---|
+| `package.json` | The robot, cameras, board, image mode, the joint zeroing each arm was on, lens values, every transform, both recordings with their IDs and SHA-256, every metric and check, and PASS or FAIL. |
+| `recording_A.mcap`, `recording_B.mcap` | The two recordings: every camera, the joints and the head camera's IMU. |
+| `corners_A.json`, `corners_B.json` | The board corners found in every frame that was examined, with its timestamp. |
+| `locked_A.json` | The values fitted on Recording A, saved before Recording B was examined. |
+| `camera_calibration.json` | The calibration file the session wrote, with `pass` or `fail`. |
+
+Keep each package with the episodes recorded under that calibration.
+
+## How episodes use the calibration
+
+At the start of every episode, Collect data reads `~/.almond/camera_calibration.json`. It uses the file only when it passed, names this robot, and hasn't expired. The robot is named by its Axol hub serial.
+
+- Each measured camera is placed from the file. A lookup between the two frames in the file gives the file's values.
+- A camera that was swapped after calibrating keeps its CAD position until you calibrate again.
+- A calibration expires 30 days after it was made, at its `due_at` time. After that, episodes use the CAD positions until you calibrate again.
+- Without a usable file, episodes use the CAD positions. When you start Collect data, it says why the file isn't used.
+
+The episode's `calibration` metadata says which calibration was used and where each transform came from. See [Camera mounts](/operations/mcap#camera-mounts).
+
+## Try the procedure in the sim
+
+`axol calibration.cameras --sim true` runs the whole procedure on the sim's robot, with no robot attached. The sim's cameras sit a few millimetres from CAD, and the result says how close the calibration came to their true positions. Its packages are in `~/.almond/camera_calibration/sim/`. Nothing is saved as this robot's calibration.
+
+The sim run takes about 40 minutes on an 8-core computer, most of it rendering video. `--sim_workers` sets how many processes render.
+
+## Quick check by hand
+
+`axol calibration.cameras --hand_guided true` is a shorter session without the two recordings or an evidence package. The arms go limp, and you move each wrist camera around the board by hand. It saves a calibration when every camera passes its own checks: enough views, an average error of 3 px or less, and within 25 mm and 6 degrees of CAD. Every run keeps a report folder, `~/.almond/camera_calibration/run-<time>/`, and `--from_report <folder>` solves a saved run again without the robot.
+
+## Use your own calibration
+
+You can measure the cameras another way, for example with motion capture, and write the file yourself. Collect data reads any file in this form:
+
+```json
+{
+  "robot_serial": "E66138528F2B3F2A",
+  "calibration_id": "lab-2026-11-24",
+  "calibrated_at": "2026-11-24T18:15:00Z",
+  "due_at": "2026-12-24T18:15:00Z",
+  "status": "pass",
+  "transforms": [
+    {"parent": "root", "child": "head_camera_left_optical",
+     "translation_m": [0.07, 0.03, 0.41], "rotation_xyzw": [-0.61, 0.61, -0.36, 0.36]}
+  ]
+}
+```
+
+- `robot_serial` is the robot's Axol hub serial, the `robot.serial` value in any MCAP episode it recorded.
+- Each transform gives the child frame's pose in the parent frame: the translation in metres and a unit quaternion in `x, y, z, w` order.
+- The parent must be fixed to the child, with no moving joint between them.
+- `camera_serial` is optional. When it is set, the transform applies only while that camera is fitted.
+- `due_at` is optional. When it is set, the file isn't used after that time.
+- Frame names can be the defaults below or the names you set in **MCAP frame names**.
+- List only the frames you measured. Every other frame comes from the URDF.
+
+| Camera | Child frame | Parent frame |
+|---|---|---|
+| Head camera, left eye | `head_camera_left_optical` | `root` |
+| Left wrist camera | `left_wrist_camera_optical` | `left_w2` |
+| Right wrist camera | `right_wrist_camera_optical` | `right_w2` |
+
+Optical frames have z forward out of the lens, x to the right and y down in the image. The right head eye follows the left eye by the head camera's factory stereo calibration, unless the file also lists `head_camera_right_optical`.

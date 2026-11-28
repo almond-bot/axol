@@ -37,6 +37,7 @@ _KNOWN_OPTIONS: dict[str, list[str]] = {
     "log_level": ["DEBUG", "INFO", "WARNING", "ERROR"],
     "mantis_source": ["quest", "lighthouse"],
     "dataset_resolution": ["SVGA", "HD1080", "HD1200"],
+    "stream_resolution": ["SVGA", "HD1080", "HD1200"],
     "eyes": ["both", "left", "right"],
     "controller": ["impedance", "position"],
     "aggregate_fn": [
@@ -370,6 +371,7 @@ _HIDDEN_FORM_KEYS: frozenset[str] = frozenset(
         "camera_eyes",
         "resolution",
         "dataset_resolution",
+        "stream_resolution",
         "robot_config.cameras",
     }
 )

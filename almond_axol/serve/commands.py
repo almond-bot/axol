@@ -524,7 +524,7 @@ COMMANDS: dict[str, CommandDef] = {
         # start recording and save or discard an episode, and mirrors the
         # headset HUD (phase, episode number, saved count).
         episode_control=_collect_data_control,
-        per_run_fields=("repo_id", "task"),
+        per_run_fields=("repo_id", "task", "operator", "episode_metadata"),
     ),
     "collect-dagger": CommandDef(
         "collect-dagger",

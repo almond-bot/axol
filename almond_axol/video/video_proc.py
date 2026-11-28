@@ -199,8 +199,16 @@ def _gsth264_meta(
     dataset_fps: int,
     capture_fps: int,
     pts_perf_offset_s: float,
+    codec: str = "h264",
+    **identity: object,
 ) -> dict:
-    """Describe the encoded-H.264 shared-memory transport for one dataset source.
+    """Describe the encoded shared-memory transport for one dataset source.
+
+    ``codec`` names the stream (``"h264"`` for LeRobot datasets, ``"h265"``
+    for MCAP episodes) and selects the transport name, ``gstshm-<codec>``.
+    ``identity`` carries which physical camera this is (``camera``, ``eye``,
+    ``serial``, ``resolution``, ``stereo``), which the MCAP recorder uses to
+    find its calibration.
 
     The relay encodes the dataset stream on the GPU and writes GDP-wrapped,
     AU-aligned H.264 to ``socket_path`` via ``shmsink``; the recorder attaches an
@@ -211,13 +219,15 @@ def _gsth264_meta(
     snapshots: ``capture_perf = pts / 1e9 + pts_perf_offset_s``.
     """
     return {
-        "transport": "gstshm-h264",
+        "transport": f"gstshm-{codec}",
+        "codec": codec,
         "socket_path": socket_path,
         "width": width,
         "height": height,
         "fps": dataset_fps,
         "capture_fps": capture_fps,
         "pts_perf_offset_s": pts_perf_offset_s,
+        **identity,
     }
 
 
@@ -375,6 +385,28 @@ def _open_gst_camera_raw(
     # dataset branch; the pyshm meta for that ring is returned as policy_meta.
     policy_ring = use_shm and transport == "gstshm+pyshm"
     dataset_fps = int(spec.get("dataset_fps", spec.get("fps", 60)))
+    # The recording encoder's codec: H.264 for LeRobot datasets, H.265 for MCAP
+    # episodes (``dataset_codec`` in the spec). Only the shm transport encodes
+    # in the relay; the pyshm fallback ships raw frames.
+    dataset_codec = str(spec.get("dataset_codec") or "h264")
+    # The headset's size when it is smaller than the capture (the Streaming
+    # resolution, with the camera capturing at a larger Recording resolution):
+    # the encoded branch scales down on the VIC.
+    stream_name = spec.get("stream_resolution")
+    stream_dims = _RESOLUTION_DIMS.get(stream_name) if stream_name else None
+    # MCAP recording asks a stereo camera to send its IMU samples to this
+    # socket; only a zedsrc built with Axol's IMU patch can.
+    imu_socket = spec.get("imu_socket") if stereo else None
+    if imu_socket:
+        from .gst_zed import zedsrc_exports_imu
+
+        if not zedsrc_exports_imu():
+            _logger.warning(
+                "video relay: %s's ZED plugin can't send IMU samples; run "
+                "`axol gst.build-zed` to update it",
+                name,
+            )
+            imu_socket = None
     # The control-process ring's rate (``policy_fps``; 0/absent = capture rate).
     # Only the combined transport has a ring that is the policy's alone; on the
     # plain pyshm fallback the ring is also the recorder's input and stays at
@@ -426,8 +458,11 @@ def _open_gst_camera_raw(
                     resolution,
                     fps,
                     raw_dims=raw_dims,
+                    stream_dims=stream_dims,
                     dataset_fps=dataset_fps,
                     policy_fps=policy_fps,
+                    dataset_codec=dataset_codec,
+                    imu_socket=imu_socket,
                     encoded_eyes=enc_sides,
                     raw_eyes=raw_sides,
                     encoded_sbs=sbs,
@@ -449,6 +484,14 @@ def _open_gst_camera_raw(
                         dataset_fps,
                         fps,
                         pts_perf_offset_s,
+                        dataset_codec,
+                        camera=name,
+                        eye=side,
+                        serial=serial,
+                        resolution=resolution,
+                        stereo=True,
+                        imu_socket=imu_socket,
+                        imu_requested=bool(spec.get("imu_socket")),
                     )
                     for side, src in raw_plan
                 }
@@ -479,6 +522,7 @@ def _open_gst_camera_raw(
                     resolution,
                     fps,
                     raw_dims=raw_dims,
+                    stream_dims=stream_dims,
                     encoded_eyes=enc_sides,
                     raw_eyes=raw_sides,
                     encoded_sbs=sbs,
@@ -513,8 +557,10 @@ def _open_gst_camera_raw(
                     raw_sink=ring.publish if ring is not None else None,
                     raw_socket_path=sock,
                     raw_dims=raw_dims,
+                    stream_dims=stream_dims,
                     dataset_fps=dataset_fps,
                     policy_fps=policy_fps,
+                    dataset_codec=dataset_codec,
                 )
                 cam.connect()
                 meta = {
@@ -525,6 +571,12 @@ def _open_gst_camera_raw(
                         dataset_fps,
                         fps,
                         cam.pts_perf_offset_s,
+                        dataset_codec,
+                        camera=name,
+                        eye=None,
+                        serial=serial,
+                        resolution=resolution,
+                        stereo=False,
                     )
                 }
                 policy_meta = (
@@ -548,6 +600,7 @@ def _open_gst_camera_raw(
                 want_encoded=wants_stream,
                 raw_sink=writer.publish,
                 raw_dims=raw_dims,
+                stream_dims=stream_dims,
             )
             cam.connect()
             return (

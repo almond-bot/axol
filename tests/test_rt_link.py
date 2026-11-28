@@ -124,8 +124,9 @@ class RtLinkConfigureTest(unittest.IsolatedAsyncioTestCase):
         # impedance_hz; 17: the optional trailing spring-torque cap and the
         # 10-field target slot (per-command cap); 18: no layout change — the
         # core must stop on the hub's no-ACK report (hub firmware 2.01).
+        # 22: the applied trailer on F telemetry (target seq + send age).
         # Bump both sides together (rust/axol-rt/src/serve.rs CONFIG_PROTO).
-        self.assertEqual(link.CONFIG_PROTO, 21)
+        self.assertEqual(link.CONFIG_PROTO, 22)
 
     async def test_configure_names_a_stale_binary_when_the_core_exits(self) -> None:
         rt = self._link(_ExitedProc())

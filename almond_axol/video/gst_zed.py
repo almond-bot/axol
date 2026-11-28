@@ -47,6 +47,7 @@ gate use; without them callers fall back to the SDK ``ZedCamera``.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
@@ -210,6 +211,24 @@ def zed_stereo_gst_available(*, require_sensor_timestamps: bool = False) -> bool
 
 # Elements whose stale-plugin warning has already been logged in this process.
 _stale_plugin_warned: set[str] = set()
+
+
+@functools.cache
+def zedsrc_exports_imu() -> bool:
+    """Whether the installed ``zedsrc`` can send its IMU samples to a socket.
+
+    That is Axol's ``imu-socket`` property (``zed-gstreamer-imu-socket.patch``).
+    A plugin built before the patch lacks it, and ``parse_launch`` would reject
+    the whole pipeline over the unknown property, so callers ask first.
+    """
+    if not _element_available("zedsrc"):
+        return False
+    try:
+        Gst, _ = _require_gst()
+        element = Gst.ElementFactory.make("zedsrc", None)
+    except Exception:  # noqa: BLE001 - no usable plugin
+        return False
+    return element is not None and element.find_property("imu-socket") is not None
 
 
 def _element_available(element: str) -> bool:
@@ -746,6 +765,7 @@ def _dataset_enc_shmsink(
     h: int,
     dataset_fps: int,
     name: str,
+    codec: str = "h264",
 ) -> str:
     """Encode on the GPU and ship timestamped H.264 AUs over ``shmsink``.
 
@@ -782,20 +802,28 @@ def _dataset_enc_shmsink(
     budget is the all-intra one (``dataset_intra_vbr_bitrate``): every frame is
     an IDR here, so the predictive-GOP budget would leave each frame visibly
     blocky.
+
+    ``codec`` is ``"h264"`` (LeRobot datasets) or ``"h265"`` (MCAP
+    episodes). Both use the same all-intra contract, the same GDP/shm
+    transport and the same valve; only the encoder element, its caps and its
+    bitrate budget differ. Each H.265 frame carries its VPS/SPS/PPS
+    (``insert-sps-pps``), so an MCAP file decodes from any frame.
     """
-    target, peak = dataset_intra_vbr_bitrate(w, h, dataset_fps)
+    if codec not in ("h264", "h265"):
+        raise ValueError(f"dataset codec must be h264 or h265, got {codec!r}")
+    target, peak = dataset_intra_vbr_bitrate(w, h, dataset_fps, codec)
     input_buffers = _dataset_active_input_buffers(dataset_fps)
     converter_buffers = input_buffers + _DATASET_VIC_INFLIGHT_SURFACES
     return (
         f"nvvidconv output-buffers={converter_buffers} ! "
         f"video/x-raw(memory:NVMM),format=I420,width={w},height={h} "
         f"! {_dataset_input_queue(name)} "
-        f"! nvv4l2h264enc name={name} control-rate=0 "
+        f"! nvv4l2{codec}enc name={name} control-rate=0 "
         f"bitrate={target} peak-bitrate={peak} preset-level=1 "
         f"insert-sps-pps=true insert-aud=true "
         f"iframeinterval={_DATASET_GOP_FRAMES} "
         f"idrinterval={_DATASET_GOP_FRAMES} {nvenc_maxperf_prop()} "
-        "! video/x-h264,stream-format=byte-stream,alignment=au "
+        f"! video/x-{codec},stream-format=byte-stream,alignment=au "
         f"! queue name={name}_outq leaky=downstream "
         f"max-size-buffers={_DATASET_STARTUP_QUEUE_BUFFERS} "
         "max-size-bytes=0 max-size-time=0 ! gdppay "
@@ -811,6 +839,34 @@ def _enc_branch(bitrate: int, fps: int, name: str = "venc") -> str:
         f"insert-sps-pps=true insert-aud=true idrinterval={fps} {nvenc_maxperf_prop()} "
         "! video/x-h264,stream-format=byte-stream"
     )
+
+
+def _stream_scale(capture: tuple[int, int], stream: tuple[int, int] | None) -> str:
+    """GStreamer prefix that scales the headset branch down on the GPU.
+
+    Empty when the stream is the capture size. The VIC (``nvvidconv``) does the
+    resize in NVMM, so the camera can capture at a larger recording
+    resolution while the headset gets the smaller **Streaming resolution**.
+    Placed after the headset's rate limit so it only resizes frames that are
+    sent.
+    """
+    if stream is None or tuple(stream) == tuple(capture):
+        return ""
+    w, h = stream
+    return (
+        "nvvidconv ! "
+        f"video/x-raw(memory:NVMM),format=NV12,width={w},height={h},"
+        "pixel-aspect-ratio=1/1 ! "
+    )
+
+
+def _clamp_stream_dims(
+    capture: tuple[int, int], stream: tuple[int, int] | None
+) -> tuple[int, int]:
+    """The headset size: ``stream`` when smaller than the capture, else it."""
+    if stream is None or stream[0] >= capture[0] or stream[1] >= capture[1]:
+        return capture
+    return int(stream[0]), int(stream[1])
 
 
 def _stream_rate_limit(capture_fps: int, stream_fps: int) -> str:
@@ -1559,6 +1615,8 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         raw_dims: tuple[int, int] | None = None,
         dataset_fps: int | None = None,
         policy_fps: int | None = None,
+        dataset_codec: str = "h264",
+        stream_dims: tuple[int, int] | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _RESOLUTION_ENUM:
@@ -1583,6 +1641,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         self.fps = fps
         self.stream_fps = HEADSET_STREAM_FPS
         self.dataset_fps = fps if dataset_fps is None else int(dataset_fps)
+        self.dataset_codec = dataset_codec
         if self.dataset_fps <= 0 or self.dataset_fps > self.fps:
             raise ValueError(
                 f"dataset fps must be in [1, {self.fps}], got {self.dataset_fps}"
@@ -1595,9 +1654,13 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
                 f"policy fps must be in [1, {self.fps}], got {self.policy_fps}"
             )
         self.width, self.height = _RESOLUTION_DIMS[resolution]
+        # The headset stream's size: ``stream_dims`` (the Streaming resolution)
+        # when smaller than the capture, which then scales down on the VIC.
+        self.stream_width, self.stream_height = _clamp_stream_dims(
+            (self.width, self.height), stream_dims
+        )
         # The raw (dataset) branch can be downscaled on the VIC to cut the bytes
-        # that cross to the control process; the encoded headset branch always
-        # keeps the full capture resolution. ``raw_dims`` is the relay's target.
+        # that cross to the control process. ``raw_dims`` is the relay's target.
         self.raw_width, self.raw_height = raw_dims or (self.width, self.height)
         self._want_encoded = want_encoded
         self._want_raw = want_raw
@@ -1615,7 +1678,10 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         return f"ZedGstCamera(serial={self.serial})"
 
     def _pipeline_str(self) -> str:
-        bitrate = _bitrate_for(self.width, self.height, self.stream_fps)
+        bitrate = _bitrate_for(self.stream_width, self.stream_height, self.stream_fps)
+        scale = _stream_scale(
+            (self.width, self.height), (self.stream_width, self.stream_height)
+        )
         src = (
             f"zedxonesrc name={_SOURCE_ELEMENT_NAME} camera-sn={self.serial} "
             f"camera-resolution={_RESOLUTION_ENUM[self.resolution]} "
@@ -1625,7 +1691,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         )
         rate = _stream_rate_limit(self.fps, self.stream_fps)
         enc = (
-            f"{_QUEUE} ! {rate}"
+            f"{_QUEUE} ! {rate}{scale}"
             f"{_enc_branch(bitrate, self.stream_fps)} ! {_enc_appsink('enc')}"
         )
         # The dataset branch sits behind a `valve` so it can be gated shut at
@@ -1656,6 +1722,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
                     self.raw_height,
                     self.dataset_fps,
                     "dsenc",
+                    self.dataset_codec,
                 )
             )
         if self._raw_appsink_wanted():
@@ -1858,10 +1925,13 @@ class ZedGstStereoCamera(_GstPipelineBase):
         raw_dims: tuple[int, int] | None = None,
         dataset_fps: int | None = None,
         policy_fps: int | None = None,
+        dataset_codec: str = "h264",
         eyes: str = "both",
         encoded_eyes: "list[str] | tuple[str, ...] | None" = None,
         raw_eyes: "list[str] | tuple[str, ...] | None" = None,
         encoded_sbs: bool = False,
+        imu_socket: str | None = None,
+        stream_dims: tuple[int, int] | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _STEREO_RESOLUTION_ENUM:
@@ -1902,6 +1972,9 @@ class ZedGstStereoCamera(_GstPipelineBase):
         # The SBS branch replaces the per-eye encodes (one packed stream instead
         # of two): with ``encoded_sbs`` no per-eye encoded side is built.
         self._encoded_sbs = encoded_sbs
+        # Unix datagram socket the camera sends every IMU sample to (MCAP
+        # recording); needs zedsrc_exports_imu(). None leaves it off.
+        self._imu_socket = imu_socket
         self._encoded_sides = (
             ()
             if encoded_sbs
@@ -1928,6 +2001,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         self.fps = fps
         self.stream_fps = HEADSET_STREAM_FPS
         self.dataset_fps = fps if dataset_fps is None else int(dataset_fps)
+        self.dataset_codec = dataset_codec
         if self.dataset_fps <= 0 or self.dataset_fps > self.fps:
             raise ValueError(
                 f"dataset fps must be in [1, {self.fps}], got {self.dataset_fps}"
@@ -1938,8 +2012,13 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 f"policy fps must be in [1, {self.fps}], got {self.policy_fps}"
             )
         self.width, self.height = _RESOLUTION_DIMS[resolution]
-        # Per-eye downscale target for the raw (dataset) branch; encoded eyes keep
-        # the full capture resolution. See ZedGstCamera for the rationale.
+        # Per-eye headset size (see ZedGstCamera); the packed side-by-side
+        # stream is twice as wide.
+        self.stream_width, self.stream_height = _clamp_stream_dims(
+            (self.width, self.height), stream_dims
+        )
+        # Per-eye downscale target for the raw (dataset) branch. See
+        # ZedGstCamera for the rationale.
         self.raw_width, self.raw_height = raw_dims or (self.width, self.height)
         self._want_encoded = want_encoded
         self._want_raw = want_raw
@@ -2007,8 +2086,10 @@ class ZedGstStereoCamera(_GstPipelineBase):
         eye_w, eye_h = self.width, self.height
         left = 0 if side == "left" else eye_w
         right = eye_w if side == "left" else eye_w * 2
-        bitrate = _bitrate_for(eye_w, eye_h, self.stream_fps)
-        rate = _stream_rate_limit(self.fps, self.stream_fps)
+        bitrate = _bitrate_for(self.stream_width, self.stream_height, self.stream_fps)
+        rate = _stream_rate_limit(self.fps, self.stream_fps) + _stream_scale(
+            (eye_w, eye_h), (self.stream_width, self.stream_height)
+        )
         caps = (
             f"video/x-raw(memory:NVMM),format=NV12,width={eye_w},height={eye_h},"
             "pixel-aspect-ratio=1/1"
@@ -2037,6 +2118,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
                     self.raw_height,
                     self.dataset_fps,
                     "dsenc_" + sink_suffix,
+                    self.dataset_codec,
                 )
             )
         if want_raw and self._eye_appsink_wanted(side):
@@ -2086,8 +2168,12 @@ class ZedGstStereoCamera(_GstPipelineBase):
         bitrate is twice the per-eye default (same total bits as two per-eye
         streams, just in one track).
         """
-        bitrate = 2 * _bitrate_for(self.width, self.height, self.stream_fps)
-        rate = _stream_rate_limit(self.fps, self.stream_fps)
+        bitrate = 2 * _bitrate_for(
+            self.stream_width, self.stream_height, self.stream_fps
+        )
+        rate = _stream_rate_limit(self.fps, self.stream_fps) + _stream_scale(
+            (2 * self.width, self.height), (2 * self.stream_width, self.stream_height)
+        )
         return (
             f"{_QUEUE} ! {rate}"
             f"{_enc_branch(bitrate, self.stream_fps, 'venc_s')} ! "
@@ -2156,7 +2242,8 @@ class ZedGstStereoCamera(_GstPipelineBase):
             f"camera-resolution={_STEREO_RESOLUTION_ENUM[self.resolution]} "
             f"camera-fps={self.fps} stream-type=7 depth-mode=0 "
             "do-timestamp=false "
-            "! video/x-raw(memory:NVMM),format=NV12 ! tee name=split"
+            + (f"imu-socket={self._imu_socket} " if self._imu_socket else "")
+            + "! video/x-raw(memory:NVMM),format=NV12 ! tee name=split"
         )
         parts = [f"split. ! {self._eye_branch(side, side[0])}" for side in self._sides]
         if self._encoded_sbs:

@@ -1437,6 +1437,28 @@ class AxolArm:
         return arr + self._joint_offsets.astype(np.float32)
 
     @property
+    def velocities(self) -> np.ndarray:
+        """Latest cached joint velocities. Requires start_telemetry().
+
+        Returns shape (8,) array in Joint enum order: arm joints in rad/s, the
+        gripper in normalized opening per second (the rate of
+        :attr:`positions`' gripper entry). A motor that has not reported a
+        velocity yet reads NaN; on the gripperless SKU the gripper element is
+        0.0. These are the motors' own (filtered) estimates.
+        """
+        values = self._pad_absent(
+            [
+                np.nan if m._velocity is None else float(m._velocity)
+                for m in self.motors.values()
+            ]
+        )
+        if self._has_gripper:
+            span = self._gripper_open - self._gripper_close
+            gripper_i = self._gripper_i
+            values[gripper_i] = values[gripper_i] / span if span else np.nan
+        return np.array(values, dtype=np.float32)
+
+    @property
     def torques(self) -> np.ndarray:
         """Latest cached joint torques (Nm / A). Requires start_telemetry().
 
@@ -1918,8 +1940,33 @@ class AxolArm:
 
         Args:
             joints: List of joints to zero.
+
+        Each zeroing is added to the robot's joint zeroing record
+        (:mod:`almond_axol.robot.joint_zero`).
         """
+        before: dict[Joint, float | None] = {}
+        for j in joints:
+            try:
+                before[j] = float(await self.motors[j].get_position())
+            except Exception:  # noqa: BLE001 - the record notes it as unknown
+                before[j] = None
         await asyncio.gather(*[self.motors[j].set_zero_position() for j in joints])
+        from . import joint_zero
+
+        joint_zero.record_quietly(
+            "left" if self._is_left else "right",
+            {
+                j.value: {
+                    "motor_id": getattr(self.motors[j], "motor_id", None),
+                    "end_stop_deg": None,
+                    "reading_before_rad": (
+                        round(before[j], 6) if before[j] is not None else None
+                    ),
+                }
+                for j in joints
+            },
+            joint_zero.METHOD_SDK,
+        )
         # A re-zeroed joint's encoder moved under us: an either-stop joint's
         # detected offset no longer describes it (Damiao applies the new zero
         # after a power cycle, but the old detection is stale either way),

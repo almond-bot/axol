@@ -1,0 +1,46 @@
+---
+title: "calibration.cameras"
+description: "Measure where the head and wrist cameras sit on Axol, for MCAP episodes."
+---
+
+`axol calibration.cameras` measures where the head camera and each wrist camera sit on this robot, using a ChArUco board and the arms' joint readings. It saves the result to `~/.almond/camera_calibration.json`, which MCAP episodes use to place the cameras. See [Calibrating the Cameras](/operations/camera-calibration) for the steps.
+
+```bash
+axol calibration.cameras --board.id CB-0042
+axol calibration.cameras --sim true
+```
+
+The cameras, image mode and encoder come from Collect data's settings, and the arm and IK settings from teleop's. Without `--hand_guided`, the arms move on their own through generated poses.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--board.id` | | The board's ID, recorded with the calibration. |
+| `--board.squares_x`, `--board.squares_y` | `12`, `9` | Squares along the long and the short side. |
+| `--board.square_mm`, `--board.marker_mm` | `30`, `22` | Square and marker size, in mm. |
+| `--board.dictionary` | `DICT_5X5_100` | The ArUco dictionary of the markers. |
+| `--print_board PATH` | | Write a printable board (PDF, or PNG by file name) and exit. |
+| `--board.paper {letter,a4,a3}` | `a3` | Paper size of the printable board. |
+| `--sim` | `false` | Run the two-recording calibration procedure on the sim's robot. See [Try the procedure in the sim](/operations/camera-calibration#try-the-procedure-in-the-sim). |
+| `--sim_workers` | `4` | With `--sim`: processes that render video. |
+| `--hand_guided` | `false` | A quick session where you move the arms by hand, without the two recordings or an evidence package. |
+| `--packages DIR` | `~/.almond/camera_calibration` | Folder for the evidence packages. |
+| `--checks.<name>` | | The procedure's limits, such as `--checks.median_px 0.5`. |
+| `--valid_days` | `30` | Days until a calibration expires. `0` means it never expires. |
+| `--cameras "{slot: serial}"` | Panel settings | Cameras to calibrate: `overhead`, `left_arm`, `right_arm`. |
+| `--output PATH` | `~/.almond/camera_calibration.json` | Where to save the calibration. |
+| `--from_report DIR` | | Solve a saved run again, without the robot. |
+| `--save_from_report` | `false` | With `--from_report`: save the calibration when every camera passes. |
+| `--limits.min_wrist_views` | `10` | Views each wrist camera needs. |
+| `--limits.min_head_placements` | `3` | Board places the head camera must see. |
+| `--limits.max_rms_px` | `3.0` | Largest average error allowed, in pixels. |
+| `--limits.max_change_mm`, `--limits.max_change_deg` | `25`, `6` | Largest distance allowed from the CAD position. |
+| `--kd` | `0.5` | Gravity compensation damping, in N·m·s/rad. |
+| `--left_channel`, `--right_channel` | Panel settings | CAN interfaces of the arms. |
+
+With `--hand_guided true`, while it runs:
+
+| Input | Effect |
+|---|---|
+| Enter | Starts taking views at a board place, or pauses them so you can move the board. |
+| `done`, then Enter | Solves, prints the result and saves the calibration when every camera passes. |
+| `quit`, then Enter | Stops without solving. |

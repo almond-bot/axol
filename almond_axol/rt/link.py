@@ -31,6 +31,9 @@ _CLOSED_STATE = "<connection closed>"
 # One telemetry entry per slot: pos (rad), vel (rad/s), tau (Nm), age_us.
 _FEEDBACK_SLOTS = 8
 _FEEDBACK_FMT = struct.Struct("<BB" + "3dI" * _FEEDBACK_SLOTS)
+# Trailer after the slots: whether a target has been applied, its seq, and
+# the age (us) of the first CAN frame sent from it.
+_APPLIED_FMT = struct.Struct("<BII")
 
 #: One parsed telemetry slot: (position, velocity, torque, receive_ts) —
 #: receive_ts is the frame's CAN receive time reconstructed on this host's
@@ -57,7 +60,9 @@ _ARM_TIMEOUT_S = 15.0
 #: Exchange Phase 0 and Change Motor Direction off, or with a current sample
 #: resistor that doesn't match its model, and sets MAX_TORQUE to the model's
 #: rating at bring-up.
-CONFIG_PROTO = 21
+#: 22 adds the applied trailer to ``F`` telemetry: the newest target each bus
+#: has started using and when its first CAN frame went out.
+CONFIG_PROTO = 22
 
 
 def config_header() -> list[str]:
@@ -116,6 +121,10 @@ class RtLink:
         self._stalled_ifaces: set[str] = set()
         # Called for each telemetry packet: (side, {slot: FeedbackSlot}).
         self.on_feedback: Callable[[int, dict[int, FeedbackSlot]], None] | None = None
+        # Per side: (seq, applied_ts) of the newest target the core has started
+        # sending to the motors, applied_ts on time.time(). Updated before
+        # on_feedback runs for the same packet.
+        self.applied: dict[int, tuple[int, float]] = {}
 
     async def start(self) -> None:
         """Launch the core and connect. The core is idle until configured."""
@@ -196,6 +205,9 @@ class RtLink:
                 payload = await self._reader.readexactly(size)
                 tag = payload[:1]
                 if tag == b"F":
+                    applied = self._parse_applied(payload)
+                    if applied is not None:
+                        self.applied[payload[1]] = applied
                     if self.on_feedback is not None:
                         side, slots = self._parse_feedback(payload)
                         self.on_feedback(side, slots)
@@ -254,7 +266,7 @@ class RtLink:
         consistent across slots, which is all downstream differentiation
         needs.
         """
-        vals = _FEEDBACK_FMT.unpack(payload[1:])
+        vals = _FEEDBACK_FMT.unpack_from(payload, 1)
         side, mask = vals[0], vals[1]
         now = time.time()
         slots: dict[int, FeedbackSlot] = {}
@@ -264,6 +276,23 @@ class RtLink:
             pos, vel, tau, age_us = vals[2 + i * 4 : 6 + i * 4]
             slots[i] = (pos, vel, tau, now - age_us / 1e6)
         return side, slots
+
+    @staticmethod
+    def _parse_applied(payload: bytes) -> tuple[int, float] | None:
+        """``(seq, applied_ts)`` from an `F` packet's applied trailer.
+
+        ``applied_ts`` is when the core sent the first CAN frame computed from
+        target ``seq``, reconstructed on ``time.time()`` from the trailer's age
+        like the slot timestamps. ``None`` before any target has gone out (or
+        from a packet without the trailer).
+        """
+        offset = 1 + _FEEDBACK_FMT.size
+        if len(payload) < offset + _APPLIED_FMT.size:
+            return None
+        valid, seq, age_us = _APPLIED_FMT.unpack_from(payload, offset)
+        if not valid:
+            return None
+        return seq, time.time() - age_us / 1e6
 
     @property
     def fault(self) -> str | None:

@@ -72,6 +72,9 @@ _PATCHES = tuple(
     for name in (
         "zed-gstreamer-sensor-timestamp.patch",
         "zed-gstreamer-zedxone-newer-l4t.patch",
+        # zedsrc's imu-socket property: every IMU sample of the stereo camera,
+        # sent to the MCAP recorder (almond_axol.recording.mcap.imu).
+        "zed-gstreamer-imu-socket.patch",
     )
 )
 

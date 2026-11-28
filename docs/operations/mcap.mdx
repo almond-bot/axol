@@ -1,0 +1,268 @@
+---
+title: "MCAP Recording"
+description: "Record each episode as an MCAP file with video, joints, IMU, calibration and transforms."
+---
+
+Collect data saves a LeRobot dataset by default. Set **Recording format** to `mcap` to save each episode as its own MCAP file instead. Open the files in [Foxglove](https://foxglove.dev), replay them with `ros2 bag`, or read them in Python with the `mcap` and `mcap-ros2-support` packages.
+
+Each file holds:
+
+- every camera's video, encoded to H.264 or H.265 once on the robot and stored as is;
+- each camera's calibration, and the head camera's IMU;
+- the joints, commands, headset input and, on Jelly, the base;
+- the full transform tree, from the base to every camera, with the camera mounts measured on your Axol when it has a [camera calibration](/operations/camera-calibration);
+- the episode's ID, task, operator, robot, software version, outcome and calibration.
+
+Every sample is stored at its own time, on one clock. Nothing is resampled and no frame is repeated to fill a gap.
+
+## Turn it on
+
+1. In the control panel, open **Settings**, then **Recording**, and set **Recording format** to `mcap`. On the command line, add `--format mcap`.
+2. Choose the video size and rate. In **Axol settings**, open **Cameras** and set **Recording resolution**. Set **Recording fps** under **Settings**, then **Recording**. For 1920x1200 at 60 fps, choose `HD1200` and `60`.
+3. In the **Collect data** form, type your name or ID in **Operator**. It is saved in every episode and kept for the next session.
+4. To save more details with every episode, fill in **Episode metadata** in the same form, as `key=value` pairs separated by commas. For example: `task_id=pick-12, site=lab-2`. On the command line, use `--episode_metadata`.
+5. [Calibrate the cameras](/operations/camera-calibration), so episodes place them from measurements.
+
+**Streaming resolution** only sets the headset's picture. Collect data captures at the larger of the two resolutions, so you can record at `HD1200` and stream `SVGA` to keep the headset and the Jetson's encoders lighter.
+
+**MCAP video codec**, under **Settings**, then **Recording**, picks the codec: `h264` (the default) plays in a web browser on any computer, and `h265` makes smaller files. On the command line, use `--mcap_video_codec`.
+
+MCAP recording works with Collect data on Axol. Mantis, Collect DAgger data and Run policy save LeRobot datasets. **Push to HuggingFace Hub** doesn't apply to MCAP episodes.
+
+## Where the files go
+
+Episodes are saved in the **Dataset root** folder, in a subfolder named after the **Repo ID**: `episode_000000.mcap`, `episode_000001.mcap`, and so on. A new session in the same folder continues the numbering. Use a new **Repo ID** for MCAP recording. Collect data won't write MCAP episodes into a folder that holds a LeRobot dataset.
+
+A file appears only when you save the episode. A discarded take leaves nothing behind.
+
+Plan for storage. Every frame is a keyframe, so each 1920x1200 camera at 60 fps records about 50 Mbit/s with H.264, or 40 Mbit/s with H.265. With four cameras and H.264 that is about 25 MB/s, or 90 GB per hour of recording (72 GB with H.265). Collect data won't start an episode with less than 2 GB free.
+
+## Topics
+
+| Topic | Type | Rate | Contents |
+|---|---|---|---|
+| `/head/left/video`, `/head/right/video` | `foxglove_msgs/CompressedVideo` | Recording fps | The two eyes of the head camera. |
+| `/wrist/left/video`, `/wrist/right/video` | `foxglove_msgs/CompressedVideo` | Recording fps | The wrist cameras. |
+| `/head/imu` | `sensor_msgs/Imu` | About 200 Hz | The head camera's IMU. See [Head camera IMU](#head-camera-imu). |
+| `<camera>/camera_info` | `sensor_msgs/CameraInfo` | With every frame | The camera's calibration at the recorded size. |
+| `/joint_states` | `sensor_msgs/JointState` | 240 Hz | Measured position, velocity and torque of every joint. |
+| `/joint_command` | `sensor_msgs/JointState` | 120 Hz | Joint and gripper targets sent to the arms. |
+| `/joint_command/info` | `almond_msgs/CommandInfo` | 120 Hz | When each `/joint_command` was sent and how each device follows it. See [Commands](#commands). |
+| `/ee_pose/left`, `/ee_pose/right` | `geometry_msgs/PoseStamped` | 240 Hz | Measured pose of `left_tcp` / `right_tcp`, in the `root` frame. |
+| `/ee_target/left`, `/ee_target/right` | `geometry_msgs/PoseStamped` | 120 Hz | Commanded pose of `left_tcp` / `right_tcp`, in the `root` frame. |
+| `/teleop/left/pose`, `/teleop/right/pose` | `geometry_msgs/PoseStamped` | Headset rate | Controller poses as the headset sent them, in the headset's tracking space (`vr_world`). |
+| `/teleop/joy` | `sensor_msgs/Joy` | Headset rate | Grips, thumbsticks and buttons. See [Teleop input](#teleop-input). |
+| `/base/odom` | `nav_msgs/Odometry` | 50 Hz | Jelly's pose and velocity, worked out from its wheels. |
+| `/base/wheel_states` | `sensor_msgs/JointState` | 50 Hz | Jelly's wheel angles (rad, zero at the start of the episode) and speeds. |
+| `/base/lift` | `sensor_msgs/JointState` | On change, and once a second | Jelly's lift (`lift`), in metres lowered from fully raised. |
+| `/base/command` | `almond_msgs/BaseCommand` | Each command | The drive and lift command sent to Jelly. See [Commands](#commands). |
+| `/base/cmd_vel` | `geometry_msgs/TwistStamped` | On change | The speed Jelly's wheels are driven at, in m/s and rad/s. |
+| `/tf` | `tf2_msgs/TFMessage` | As measured | Every moving joint: the arms and grippers at 240 Hz, Jelly's base at 50 Hz, the lift when it moves. |
+| `/tf_static` | `tf2_msgs/TFMessage` | Once, at the start | Every fixed frame: the camera mounts, each gripper's tool centre and the head camera's IMU. See [Frames](#frames). |
+| `/robot_description` | `std_msgs/String` | Once, at the start | The robot's URDF, with the same camera mounts as `/tf_static`. |
+
+The `/base` topics appear on Axol on Jelly only. Time stamps are Unix time. Each message's log time is its header stamp.
+
+### Joint names
+
+`/joint_states` and `/joint_command` use the URDF's joint names, so the URDF in `/robot_description` places every link.
+
+The URDF links each mesh to its file on GitHub, at the release of the software that recorded the episode. Foxglove loads them when the computer is online, so the 3D panel shows the robot model. To show it, add a URDF layer to the 3D panel and set its source to the `/robot_description` topic.
+
+| Name | Joint |
+|---|---|
+| `left_s1_0`, `left_s2_0`, `left_s3_0` | Shoulder 1, 2 and 3 |
+| `left_e1_0` | Elbow |
+| `left_e2_0`, `left_w1_0`, `left_w2_0` | Wrist 1, 2 and 3 |
+| `left_gripper` | Gripper opening, from `0` (closed) to `1` (open) |
+
+The right arm uses the same names with `right_`. Positions are in radians, with zero at the rest pose.
+
+### Commands
+
+Each `/joint_command` message holds one control tick's targets for the arms and grippers, as a standard `sensor_msgs/JointState`. A `/joint_command/info` message goes with each one, with the same time stamp: the time the software sent the targets.
+
+`/joint_command/info` and `/base/command` use two Almond message types. Their definitions are stored in each file, so Foxglove and the `mcap` Python packages read them with no setup.
+
+`almond_msgs/CommandInfo` describes one `/joint_command`:
+
+| Field | Contents |
+|---|---|
+| `command_id` | Counts the commands sent since Collect data started. It goes up by one each control tick. |
+| `issue_timestamp` | When the software sent the targets to the arms. |
+| `name` | The joints, in the same order as the matching `/joint_command`. |
+| `target_device_id` | The device each joint belongs to: `left_arm`, `right_arm`, `left_gripper` or `right_gripper`. |
+| `control_mode` | How that device follows its target. |
+| `application_timestamp` | For each joint, when the robot started applying its target: the time its arm's realtime controller sent the first motor command computed from it. It is zero when the robot never used that target, because a newer one replaced it first. |
+
+`almond_msgs/BaseCommand` holds one command to Jelly:
+
+| Field | Contents |
+|---|---|
+| `command_id` | Counts the commands Jelly received since Collect data started. |
+| `issue_timestamp` | When the software sent the command to Jelly. |
+| `target_device_id` | `jelly`. |
+| `control_mode` | How Jelly's wheels are run when the command arrives. |
+| `vx`, `vy`, `wz` | Forward, left and counter-clockwise speed, each as a fraction of full speed from `-1` to `1`. |
+| `lift_direction` | `1` raises the lift, `-1` lowers it and `0` stops it. |
+
+`control_mode` is one of these:
+
+| Value | Meaning |
+|---|---|
+| `impedance` | An arm joint moves toward its target with set stiffness and damping. |
+| `gravity_compensation` | The arms went limp after a fault, so their targets are not followed. |
+| `position_force` | A gripper moves to its opening with a force limit. |
+| `velocity` | Jelly's wheels follow the drive command. |
+| `position_hold` | Jelly is parked and holds its wheels in place. |
+
+### Teleop input
+
+`/teleop/joy` has these axes and buttons, in order:
+
+| | Order |
+|---|---|
+| Axes | left grip, right grip, left stick x, left stick y, right stick x, right stick y |
+| Buttons | left grip button, right grip button, left stick click, right stick click, reset, **A** (stow), left controller tracked, right controller tracked |
+
+### Rename topics
+
+To use your own topic names, set **MCAP topic names** under **Settings**, then **Recording**. Write `default=new` pairs, separated by commas:
+
+```
+/head/left/video=/top-left-camera/image-raw, /joint_states=/robot/joints
+```
+
+Only the names change. The message types stay the same. Collect data won't start if a name is misspelled, isn't a topic this session records, or would clash with another topic. Each file lists its renames in the `recording` metadata as `topic_names`. On the command line, use `--mcap_topics`.
+
+## Head camera IMU
+
+`/head/imu` holds every sample of the head camera's IMU, about 200 per second, each at the time the IMU measured it. Each sample has:
+
+- `linear_acceleration` in m/s², gravity included;
+- `angular_velocity` in rad/s;
+- no orientation (`orientation_covariance[0]` is `-1`).
+
+The samples are in the IMU's own frame, `head_camera_imu`. `/tf_static` places it in `head_camera_left_optical` with the camera's factory camera-to-IMU transform.
+
+If the episode's `recording` metadata gives `head_imu.frame_id` as `head_camera_left_optical`, the ZED camera plugins need updating. The samples are then labelled with the optical frame. Run [`axol gst.build-zed`](/cli/gst-build-zed) once to fix it.
+
+The IMU needs the ZED camera plugins that come with this version of Axol. If the episode's `recording` metadata has `imu_missing`, run [`axol gst.build-zed`](/cli/gst-build-zed) once, then record again. With a ZED SDK older than 5.1 the IMU is recorded once per video frame instead.
+
+## Video
+
+Each frame is one H.264 or H.265 access unit, encoded on the Jetson as the camera captured it. It is stamped with the time the sensor exposed it. Every frame is a keyframe and carries its own parameter sets, so you can decode from any frame.
+
+The images are the cameras' raw images, without rectification. Undistort them with the `camera_info` on the same topic.
+
+Browser versions of Foxglove play H.265 only on computers with hardware H.265 decoding. The Foxglove desktop app and `ffmpeg` decode it anywhere.
+
+## Calibration
+
+| What | Source |
+|---|---|
+| Intrinsics (`camera_info`) | Each camera's ZED factory calibration, scaled to the recorded size. The head camera uses `plumb_bob`. A fisheye calibration, as on the wrist cameras, uses `equidistant`. |
+| Head stereo baseline | The head camera's factory calibration. It places `head_camera_right_optical` relative to `head_camera_left_optical`. |
+| Camera mounts | The robot's [camera calibration](/operations/camera-calibration) when it has one. Otherwise the URDF's camera frames, from the CAD of the mounts and the cameras. |
+| Head camera IMU | The head camera's factory camera-to-IMU transform. |
+
+If a camera has no factory calibration file on the robot, its `camera_info` is left out and the metadata says `missing`. Open each camera once with the ZED SDK to fetch its file.
+
+### Camera mounts
+
+At the start of each episode, Collect data reads the robot's camera calibration file. It uses the file when the file passed and names this robot.
+
+- The tree keeps the URDF's shape. Each measured camera's own fixed joint is set so the camera lands where the file says. A TF lookup between a transform's two frames in the file returns the file's values.
+- `/robot_description` carries the same measured joints, so the robot model and `/tf_static` agree.
+- The file itself is attached to the episode as `camera_calibration.json`.
+
+The `calibration` metadata says what was used:
+
+| Key | Contents |
+|---|---|
+| `calibration_status` | `calibrated` when every recorded camera is placed from the file, `partial` when some are, `uncalibrated` when none are. |
+| `calibration_id`, `calibrated_at`, `due_at` | The file's ID, date and expiry. Empty when no file was used. |
+| `calibration_file`, `calibration_file_sha256` | The file's name and SHA-256. |
+| `calibration_problem` | Why no file was used, such as no file, a file for another robot, or an expired calibration. |
+| `calibration_skipped` | Transforms in the file that were not used, and why. |
+| `tf_sources` | The source of every `/tf_static` transform: `calibration`, `zed_factory`, `urdf`, `gripper_model`, or `urdf_at_zero` for a moving joint nothing measures. |
+| `<camera>.extrinsics` | The source of each camera's mount. |
+
+### Frames
+
+| Frame | What it is |
+|---|---|
+| `world` | Where Jelly started the episode (Axol on Jelly). |
+| `jelly` | Jelly's base. It moves in `/tf`. |
+| `root` | Axol's torso, above the lift. The head camera is fixed to it. |
+| `left_w2`, `right_w2` | Each arm's last link. The wrist camera and gripper are fixed to it. |
+| `head_camera_left_optical`, `head_camera_right_optical` | The head camera's eyes. |
+| `left_wrist_camera_optical`, `right_wrist_camera_optical` | The wrist cameras. |
+| `head_camera_imu` | The head camera's IMU. |
+| `left_tcp`, `right_tcp` | Where each gripper's fingers close, 145 mm out from the gripper mount (`left_gripper`). This is the tool point the Axol SDK uses. A parcel gripper has no TCP, so its `/ee_pose` and `/ee_target` give the gripper mount. |
+
+Optical frames have z forward out of the lens, x to the right and y down in the image. Each optical frame is the `frame_id` of its camera's video and `camera_info`.
+
+### Rename frames
+
+To use your own frame names, set **MCAP frame names** under **Settings**, then **Recording**. Write `default=new` pairs, separated by commas:
+
+```
+root=lift_link, jelly=base_link, head_camera_left_optical=head_left_optical
+```
+
+A renamed frame is renamed everywhere the episode names it:
+- `/tf` and `/tf_static`;
+- the links in `/robot_description`;
+- the `frame_id` of every message, such as video, `camera_info`, the IMU and `/ee_pose`.
+
+A calibration file can use either the default names or your names. The recorder won't start if a name is misspelled or would clash with another frame. Each file lists its renames in the `recording` metadata as `frame_names`. On the command line, use `--mcap_frames`.
+
+## Metadata
+
+Each file has these metadata records.
+
+| Record | Keys |
+|---|---|
+| `episode` | `index`, `uuid` (unique to each episode), `task`, `operator`, `outcome` (`success` or `failure`), `start_time`, `end_time`, `duration_s`, `paused_s`, `end_gesture_time` |
+| `robot` | `serial` (the Axol hub serial), `model`, `gripper`, `jelly`, `software_version`, `hostname`, `compute_serial` (the Jetson's serial) |
+| `recording` | Frame counts, measured frame rate, gaps and missing frames for each camera with its serial and frame, joint sample counts, the IMU's frame and serial, the frames `/ee_pose` and `/ee_target` are for (`ee_frames`), and the clock offset |
+| `calibration` | The camera calibration used (see [Camera mounts](#camera-mounts)), and each camera's factory calibration file with its name, SHA-256 and date (`intrinsics_id`, `intrinsics_date`) |
+| `joint_zero` | The joint zeroing each arm was on (see [Joint zero](#joint-zero)) |
+| `custom` | The **Episode metadata** pairs, when there are any |
+
+A camera that drops an exposure leaves a gap, counted in `recording` as `gaps` and `missing_frames`.
+
+### Joint zero
+
+Joint angles, the TCP frames and the wrist camera mounts all depend on where each joint was zeroed. At the start of each episode, Collect data reads the robot's [zeroing record](/cli/motor-set-zero-pos#zeroing-record) and attaches it to the episode as `joint_zero.json`. The `joint_zero` metadata says which zeroing each arm was on:
+
+| Key | Contents |
+|---|---|
+| `status` | `recorded` when every arm joint has a recorded zeroing, `partly recorded` when some do, `no record` when none do. |
+| `left.zero_id`, `right.zero_id` | The arm's latest zeroing. Empty when a joint of that arm has no recorded zeroing. |
+| `left.last_zeroed_at`, `right.last_zeroed_at` | When that arm was last zeroed. |
+| `left.unrecorded_joints`, `right.unrecorded_joints` | Joints with no recorded zeroing. |
+| `joints` | Each joint's zeroing ID and date, as JSON. |
+| `file`, `file_sha256` | The attached record's name and SHA-256. |
+| `camera_calibration` | `same` when both arms are on the zeroing the camera calibration was made with. `changed` names each arm re-zeroed since. `unknown` when that isn't recorded. Empty without a camera calibration. |
+
+When an arm is re-zeroed after the cameras were calibrated, episodes still use the calibration. Collect data logs a warning and `axol mcap.check` warns. Calibrate the cameras again.
+
+## Base odometry
+
+On Axol on Jelly, `/base/odom` gives Jelly's position and heading relative to where it was when the episode started. It also places Jelly in `/tf` (`world` to `jelly`). It is worked out from the wheel angles, so it drifts over distance, mostly when the base turns.
+
+## Check an episode
+
+Run [`axol mcap.check`](/cli/mcap-check) on a file to confirm it has every topic, its frame rates and gaps, a sound transform tree, and its calibration:
+
+```bash
+axol mcap.check ~/.cache/huggingface/lerobot/myorg/pick/episode_000000.mcap
+```
+
+It exits with status 1 if something required is missing.
+
+## Sample episodes
+
+To get sample files without a robot, run [`axol mcap.synthetic`](/cli/mcap-synthetic). It writes two episodes made in the sim, with the same topics and metadata as Collect data's.

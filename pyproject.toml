@@ -35,6 +35,11 @@ dependencies = [
     # Pinned for Mink parity (above). robot/gravity.py supports both the
     # 3.8/3.9 and 3.10/3.11 mass-matrix APIs; tests/test_gravity.py guards it.
     "mujoco==3.11.0",
+    # MCAP episode recording (Collect data's Recording format = mcap): the
+    # container writer, and the ROS 2 message reader that scripts/mcap_check.py
+    # and the tests decode episodes with. Both are pure Python (MIT).
+    "mcap>=1.6.0,<2",
+    "mcap-ros2-support>=0.6.0,<0.7",
     "numpy>=2.2.6,<2.3",
     "pydantic>=2.12.5,<3",
     # Our PyPI-published fork of pyroki (github.com/almond-bot-research/pyroki,
